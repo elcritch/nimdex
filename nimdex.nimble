@@ -6,3 +6,7 @@ srcDir        = "src"
 
 requires "nim >= 2.0.0"
 
+requires "https://github.com/elcritch/binny"
+
+requires "https://github.com/elcritch/sigils"
+
