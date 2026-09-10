@@ -1,8 +1,8 @@
 import std/unittest
 
-import nim_repo
+import nimdex
 
-suite "nim_repo":
+suite "nimdex":
   test "greets by name":
     check greet("Nim") == "hello, Nim"
 
