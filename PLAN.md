@@ -1,6 +1,6 @@
 # Binny-backed LSP plan
 
-Status: Phase 0 implemented. This document describes the remaining
+Status: Phase 1 implemented. This document describes the remaining
 implementation stages and the compatibility gates for each one.
 
 ## Goal
@@ -75,7 +75,7 @@ LSP positions also require a conversion layer for negotiated character encodings
 
 The current `LanguageRuntime` has one response slot and blocks each caller while pumping the local Sigils scheduler. It cannot safely represent multiple outstanding requests, and an uncaught worker exception can leave the caller waiting forever.
 
-Sigils' `jrStdio.pollJsonRpcStdio` blocks while waiting for the next complete frame. That is sufficient for the current synchronous shim, but it cannot reliably publish diagnostics or other unsolicited notifications while stdin is idle. Sigils JSON-RPC already owns framing and outbound notification primitives; any asynchronous stdio support should be a generic Sigils/runtime improvement. Chronos may be used only through the Sigils Chronos thread, never as a separate language backend scheduler.
+Sigils' `jrStdio.pollJsonRpcStdio` blocks while waiting for the next complete frame. That is sufficient for the current synchronous document-state bridge, but it cannot reliably publish diagnostics or other unsolicited notifications while stdin is idle. Sigils JSON-RPC already owns framing and outbound notification primitives; any asynchronous stdio support should be a generic Sigils/runtime improvement. Chronos may be used only through the Sigils Chronos thread, never as a separate language backend scheduler.
 
 ## Target architecture
 
@@ -114,7 +114,7 @@ Suggested boundaries, introduced only as their responsibilities become real:
 | `src/nimdex/documents.nim` | URI/path normalization, open-buffer versions, line indexes, overlays, and LSP position encoding. |
 | `src/nimdex/workspace.nim` | Roots, entry points, Nim arguments/import paths, configuration fingerprints, and invalidation. |
 | `src/nimdex/bifindex.nim` | Safe BIF discovery/loading, schema-aware traversal, effective source locations, and conversion to owned records. |
-| `src/nimdex/semantic.nim` | `DocumentSnapshot`, `AnalysisStamp`, `SymbolInfo`, `Occurrence`, locations, lookup tables, and analysis failures. |
+| `src/nimdex/semantic.nim` | `AnalysisStamp`, `SymbolInfo`, `Occurrence`, locations, lookup tables, and analysis failures. |
 | `src/nimdex/compiler.nim` | Compiler capability probing, controlled artifact generation, process results, and diagnostic extraction. |
 | `src/nimdex/language.nim` | Sigils worker-pool coordination, queueing, snapshot installation, and response/notification completion. |
 
@@ -143,9 +143,21 @@ capability is promoted based only on synthetic BIF data.
 
 ### Phase 1: documents and offline BIF indexing
 
-Add the document and workspace value objects first. Track URI, normalized source path, client version, text hash, line index, position encoding, project identity, and configuration generation.
+Implemented in the current tree. Document snapshots, workspace identity,
+position encoding conversion, and the owned semantic snapshot are in place.
+`bifindex` discovers artifacts without Binny's mmap-backed convenience loader,
+then uses one independent Sigils actor per artifact to load, traverse, and
+convert BIF data in parallel. The caller sorts owned results before installing
+the snapshot so worker completion order cannot change query results. The LSP
+document actor now owns the authoritative version-ordered overlay, rejects
+ranged edits, and reports analysis-unavailable rather than returning shim
+semantics until compiler-backed refresh is implemented.
 
-Implement `bifindex` as an offline worker operation:
+The document and workspace value objects track URI, normalized source path,
+client version, text hash, line index, position encoding, project identity,
+and configuration generation.
+
+`bifindex` is an offline worker operation that:
 
 1. discover candidate `.s.bif` files without the mmap loader;
 2. safely load one artifact;
@@ -155,7 +167,9 @@ Implement `bifindex` as an offline worker operation:
 6. build name and location lookup tables once per snapshot rather than calling the linear `findDeclaration` path for every query;
 7. destroy Binny storage before the worker result is returned.
 
-Use qualified project/module identities for symbol keys. Numeric pool IDs and cursor addresses are local implementation details and must not become workspace identifiers.
+Qualified project/module identities are used for symbol keys. Numeric pool IDs
+and cursor addresses remain local implementation details and do not become
+workspace identifiers.
 
 Do not keep the existing language shim as a semantic fallback. Full document
 synchronization updates the authoritative overlay, but must not pretend that

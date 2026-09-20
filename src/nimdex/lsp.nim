@@ -1,15 +1,17 @@
 ## Minimal LSP 3.18 session handling for Nimdex.
 
-import std/[json, syncio]
+import std/[json, strutils, syncio]
 
 import sigils
 import sigils/rpcs/jsonrpc
 import sigils/rpcs/json/jrStdio as jrStdio
 
+import ./documents
 import ./language
 
 const
   LspServerNotInitialized* = -32002'i32 ## LSP error for pre-initialization requests.
+  LspAnalysisUnavailable* = -32001'i32 ## No compiler-backed snapshot is installed.
   LspExitSuccess* = 0 ## Exit status after a valid shutdown and exit sequence.
   LspExitFailure* = 1 ## Exit status when the client exits without shutdown.
 
@@ -25,6 +27,7 @@ type
     adapter: JsonRpcAdapter
     language: LanguageRuntime
     home: SigilThreadPtr
+    positionEncoding: PositionEncoding
     state: LspSessionState
     exitRequested: bool
     exitStatus: int
@@ -69,7 +72,9 @@ proc requireInt(node: JsonNode, name, description: string): int =
     raiseLspError(RpcInvalidParams, description & "." & name & " must be an integer")
   member.getInt()
 
-proc parseOpenRequest(params: JsonNode): LanguageRequest =
+proc parseOpenRequest(
+    params: JsonNode, positionEncoding: PositionEncoding
+): LanguageRequest =
   let document = requireObject(
     requireMember(
       requireObject(params, "didOpen params"), "textDocument", "didOpen params"
@@ -81,9 +86,12 @@ proc parseOpenRequest(params: JsonNode): LanguageRequest =
     uri: requireString(document, "uri", "didOpen textDocument"),
     version: requireInt(document, "version", "didOpen textDocument"),
     text: requireString(document, "text", "didOpen textDocument"),
+    positionEncoding: positionEncoding,
   )
 
-proc parseChangeRequest(params: JsonNode): LanguageRequest =
+proc parseChangeRequest(
+    params: JsonNode, positionEncoding: PositionEncoding
+): LanguageRequest =
   let root = requireObject(params, "didChange params")
   let document = requireObject(
     requireMember(root, "textDocument", "didChange params"), "didChange textDocument"
@@ -97,6 +105,11 @@ proc parseChangeRequest(params: JsonNode): LanguageRequest =
   var text = ""
   for change in changes:
     let fullChange = requireObject(change, "didChange content change")
+    if fullChange.hasKey("range") or fullChange.hasKey("rangeLength"):
+      raiseLspError(
+        RpcInvalidParams,
+        "ranged document changes are not supported; send full document text",
+      )
     text = requireString(fullChange, "text", "didChange content change")
 
   result = LanguageRequest(
@@ -104,6 +117,7 @@ proc parseChangeRequest(params: JsonNode): LanguageRequest =
     uri: requireString(document, "uri", "didChange textDocument"),
     version: requireInt(document, "version", "didChange textDocument"),
     text: text,
+    positionEncoding: positionEncoding,
   )
 
 proc parseCloseRequest(params: JsonNode): LanguageRequest =
@@ -115,7 +129,9 @@ proc parseCloseRequest(params: JsonNode): LanguageRequest =
     kind: lrkClose, uri: requireString(document, "uri", "didClose textDocument")
   )
 
-proc parseHoverRequest(params: JsonNode): LanguageRequest =
+proc parseHoverRequest(
+    params: JsonNode, positionEncoding: PositionEncoding
+): LanguageRequest =
   let root = requireObject(params, "hover params")
   let document = requireObject(
     requireMember(root, "textDocument", "hover params"), "hover textDocument"
@@ -127,7 +143,44 @@ proc parseHoverRequest(params: JsonNode): LanguageRequest =
     uri: requireString(document, "uri", "hover textDocument"),
     line: requireInt(position, "line", "hover position"),
     character: requireInt(position, "character", "hover position"),
+    positionEncoding: positionEncoding,
   )
+
+proc positionEncodingName(encoding: PositionEncoding): string =
+  case encoding
+  of peUtf8: "utf-8"
+  of peUtf16: "utf-16"
+  of peUtf32: "utf-32"
+
+proc negotiatePositionEncoding(params: JsonNode): PositionEncoding =
+  ## LSP defaults to UTF-16 when the client does not advertise a preference.
+  if params.kind != JObject or not params.hasKey("capabilities"):
+    return peUtf16
+  let capabilities = params["capabilities"]
+  if capabilities.kind != JObject or not capabilities.hasKey("general"):
+    return peUtf16
+  let general = capabilities["general"]
+  if general.kind != JObject or not general.hasKey("positionEncodings"):
+    return peUtf16
+  let encodings = general["positionEncodings"]
+  if encodings.kind != JArray:
+    raiseLspError(
+      RpcInvalidParams,
+      "initialize capabilities.general.positionEncodings must be an array",
+    )
+  for value in encodings:
+    if value.kind != JString:
+      continue
+    case value.getStr().toLowerAscii()
+    of "utf-8":
+      return peUtf8
+    of "utf-16":
+      return peUtf16
+    of "utf-32":
+      return peUtf32
+    else:
+      discard
+  peUtf16
 
 proc requireRunning(server: LspServer) =
   case server.state
@@ -140,12 +193,18 @@ proc requireRunning(server: LspServer) =
 
 proc requireLanguageSuccess(response: LanguageResponse) =
   if not response.ok:
-    raiseLspError(RpcInternalError, response.error)
+    let code =
+      if response.error.startsWith("analysis unavailable"):
+        LspAnalysisUnavailable
+      else:
+        RpcInternalError
+    raiseLspError(code, response.error)
 
 proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
   if server.state != lssCreated:
     raiseLspError(RpcInvalidRequest, "server has already been initialized")
   discard requireObject(params, "initialize params")
+  server.positionEncoding = negotiatePositionEncoding(params)
 
   server.state = lssInitializing
   result = newJObject()
@@ -154,7 +213,7 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
   textDocumentSync["openClose"] = %true
   textDocumentSync["change"] = %1
   capabilities["textDocumentSync"] = textDocumentSync
-  capabilities["hoverProvider"] = %true
+  capabilities["positionEncoding"] = %server.positionEncoding.positionEncodingName()
   result["capabilities"] = capabilities
 
   let serverInfo = newJObject()
@@ -188,13 +247,15 @@ proc exitLsp(server: LspServer, params: JsonNode): JsonNode =
 
 proc didOpenLsp(server: LspServer, params: JsonNode): JsonNode =
   server.requireRunning()
-  let response = server.language.request(parseOpenRequest(params))
+  let response =
+    server.language.request(parseOpenRequest(params, server.positionEncoding))
   requireLanguageSuccess(response)
   newJNull()
 
 proc didChangeLsp(server: LspServer, params: JsonNode): JsonNode =
   server.requireRunning()
-  let response = server.language.request(parseChangeRequest(params))
+  let response =
+    server.language.request(parseChangeRequest(params, server.positionEncoding))
   requireLanguageSuccess(response)
   newJNull()
 
@@ -206,18 +267,15 @@ proc didCloseLsp(server: LspServer, params: JsonNode): JsonNode =
 
 proc hoverLsp(server: LspServer, params: JsonNode): JsonNode =
   server.requireRunning()
-  let response = server.language.request(parseHoverRequest(params))
+  let response =
+    server.language.request(parseHoverRequest(params, server.positionEncoding))
   requireLanguageSuccess(response)
   if not response.found:
     return newJNull()
 
   let contents = newJObject()
   contents["kind"] = %"markdown"
-  contents["value"] =
-    %(
-      "Nimdex shim\n\nURI: `" & response.uri & "`\nVersion: " & $response.version &
-      "\n\n" & response.preview
-    )
+  contents["value"] = %response.preview
   result = newJObject()
   result["contents"] = contents
 
@@ -245,7 +303,7 @@ proc registerLspRoutes(server: LspServer) =
   server.adapter.registerSelectorMethod("textDocument/hover", server, hoverSelector)
 
 proc newNimdexLspServer*(workers = 1): LspServer =
-  ## Create an LSP server with shimmed language components on a worker pool.
+  ## Create an LSP server with worker-owned document state.
   startLocalThreadDefault()
   result = LspServer(
     adapter: newJsonRpcAdapter(),
