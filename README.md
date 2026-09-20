@@ -39,6 +39,18 @@ It uses Sigils' LSP-style `Content-Length` framing and currently exposes the
 `nimdex.greet` method with a `name` parameter. Keep diagnostics on stderr;
 stdout is reserved for JSON-RPC messages.
 
+## LSP over stdio
+
+Run the initial LSP server with:
+
+```sh
+nim r src/nimdex_lsp.nim
+```
+
+The server currently supports lifecycle messages, full document
+synchronization, and a deterministic shim for `textDocument/hover`. Its
+language state is processed by a Sigils worker pool.
+
 ## Test
 
 Run the full test suite:
