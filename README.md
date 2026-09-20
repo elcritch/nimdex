@@ -47,9 +47,16 @@ Run the initial LSP server with:
 nim r src/nimdex_lsp.nim
 ```
 
+Nimdex requires a Nim compiler that advertises `--genBif:on` so it can build
+semantic artifacts for language features. In this checkout the development
+compiler is `deps/nim-devel/bin/nim`; an equivalent BIF-capable compiler is
+required in other environments. Nimdex does not use the `deps/langserver/`
+language backend or `nimsuggest`.
+
 The server currently supports lifecycle messages, full document
-synchronization, and a deterministic shim for `textDocument/hover`. Its
-language state is processed by a Sigils worker pool.
+synchronization, and a deterministic temporary response for
+`textDocument/hover`. Its language state is processed by a Sigils worker pool;
+compiler-backed semantic features are being added incrementally.
 
 ## Test
 
