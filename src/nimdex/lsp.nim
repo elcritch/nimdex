@@ -1,13 +1,15 @@
 ## Minimal LSP 3.18 session handling for Nimdex.
 
-import std/[json, strutils, syncio]
+import std/[json, os, strutils, syncio]
 
 import sigils
 import sigils/rpcs/jsonrpc
 import sigils/rpcs/json/jrStdio as jrStdio
 
+import ./bifindex
 import ./documents
 import ./language
+import ./workspace
 
 const
   LspServerNotInitialized* = -32002'i32 ## LSP error for pre-initialization requests.
@@ -27,6 +29,9 @@ type
     adapter: JsonRpcAdapter
     language: LanguageRuntime
     home: SigilThreadPtr
+    workspace: Workspace
+    artifactRoots: seq[string]
+    semanticCapabilities: bool
     positionEncoding: PositionEncoding
     state: LspSessionState
     exitRequested: bool
@@ -40,6 +45,8 @@ let
   didOpenSelector = selector[JsonNode, JsonNode]("textDocument/didOpen")
   didChangeSelector = selector[JsonNode, JsonNode]("textDocument/didChange")
   didCloseSelector = selector[JsonNode, JsonNode]("textDocument/didClose")
+  documentSymbolSelector = selector[JsonNode, JsonNode]("textDocument/documentSymbol")
+  workspaceSymbolSelector = selector[JsonNode, JsonNode]("workspace/symbol")
   hoverSelector = selector[JsonNode, JsonNode]("textDocument/hover")
 
 proc raiseLspError(code: int32, message: string) {.noreturn.} =
@@ -71,6 +78,51 @@ proc requireInt(node: JsonNode, name, description: string): int =
   if member.kind != JInt:
     raiseLspError(RpcInvalidParams, description & "." & name & " must be an integer")
   member.getInt()
+
+proc stringArray(node: JsonNode, name, description: string): seq[string] =
+  if node.isNil or node.kind != JObject or not node.hasKey(name):
+    return
+  let member = node[name]
+  if member.kind != JArray:
+    raiseLspError(RpcInvalidParams, description & "." & name & " must be an array")
+  for value in member:
+    if value.kind != JString:
+      raiseLspError(
+        RpcInvalidParams, description & "." & name & " must contain strings"
+      )
+    result.add(value.getStr())
+
+proc rootUriFromInitialize(params: JsonNode): string =
+  if params.hasKey("rootUri") and params["rootUri"].kind == JString:
+    return params["rootUri"].getStr()
+  if params.hasKey("rootPath") and params["rootPath"].kind == JString:
+    return params["rootPath"].getStr()
+  if params.hasKey("workspaceFolders") and params["workspaceFolders"].kind == JArray:
+    for folder in params["workspaceFolders"]:
+      if folder.kind != JObject or not folder.hasKey("uri"):
+        continue
+      if folder["uri"].kind == JString:
+        return folder["uri"].getStr()
+
+proc artifactRootsFromInitialize(params: JsonNode): seq[string] =
+  if not params.hasKey("initializationOptions"):
+    return
+  let options = params["initializationOptions"]
+  if options.kind != JObject:
+    return
+  result = stringArray(options, "artifactRoots", "initialize initializationOptions")
+
+proc resolveArtifactRoots(rootUri: string, roots: openArray[string]): seq[string] =
+  let rootPath = pathFromDocumentUri(rootUri)
+  for root in roots:
+    if root.len == 0:
+      continue
+    result.add(
+      if rootPath.len > 0 and not isAbsolute(root):
+        rootPath / root
+      else:
+        root
+    )
 
 proc parseOpenRequest(
     params: JsonNode, positionEncoding: PositionEncoding
@@ -146,6 +198,30 @@ proc parseHoverRequest(
     positionEncoding: positionEncoding,
   )
 
+proc parseDocumentSymbolsRequest(
+    params: JsonNode, positionEncoding: PositionEncoding
+): LanguageRequest =
+  let root = requireObject(params, "documentSymbol params")
+  let document = requireObject(
+    requireMember(root, "textDocument", "documentSymbol params"),
+    "documentSymbol textDocument",
+  )
+  LanguageRequest(
+    kind: lrkDocumentSymbols,
+    uri: requireString(document, "uri", "documentSymbol textDocument"),
+    positionEncoding: positionEncoding,
+  )
+
+proc parseWorkspaceSymbolsRequest(
+    params: JsonNode, positionEncoding: PositionEncoding
+): LanguageRequest =
+  let root = requireObject(params, "workspace/symbol params")
+  LanguageRequest(
+    kind: lrkWorkspaceSymbols,
+    query: requireString(root, "query", "workspace/symbol params"),
+    positionEncoding: positionEncoding,
+  )
+
 proc positionEncodingName(encoding: PositionEncoding): string =
   case encoding
   of peUtf8: "utf-8"
@@ -200,11 +276,78 @@ proc requireLanguageSuccess(response: LanguageResponse) =
         RpcInternalError
     raiseLspError(code, response.error)
 
+proc installSemanticIndex(server: LspServer) =
+  if not server.semanticCapabilities:
+    return
+  try:
+    var snapshot = buildBifIndex(server.workspace, server.artifactRoots)
+    server.language.installIndex(snapshot)
+  except CatchableError:
+    ## Capability advertisement remains useful when a refresh cannot be
+    ## completed, but the language actor will correctly return no results
+    ## until a complete snapshot is installed.
+    discard
+
+proc lspPosition(position: TextPosition): JsonNode =
+  result = newJObject()
+  result["line"] = %position.line
+  result["character"] = %position.character
+
+proc lspRange(symbol: LanguageSymbol): JsonNode =
+  result = newJObject()
+  result["start"] = lspPosition(symbol.start)
+  result["end"] = lspPosition(symbol.finish)
+
+proc lspSymbolKind(symbol: SymbolInfo): int =
+  let kind = symbol.kind.toLowerAscii()
+  if kind.contains("namespace"):
+    return 3
+  if kind.contains("module"):
+    return 2
+  if kind.contains("method"):
+    return 6
+  if kind.contains("field"):
+    return 8
+  if kind.contains("constructor"):
+    return 9
+  if kind.contains("enum"):
+    return 10
+  if kind.contains("interface"):
+    return 11
+  if kind.contains("proc") or kind.contains("func") or kind.contains("routine"):
+    return 12
+  if kind.contains("constant"):
+    return 14
+  if kind.contains("type") or kind.contains("class") or kind.contains("object"):
+    return 5
+  ## Binny's generic declaration tag has no narrower LSP equivalent.
+  13
+
+proc lspSymbolInformation(symbol: LanguageSymbol): JsonNode =
+  result = newJObject()
+  result["name"] = %symbol.symbol.name
+  result["kind"] = %symbol.symbol.lspSymbolKind()
+  let location = newJObject()
+  location["uri"] = %symbol.symbol.location.uri
+  location["range"] = symbol.lspRange()
+  result["location"] = location
+
 proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
   if server.state != lssCreated:
     raiseLspError(RpcInvalidRequest, "server has already been initialized")
-  discard requireObject(params, "initialize params")
+  let initializeParams = requireObject(params, "initialize params")
   server.positionEncoding = negotiatePositionEncoding(params)
+  let configuredRoots =
+    if server.artifactRoots.len > 0:
+      server.artifactRoots
+    else:
+      artifactRootsFromInitialize(initializeParams)
+  let rootUri = rootUriFromInitialize(initializeParams)
+  server.workspace = initWorkspace(
+    rootUri, artifactRoots = resolveArtifactRoots(rootUri, configuredRoots)
+  )
+  server.artifactRoots = server.workspace.artifactRoots
+  server.semanticCapabilities = server.artifactRoots.len > 0
 
   server.state = lssInitializing
   result = newJObject()
@@ -214,6 +357,10 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
   textDocumentSync["change"] = %1
   capabilities["textDocumentSync"] = textDocumentSync
   capabilities["positionEncoding"] = %server.positionEncoding.positionEncodingName()
+  if server.semanticCapabilities:
+    capabilities["documentSymbolProvider"] = %true
+    capabilities["workspaceSymbolProvider"] = %true
+    capabilities["hoverProvider"] = %true
   result["capabilities"] = capabilities
 
   let serverInfo = newJObject()
@@ -228,6 +375,7 @@ proc initializedLsp(server: LspServer, params: JsonNode): JsonNode =
       raiseLspError(LspServerNotInitialized, "server is not initialized")
     raiseLspError(RpcInvalidRequest, "unexpected initialized notification")
   server.state = lssRunning
+  server.installSemanticIndex()
   newJNull()
 
 proc shutdownLsp(server: LspServer, params: JsonNode): JsonNode =
@@ -265,6 +413,26 @@ proc didCloseLsp(server: LspServer, params: JsonNode): JsonNode =
   requireLanguageSuccess(response)
   newJNull()
 
+proc documentSymbolsLsp(server: LspServer, params: JsonNode): JsonNode =
+  server.requireRunning()
+  let response = server.language.request(
+    parseDocumentSymbolsRequest(params, server.positionEncoding)
+  )
+  requireLanguageSuccess(response)
+  result = newJArray()
+  for symbol in response.symbols:
+    result.add(symbol.lspSymbolInformation())
+
+proc workspaceSymbolsLsp(server: LspServer, params: JsonNode): JsonNode =
+  server.requireRunning()
+  let response = server.language.request(
+    parseWorkspaceSymbolsRequest(params, server.positionEncoding)
+  )
+  requireLanguageSuccess(response)
+  result = newJArray()
+  for symbol in response.symbols:
+    result.add(symbol.lspSymbolInformation())
+
 proc hoverLsp(server: LspServer, params: JsonNode): JsonNode =
   server.requireRunning()
   let response =
@@ -278,6 +446,7 @@ proc hoverLsp(server: LspServer, params: JsonNode): JsonNode =
   contents["value"] = %response.preview
   result = newJObject()
   result["contents"] = contents
+  result["range"] = response.symbols[0].lspRange()
 
 proc registerLspRoutes(server: LspServer) =
   discard server.addMethod(initializeSelector, toDynamicMethod(initializeLsp))
@@ -287,6 +456,9 @@ proc registerLspRoutes(server: LspServer) =
   discard server.addMethod(didOpenSelector, toDynamicMethod(didOpenLsp))
   discard server.addMethod(didChangeSelector, toDynamicMethod(didChangeLsp))
   discard server.addMethod(didCloseSelector, toDynamicMethod(didCloseLsp))
+  discard server.addMethod(documentSymbolSelector, toDynamicMethod(documentSymbolsLsp))
+  discard
+    server.addMethod(workspaceSymbolSelector, toDynamicMethod(workspaceSymbolsLsp))
   discard server.addMethod(hoverSelector, toDynamicMethod(hoverLsp))
 
   server.adapter.registerSelectorMethod("initialize", server, initializeSelector)
@@ -300,15 +472,22 @@ proc registerLspRoutes(server: LspServer) =
   server.adapter.registerSelectorMethod(
     "textDocument/didClose", server, didCloseSelector
   )
+  server.adapter.registerSelectorMethod(
+    "textDocument/documentSymbol", server, documentSymbolSelector
+  )
+  server.adapter.registerSelectorMethod(
+    "workspace/symbol", server, workspaceSymbolSelector
+  )
   server.adapter.registerSelectorMethod("textDocument/hover", server, hoverSelector)
 
-proc newNimdexLspServer*(workers = 1): LspServer =
+proc newNimdexLspServer*(workers = 1, artifactRoots: seq[string] = @[]): LspServer =
   ## Create an LSP server with worker-owned document state.
   startLocalThreadDefault()
   result = LspServer(
     adapter: newJsonRpcAdapter(),
     language: newLanguageRuntime(workers),
     home: getCurrentSigilThread(),
+    artifactRoots: artifactRoots,
     state: lssCreated,
     exitStatus: LspExitSuccess,
   )
@@ -335,9 +514,14 @@ proc close*(server: LspServer) =
   if not server.isNil:
     server.language.close()
 
-proc runNimdexLspStdio*(input: File = stdin, output: File = stdout, workers = 1): int =
-  ## Serve LSP Content-Length messages until EOF or an ``exit`` notification.
-  let server = newNimdexLspServer(workers)
+proc runNimdexLspStdio*(
+    input: File = stdin,
+    output: File = stdout,
+    workers = 1,
+    artifactRoots: seq[string] = @[],
+): int =
+  ## Serve LSP Content-Length messages until EOF or an exit notification.
+  let server = newNimdexLspServer(workers, artifactRoots)
   let dispatcher = newJsonRpcDispatcher(server.adapter)
   let io = jrStdio.newJsonRpcStdioIo(input, output)
   dispatcher.connectJsonRpc(io)

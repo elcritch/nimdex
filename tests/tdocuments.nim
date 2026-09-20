@@ -57,6 +57,20 @@ suite "Nimdex document and workspace values":
     doAssert utf32.offsetAt(TextPosition(line: 0, character: 2)) == content.len
     doAssert utf32.positionAt(2).character == 1
 
+  test "verifies declaration tokens instead of substrings":
+    let document = initDocumentSnapshot(
+      "file:///tmp/phase2-token.nim",
+      "proc exported(): int = 1\n# exported\nlet text = \"exported\"\nproc exportedly(): int = 2\n",
+      1,
+    )
+    var startOffset, finishOffset: int
+    doAssert document.tryTokenSpanAt(1, 5, "exported", startOffset, finishOffset)
+    doAssert startOffset == 5
+    doAssert finishOffset == 13
+    doAssert not document.tryTokenSpanAt(2, 2, "exported", startOffset, finishOffset)
+    doAssert not document.tryTokenSpanAt(3, 12, "exported", startOffset, finishOffset)
+    doAssert not document.tryTokenSpanAt(4, 5, "exported", startOffset, finishOffset)
+
   test "orders document overlay versions":
     var store = initDocumentStore()
     let uri = "file:///tmp/phase1-overlay.nim"

@@ -269,6 +269,118 @@ proc positionAt*(document: DocumentSnapshot, offset: int): TextPosition =
   if not document.tryPositionAt(offset, result):
     raise newException(ValueError, "document offset is inside a UTF-8 character")
 
+proc isIdentifierByte(value: char): bool =
+  value == '_' or value.isAlphaNumeric or (ord(value) and 0x80) != 0
+
+type SourceLexMode = enum
+  slCode
+  slLineComment
+  slBlockComment
+  slString
+  slChar
+  slBacktick
+
+proc tokenIsInSourceCode(document: DocumentSnapshot, offset: int): bool =
+  ## Reject positions that are lexically inside comments, strings, or chars.
+  ## This is deliberately conservative; the compiler position remains the
+  ## authority for syntax, while this prevents accidental substring matches.
+  var mode = slCode
+  var blockDepth = 0
+  var escaped = false
+  var tripleString = false
+  var cursor = 0
+  while cursor < offset:
+    let value = document.content[cursor]
+    case mode
+    of slCode:
+      if value == '#' and cursor + 1 < offset and document.content[cursor + 1] == '[':
+        mode = slBlockComment
+        blockDepth = 1
+        cursor += 2
+        continue
+      if value == '#':
+        mode = slLineComment
+      elif value == '"':
+        mode = slString
+        tripleString =
+          cursor + 2 < offset and document.content[cursor + 1] == '"' and
+          document.content[cursor + 2] == '"'
+        if tripleString:
+          cursor += 3
+        else:
+          inc cursor
+        continue
+      elif value == '\'':
+        mode = slChar
+      elif value == '`':
+        mode = slBacktick
+    of slLineComment:
+      if value in {'\r', '\n'}:
+        mode = slCode
+    of slBlockComment:
+      if value == '#' and cursor + 1 < offset and document.content[cursor + 1] == '[':
+        inc blockDepth
+        cursor += 2
+        continue
+      if value == ']' and cursor + 1 < offset and document.content[cursor + 1] == '#':
+        dec blockDepth
+        cursor += 2
+        if blockDepth == 0:
+          mode = slCode
+        continue
+    of slString, slChar:
+      if escaped:
+        escaped = false
+      elif value == '\\':
+        escaped = true
+      elif tripleString:
+        if value == '"' and cursor + 2 < offset and document.content[cursor + 1] == '"' and
+            document.content[cursor + 2] == '"':
+          mode = slCode
+          tripleString = false
+          cursor += 3
+          continue
+      elif (mode == slString and value == '"') or (mode == slChar and value == '\''):
+        mode = slCode
+    of slBacktick:
+      if value == '`':
+        mode = slCode
+    inc cursor
+  mode == slCode
+
+proc tryTokenSpanAt*(
+    document: DocumentSnapshot,
+    compilerLine, compilerColumn: int32,
+    token: string,
+    startOffset, finishOffset: var int,
+): bool =
+  ## Find a declaration token exactly at a compiler source position.
+  ## Compiler line numbers are one-based and columns are byte offsets.
+  if token.len == 0 or compilerLine <= 0 or compilerColumn < 0:
+    return false
+  let line = int(compilerLine) - 1
+  let text =
+    try:
+      document.lineText(line)
+    except ValueError:
+      return false
+  let column = int(compilerColumn)
+  if column + token.len > text.len:
+    return false
+  if text[column ..< column + token.len] != token:
+    return false
+  if column > 0 and text[column - 1].isIdentifierByte:
+    return false
+  if column + token.len < text.len and text[column + token.len].isIdentifierByte:
+    return false
+  startOffset = document.lineStartOffset(line) + column
+  finishOffset = startOffset + token.len
+  if not document.tokenIsInSourceCode(startOffset):
+    return false
+  var position: TextPosition
+  document.tryPositionAt(startOffset, position) and
+    document.tryPositionAt(finishOffset, position)
+
 proc initDocumentSnapshot*(
     uri, content: string, version: int, positionEncoding = peUtf16
 ): DocumentSnapshot =

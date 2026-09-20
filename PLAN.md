@@ -1,6 +1,6 @@
 # Binny-backed LSP plan
 
-Status: Phase 1 implemented. This document describes the remaining
+Status: Phase 2 implemented. This document describes the remaining
 implementation stages and the compatibility gates for each one.
 
 ## Goal
@@ -178,6 +178,20 @@ analysis is available, return a clear configuration/analysis-unavailable error
 instead of presenting shim results as language semantics.
 
 ### Phase 2: first Binny-backed LSP queries
+
+Implemented in the current tree. The server accepts artifact roots through
+`newNimdexLspServer`/`runNimdexLspStdio` or
+`initialize.initializationOptions.artifactRoots`. It builds and installs one
+owned semantic snapshot during `initialized`, using the existing Sigils
+worker-pool BIF indexer, and advertises only the verified Phase 2 capabilities
+when artifact roots are configured.
+
+The language actor returns owned, encoding-adjusted ranges across the Sigils
+boundary. `documentSymbol`, `workspace/symbol`, and declaration hover are
+implemented as `SymbolInformation`-style results. Disk and open-buffer content
+must match the indexed source fingerprint, and a source newer than its BIF is
+treated as stale; stale or unverifiable locations are omitted. Definition and
+all reference/edit/completion features remain deferred.
 
 Advertise capabilities only after their source mapping is tested. Start with the least ambitious global queries:
 

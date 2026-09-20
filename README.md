@@ -53,11 +53,19 @@ compiler is `deps/nim-devel/bin/nim`; an equivalent BIF-capable compiler is
 required in other environments. Nimdex does not use the `deps/langserver/`
 language backend or `nimsuggest`.
 
-The server currently supports lifecycle messages and full document
-synchronization. It does not advertise semantic features until compiler-backed
-snapshots are available; hover requests therefore return an
-analysis-unavailable error instead of shim results. Offline BIF loading and
-semantic extraction use independent Sigils worker-pool actors for parallelism.
+Without artifact configuration the server supports lifecycle messages and full
+document synchronization, but does not advertise semantic features. Configure
+the BIF roots in `initialize.initializationOptions`:
+
+```json
+{"artifactRoots":["/path/to/nimcache"]}
+```
+
+With roots configured, Nimdex builds an owned snapshot and advertises verified
+`documentSymbol`, `workspace/symbol`, and declaration `hover` results. Stale
+or unsaved source that differs from the indexed artifact is suppressed rather
+than served by a language shim. Offline BIF loading and semantic extraction
+use independent Sigils worker-pool actors for parallelism.
 
 ## Test
 

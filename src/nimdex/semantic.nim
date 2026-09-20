@@ -1,6 +1,6 @@
 ## Owned semantic records and lookup tables independent of Binny and LSP JSON.
 
-import std/tables
+import std/[strutils, tables]
 
 type
   SemanticVisibility* = enum
@@ -11,6 +11,8 @@ type
     valid*: bool
     uri*: string
     path*: string
+    sourceTextHash*: uint64
+    artifactModifiedUnix*: int64
     line*: int32
     column*: int32
 
@@ -27,6 +29,8 @@ type
     artifactPath*: string
     sourcePath*: string
     sourceUri*: string
+    sourceTextHash*: uint64
+    artifactModifiedUnix*: int64
     tags*: seq[string]
     symbols*: seq[SymbolInfo]
 
@@ -107,6 +111,24 @@ proc findSymbols*(snapshot: SemanticSnapshot, name: string): seq[SymbolInfo] =
     return
   for reference in snapshot.nameIndex[name]:
     result.add(snapshot.modules[reference.moduleIndex].symbols[reference.symbolIndex])
+
+proc symbolsInDocument*(snapshot: SemanticSnapshot, uri: string): seq[SymbolInfo] =
+  ## Return all owned symbols whose verified location belongs to one document.
+  for module in snapshot.modules:
+    if module.sourceUri != uri:
+      continue
+    for symbol in module.symbols:
+      if symbol.location.valid and symbol.location.uri == uri:
+        result.add(symbol)
+
+proc symbolsMatching*(snapshot: SemanticSnapshot, query: string): seq[SymbolInfo] =
+  ## Return symbols whose display or qualified name contains `query`.
+  let needle = query.toLowerAscii()
+  for module in snapshot.modules:
+    for symbol in module.symbols:
+      if needle.len == 0 or symbol.name.toLowerAscii().contains(needle) or
+          symbol.qualifiedName.toLowerAscii().contains(needle):
+        result.add(symbol)
 
 proc symbolsAt*(
     snapshot: SemanticSnapshot, uri: string, line, column: int32

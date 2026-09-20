@@ -1,8 +1,10 @@
 # Binny compatibility matrix
 
 This matrix records the Phase 0 artifact boundary. It is intentionally separate
-from the future semantic index: no LSP capability is enabled by synthetic data
-alone.
+from the semantic index: LSP results still require a verified source path,
+exact compiler position, and matching source content. Synthetic artifacts cover
+the deterministic boundary tests; the project-local compiler probe verifies
+real compiler positions.
 
 ## Reviewed toolchain and dependency
 
@@ -27,7 +29,7 @@ alone.
 | `modulesrc` source-path extraction | Synthetic BIF test | Available as a reader contract | Verify path normalization and missing metadata on real output |
 | Sparse line-info extraction | Synthetic BIF test | Available as raw metadata | Verify inheritance, declaration-name positions, and generated nodes |
 | Real fixture semantic index | `deps/nim-devel/bin/nim c --genBif:on` plus phase-0 probe | Verified for the fixture | Preserve the `sd`/`td` schema and validate richer node mappings |
-| Exact LSP ranges | Binny exposes positions, not spans | Not established | Require source/range evidence before advertising range-sensitive features |
+| Exact LSP ranges | `documents.tryTokenSpanAt`, UTF position tests, and Phase 2 LSP fixture | Available for exact source-backed declaration tokens | Keep omitting stale, generated, or unverifiable locations |
 | Nim compiler BIF generation | `tools/binny_phase0.nim` probe and real fixture build | Required | Use a compiler with `--genBif:on`; fail setup when it is absent |
 | Unsaved-buffer semantic analysis | No Binny support | Not available | Requires a compiler overlay strategy |
 

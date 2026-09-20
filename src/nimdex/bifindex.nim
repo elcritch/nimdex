@@ -1,6 +1,6 @@
 ## Safe, offline discovery and indexing of compiler-produced semantic BIFs.
 
-import std/[algorithm, cpuinfo, os, strutils]
+import std/[algorithm, cpuinfo, os, strutils, tables, times]
 
 import binny/bif_safe
 import sigils
@@ -169,11 +169,42 @@ proc symbolBaseName(qualifiedName: string): string =
   else:
     qualifiedName[0 ..< separator]
 
-proc sourceLocation(sourcePath: string, location: BinnyLocation): SourceLocation =
+proc sourceTextHashForPath(path: string): uint64 =
+  if path.len == 0 or not fileExists(path):
+    return 0
+  try:
+    stableTextHash(readFile(path))
+  except CatchableError:
+    0
+
+proc modificationTimeForPath(path: string): int64 =
+  if path.len == 0 or not fileExists(path):
+    return 0
+  try:
+    int64(getLastModificationTime(path).toUnixFloat() * 1_000_000_000.0)
+  except CatchableError:
+    0
+
+proc sourceHashForPath(hashes: var Table[string, uint64], path: string): uint64 =
+  let normalized = normalizeDocumentPath(path)
+  if normalized.len == 0:
+    return 0
+  if normalized notin hashes:
+    hashes[normalized] = sourceTextHashForPath(normalized)
+  hashes[normalized]
+
+proc sourceLocation(
+    sourcePath: string,
+    location: BinnyLocation,
+    sourceTextHash: uint64,
+    artifactModifiedUnix: int64,
+): SourceLocation =
   result.path =
     normalizeDocumentPath(if location.file.len > 0: location.file else: sourcePath)
   if result.path.len > 0:
     result.uri = documentUriFromPath(result.path)
+  result.sourceTextHash = sourceTextHash
+  result.artifactModifiedUnix = artifactModifiedUnix
   result.valid = location.valid
   result.line = location.line
   result.column = location.column
@@ -182,9 +213,17 @@ proc moduleFromReport(report: BinnyArtifactReport, projectId: string): ModuleSna
   result.artifactPath = report.path
   result.sourcePath = normalizeDocumentPath(report.sourcePath)
   result.sourceUri = documentUriFromPath(result.sourcePath)
+  result.artifactModifiedUnix = modificationTimeForPath(report.path)
+  var sourceHashes = initTable[string, uint64]()
+  result.sourceTextHash = sourceHashForPath(sourceHashes, result.sourcePath)
   result.tags = report.tags
   for declaration in report.declarations:
     let modulePath = if result.sourcePath.len > 0: result.sourcePath else: report.path
+    let locationPath =
+      if declaration.location.file.len > 0:
+        declaration.location.file
+      else:
+        report.sourcePath
     result.symbols.add(
       SymbolInfo(
         key: projectId & "\0" & modulePath & "\0" & declaration.name,
@@ -193,7 +232,12 @@ proc moduleFromReport(report: BinnyArtifactReport, projectId: string): ModuleSna
         modulePath: modulePath,
         kind: declaration.tag,
         visibility: if declaration.visibility == bvisExported: svExported else: svHidden,
-        location: sourceLocation(report.sourcePath, declaration.location),
+        location: sourceLocation(
+          report.sourcePath,
+          declaration.location,
+          sourceHashForPath(sourceHashes, locationPath),
+          result.artifactModifiedUnix,
+        ),
       )
     )
 
