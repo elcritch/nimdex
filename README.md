@@ -27,6 +27,18 @@ atlas install
 Atlas writes dependency paths to `nim.cfg` and installs dependencies under
 `deps/`. Those files are intentionally ignored.
 
+## JSON-RPC over stdio
+
+Run the stdin/stdout server with:
+
+```sh
+nim r src/nimdex_stdio.nim
+```
+
+It uses Sigils' LSP-style `Content-Length` framing and currently exposes the
+`nimdex.greet` method with a `name` parameter. Keep diagnostics on stderr;
+stdout is reserved for JSON-RPC messages.
+
 ## Test
 
 Run the full test suite:
