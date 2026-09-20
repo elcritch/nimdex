@@ -6,5 +6,5 @@ srcDir        = "src"
 
 requires "nim >= 2.0.0"
 
-requires "gh:elcritch/binny >= 0.4.8"
+requires "gh:elcritch/binny >= 0.5.22"
 requires "gh:elcritch/sigils >= 0.30.0"
