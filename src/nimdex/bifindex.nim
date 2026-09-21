@@ -214,6 +214,12 @@ proc moduleFromReport(report: BinnyArtifactReport, projectId: string): ModuleSna
   result.sourcePath = normalizeDocumentPath(report.sourcePath)
   result.sourceUri = documentUriFromPath(result.sourcePath)
   result.artifactModifiedUnix = modificationTimeForPath(report.path)
+  result.tokenCount = report.tokenCount
+  result.tagCount = report.tagCount
+  result.stringCount = report.stringCount
+  result.symbolPoolCount = report.symbolCount
+  result.filenameCount = report.filenameCount
+  result.sourceFiles = report.sourceFiles
   var sourceHashes = initTable[string, uint64]()
   result.sourceTextHash = sourceHashForPath(sourceHashes, result.sourcePath)
   result.tags = report.tags
@@ -246,7 +252,10 @@ proc buildBifIndex*(
     artifactRoots: seq[string] = @[],
     options = DefaultBifIndexOptions,
 ): BifIndex =
-  result = initSemanticSnapshot(workspace.projectId, workspace.configurationGeneration)
+  result = initSemanticSnapshot(
+    workspace.projectId, workspace.configurationGeneration,
+    workspace.configurationFingerprint,
+  )
   let roots = if artifactRoots.len > 0: artifactRoots else: workspace.artifactRoots
   let artifacts = discoverBifArtifacts(roots)
   if options.maxArtifacts >= 0 and artifacts.len > options.maxArtifacts:

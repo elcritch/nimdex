@@ -12,6 +12,8 @@ type Workspace* = object
   importPaths*: seq[string]
   nimArguments*: seq[string]
   artifactRoots*: seq[string]
+  compilerPath*: string
+  cacheRoot*: string
   configurationGeneration*: uint64
   configurationFingerprint*: uint64
 
@@ -35,6 +37,8 @@ proc initWorkspace*(
     importPaths: seq[string] = @[],
     nimArguments: seq[string] = @[],
     artifactRoots: seq[string] = @[],
+    compilerPath: string = "",
+    cacheRoot: string = "",
     configurationGeneration: uint64 = 0,
 ): Workspace =
   result.rootUri = normalizeDocumentUri(rootUri)
@@ -46,6 +50,19 @@ proc initWorkspace*(
   result.importPaths = normalizedPaths(importPaths)
   result.nimArguments = nimArguments
   result.artifactRoots = normalizedPaths(artifactRoots)
+  result.compilerPath = compilerPath
+  if result.compilerPath.len > 0 and (
+    isAbsolute(result.compilerPath) or DirSep in result.compilerPath or
+    AltSep in result.compilerPath
+  ):
+    result.compilerPath = normalizeDocumentPath(result.compilerPath)
+  result.cacheRoot =
+    if cacheRoot.len > 0:
+      normalizeDocumentPath(cacheRoot)
+    elif result.rootPath.len > 0:
+      result.rootPath / ".nimdex" / "nimcache"
+    else:
+      ""
   result.configurationGeneration = configurationGeneration
 
   var fingerprintInput = ""
@@ -58,6 +75,8 @@ proc initWorkspace*(
     appendConfigPart(fingerprintInput, "arg", argument)
   for path in result.artifactRoots:
     appendConfigPart(fingerprintInput, "artifact", path)
+  appendConfigPart(fingerprintInput, "compiler", result.compilerPath)
+  appendConfigPart(fingerprintInput, "cache", result.cacheRoot)
   appendConfigPart(fingerprintInput, "generation", $result.configurationGeneration)
   result.configurationFingerprint = stableTextHash(fingerprintInput)
 

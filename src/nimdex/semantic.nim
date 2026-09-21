@@ -3,6 +3,15 @@
 import std/[strutils, tables]
 
 type
+  AnalysisStamp* = object ## Identity of the source/configuration used by analysis.
+    valid*: bool
+    projectId*: string
+    documentGeneration*: uint64
+    configurationGeneration*: uint64
+    configurationFingerprint*: uint64
+    compilerFingerprint*: uint64
+    sourceFingerprint*: uint64
+
   SemanticVisibility* = enum
     svHidden
     svExported
@@ -31,6 +40,12 @@ type
     sourceUri*: string
     sourceTextHash*: uint64
     artifactModifiedUnix*: int64
+    tokenCount*: int
+    tagCount*: int
+    stringCount*: int
+    symbolPoolCount*: int
+    filenameCount*: int
+    sourceFiles*: seq[string]
     tags*: seq[string]
     symbols*: seq[SymbolInfo]
 
@@ -59,16 +74,29 @@ type
   SemanticSnapshot* = object ## An owned, queryable set of semantic module records.
     projectId*: string
     configurationGeneration*: uint64
+    configurationFingerprint*: uint64
+    compilerFingerprint*: uint64
+    sourceFingerprint*: uint64
+    analysisStamp*: AnalysisStamp
     modules*: seq[ModuleSnapshot]
     failures*: seq[AnalysisFailure]
     nameIndex: Table[string, seq[SymbolRef]]
     locationIndex: Table[string, seq[SymbolRef]]
 
 proc initSemanticSnapshot*(
-    projectId: string, configurationGeneration: uint64
+    projectId: string,
+    configurationGeneration: uint64,
+    configurationFingerprint: uint64 = 0,
 ): SemanticSnapshot =
   result.projectId = projectId
   result.configurationGeneration = configurationGeneration
+  result.configurationFingerprint = configurationFingerprint
+  result.analysisStamp = AnalysisStamp(
+    valid: true,
+    projectId: projectId,
+    configurationGeneration: configurationGeneration,
+    configurationFingerprint: configurationFingerprint,
+  )
   result.nameIndex = initTable[string, seq[SymbolRef]]()
   result.locationIndex = initTable[string, seq[SymbolRef]]()
 
@@ -150,3 +178,8 @@ proc containsModule*(snapshot: SemanticSnapshot, sourcePath: string): bool =
     if module.sourcePath == sourcePath:
       return true
   false
+
+proc tokenCount*(snapshot: SemanticSnapshot): int =
+  ## Return the total number of raw BIF tokens in the owned snapshot.
+  for module in snapshot.modules:
+    result += module.tokenCount

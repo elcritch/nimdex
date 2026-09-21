@@ -3,6 +3,9 @@ author        = "Your Name"
 description   = "A Nim package."
 license       = "MIT"
 srcDir        = "src"
+bin            = @[
+  "nimdex"
+]
 
 requires "nim >= 2.0.0"
 

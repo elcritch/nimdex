@@ -10,10 +10,7 @@ import sigils
 type
   LanguageWorkId* = uint64 ## Internal identity for one submitted operation.
 
-  LanguageStamp* = object ## Version of the ordered language state used by work.
-    valid*: bool
-    documentGeneration*: uint64
-    configurationGeneration*: uint64
+  LanguageStamp* = AnalysisStamp ## Version of the ordered language state used by work.
 
   LanguageRequestKind* = enum ## Operations supported by the language component.
     lrkOpen ## Store a newly opened document.
@@ -72,6 +69,8 @@ type
     hasSemantic: bool
     documentGeneration: uint64
     configurationGeneration: uint64
+    configurationFingerprint: uint64
+    compilerFingerprint: uint64
 
   LanguageReply = ref object of AgentActor
     completions: seq[LanguageCompletion]
@@ -356,6 +355,8 @@ proc installSemanticSnapshot(
     self: LanguageService, snapshot: sink SemanticSnapshot
 ) {.slot.} =
   self.configurationGeneration = snapshot.configurationGeneration
+  self.configurationFingerprint = snapshot.configurationFingerprint
+  self.compilerFingerprint = snapshot.compilerFingerprint
   self.semantic = snapshot
   self.hasSemantic = true
 
@@ -404,9 +405,11 @@ proc processLanguageWork(self: LanguageService, work: LanguageWork) {.slot.} =
       inc self.documentGeneration
       discard self.documents.closeDocument(work.request.uri)
     of lrkDocumentSymbols:
-      if work.request.stamp.valid and (
+      if self.hasSemantic and work.request.stamp.valid and (
         work.request.stamp.documentGeneration != self.documentGeneration or
-        work.request.stamp.configurationGeneration != self.configurationGeneration
+        work.request.stamp.configurationGeneration != self.configurationGeneration or
+        work.request.stamp.configurationFingerprint != self.configurationFingerprint or
+        work.request.stamp.compilerFingerprint != self.compilerFingerprint
       ):
         response.ok = false
         response.superseded = true
@@ -416,9 +419,11 @@ proc processLanguageWork(self: LanguageService, work: LanguageWork) {.slot.} =
           response.uri, work.request.positionEncoding, response, work.cancellation
         )
     of lrkWorkspaceSymbols:
-      if work.request.stamp.valid and (
+      if self.hasSemantic and work.request.stamp.valid and (
         work.request.stamp.documentGeneration != self.documentGeneration or
-        work.request.stamp.configurationGeneration != self.configurationGeneration
+        work.request.stamp.configurationGeneration != self.configurationGeneration or
+        work.request.stamp.configurationFingerprint != self.configurationFingerprint or
+        work.request.stamp.compilerFingerprint != self.compilerFingerprint
       ):
         response.ok = false
         response.superseded = true
@@ -428,9 +433,11 @@ proc processLanguageWork(self: LanguageService, work: LanguageWork) {.slot.} =
           work.request.query, work.request.positionEncoding, response, work.cancellation
         )
     of lrkHover:
-      if work.request.stamp.valid and (
+      if self.hasSemantic and work.request.stamp.valid and (
         work.request.stamp.documentGeneration != self.documentGeneration or
-        work.request.stamp.configurationGeneration != self.configurationGeneration
+        work.request.stamp.configurationGeneration != self.configurationGeneration or
+        work.request.stamp.configurationFingerprint != self.configurationFingerprint or
+        work.request.stamp.compilerFingerprint != self.compilerFingerprint
       ):
         response.ok = false
         response.superseded = true
@@ -439,8 +446,12 @@ proc processLanguageWork(self: LanguageService, work: LanguageWork) {.slot.} =
         self.findHoverSymbol(work.request, response, work.cancellation)
     response.stamp = LanguageStamp(
       valid: work.request.stamp.valid,
+      projectId: self.semantic.projectId,
       documentGeneration: self.documentGeneration,
       configurationGeneration: self.configurationGeneration,
+      configurationFingerprint: self.configurationFingerprint,
+      compilerFingerprint: self.compilerFingerprint,
+      sourceFingerprint: self.semantic.sourceFingerprint,
     )
   except CatchableError as error:
     response.ok = false

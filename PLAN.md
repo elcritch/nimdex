@@ -1,6 +1,6 @@
 # Binny-backed LSP plan
 
-Status: Phase 3 implemented. This document describes the remaining
+Status: Phase 4 implemented. This document describes the remaining
 implementation stages and the compatibility gates for each one.
 
 ## Goal
@@ -243,17 +243,39 @@ exclusively framed JSON-RPC bytes.
 
 ### Phase 4: compiler refresh and diagnostics
 
-Add a project-aware compiler worker that:
+Implemented in the current tree. `src/nimdex/compiler.nim` probes and records
+the configured Nim compiler, requires `--genBif:on`, and runs a controlled
+artifact-only command in a project/configuration/source-specific cache. The
+compiler worker runs on a dedicated Sigils thread so blocking process I/O does
+not occupy a language-pool worker; the generated BIFs are then loaded and
+indexed through the existing parallel Sigils worker-pool path.
 
-- requires and records compiler capabilities, including `--genBif:on`;
-- runs a controlled artifact-generation command in a project-specific cache;
-- captures compiler stdout/stderr and exit status;
-- discovers BIFs by normalized source path;
-- fingerprints compiler version, arguments, import paths, configuration, and source revisions;
-- converts compiler failures into owned diagnostics;
-- installs a complete new semantic snapshot atomically.
+The refresh result owns:
 
-Failed, cancelled, or superseded builds must not replace a good snapshot. Publish diagnostics only for the matching project/configuration/document stamp, and clear them after a matching successful analysis.
+- compiler capability evidence, including the version/revision and exact
+  `--genBif` support check;
+- separate compiler stdout/stderr and exit status;
+- a normalized cache path and source/configuration/compiler fingerprints;
+- owned diagnostics converted from compiler output;
+- a complete semantic snapshot whose `AnalysisStamp` records the build
+  generation.
+
+The LSP server discovers explicit `initializationOptions` values for
+`compilerPath`/`compiler`, `entryPoints`, `importPaths`, `nimArguments`, and
+`cacheRoot`, and conservatively discovers `main.nim` or a project-named entry
+point when a normal workspace omitted them. A configured compiler that is
+missing or lacks `--genBif:on` fails initialization with a prerequisite error;
+Nimdex does not silently fall back to `nimsuggest`, `deps/langserver/`, or the
+old language shim.
+
+Refreshes carry document/configuration/compiler stamps. A cancelled,
+superseded, failed, or partially indexed build never replaces the last valid
+snapshot. Matching compiler output is published with LSP
+`textDocument/publishDiagnostics` notifications, and a matching successful
+refresh replaces the diagnostic set (including clearing old diagnostics).
+Full synchronization remains an overlay only: compiler refreshes read
+workspace files, so changed unsaved buffers continue to suppress stale
+position-sensitive results until Phase 5's overlay strategy exists.
 
 ### Phase 5: unsaved-buffer analysis and richer features
 

@@ -34,6 +34,12 @@ type
     path*: string ## The artifact path passed to the inspector.
     status*: BinnyArtifactStatus ## Load and metadata outcome.
     sourcePath*: string ## The `modulesrc` path, when present.
+    sourceFiles*: seq[string] ## Source filenames referenced by line metadata.
+    tokenCount*: int ## Number of raw NIF tokens in the BIF.
+    tagCount*: int ## Number of interned tag names.
+    stringCount*: int ## Number of interned string literals.
+    symbolCount*: int ## Number of interned symbols.
+    filenameCount*: int ## Number of interned source filenames.
     tags*: seq[string] ## Distinct tags observed while traversing the artifact.
     declarations*: seq[BinnyDeclaration] ## Owned copies of indexed declarations.
     failure*: BifLoadFailure ## Structured safe-loader failure, when applicable.
@@ -110,6 +116,14 @@ proc declarationLocation(
 proc inspectLoadedArtifact(module: var BifModule, path: string): BinnyArtifactReport =
   result.path = path
   result.sourcePath = module.extractSourcePath()
+  result.tokenCount = module.buf.len()
+  result.tagCount = module.buf.tags.tags.len
+  result.stringCount = module.buf.pool.strings.len
+  result.symbolCount = module.buf.pool.syms.len
+  result.filenameCount = module.buf.pool.filenames.len
+  if result.filenameCount > 0:
+    for index in 1 .. result.filenameCount:
+      result.sourceFiles.add(module.buf.pool.filenames[FileId(index)])
   result.tags = module.collectTags()
   let effectiveLocations = module.collectEffectiveLocations()
 

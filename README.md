@@ -1,91 +1,100 @@
-# nimdex
+# Nimdex
 
-GitHub template repository for Nim packages using Atlas for dependency
-management and GitHub Actions for CI.
+Nimdex provides compiler-backed symbol indexing for Nim projects through a
+small command-line client and an LSP server.
 
-## Use This Template
+## Requirements
 
-1. Create a new repository with GitHub's "Use this template" button.
-2. Clone the new repository locally.
-3. Pick the Nim package name you want to publish, using letters, numbers, and
-   underscores.
-4. Run:
+Nimdex needs a Nim compiler that supports `--genBif:on`. This checkout
+includes one at `deps/nim-devel/bin/nim`; another environment must provide an
+equivalent compiler.
 
-```sh
-./scripts/rename_template.sh your_package_name
-```
-
-That updates the starter package/module/test filenames and rewrites the
-remaining `nimdex` / `nimdex` references in the template files.
-
-## Setup
+Install the project dependencies with Atlas:
 
 ```sh
 atlas install
 ```
 
-Atlas writes dependency paths to `nim.cfg` and installs dependencies under
-`deps/`. Those files are intentionally ignored.
+## Command line
 
-## JSON-RPC over stdio
-
-Run the stdin/stdout server with:
+Run the CLI directly from a checkout:
 
 ```sh
-nim r src/nimdex_stdio.nim
+nim r src/nimdex.nim -- check /path/to/project
+nim r src/nimdex.nim -- symbols /path/to/project
+nim r src/nimdex.nim -- symbols /path/to/project exportedRoutine
+nim r src/nimdex.nim -- debug /path/to/project
 ```
 
-It uses Sigils' LSP-style `Content-Length` framing and currently exposes the
-`nimdex.greet` method with a `name` parameter. Keep diagnostics on stderr;
-stdout is reserved for JSON-RPC messages.
+The project defaults to the current directory. The commands start a short-
+lived Nimdex daemon, communicate with it using the same LSP
+`Content-Length`/JSON-RPC transport used by editors, and then shut it down.
 
-## LSP over stdio
+`check` reports whether a compiler-backed semantic snapshot was built.
+`symbols` sends the standard `workspace/symbol` request and prints matching
+declarations. `debug` sends the custom `nimdex/debug` request and prints the
+compiler, workspace paths, refresh command/cache, generated BIF files, loaded
+modules, source mappings, pool counts, and token counts.
 
-Run the initial LSP server with:
+Useful options are:
+
+```text
+--compiler PATH       Select the Nim compiler
+--cache-root PATH     Store generated artifacts in PATH
+--entry-point PATH    Add a Nim entry point (repeatable)
+--import-path PATH    Add a Nim import path (repeatable)
+--artifact-root PATH  Read existing BIF artifacts (repeatable)
+--nim-arg ARG         Pass a controlled argument to Nim (repeatable)
+--query TEXT          Filter symbols by name
+--debug               Include the detailed daemon report with symbols
+```
+
+## Editor integration
+
+Start the daemon directly when an editor launches an LSP server:
 
 ```sh
-nim r src/nimdex_lsp.nim
+nim r src/nimdex.nim -- daemon
 ```
 
-Nimdex requires a Nim compiler that advertises `--genBif:on` so it can build
-semantic artifacts for language features. In this checkout the development
-compiler is `deps/nim-devel/bin/nim`; an equivalent BIF-capable compiler is
-required in other environments. Nimdex does not use the `deps/langserver/`
-language backend or `nimsuggest`.
-
-Without artifact configuration the server supports lifecycle messages and full
-document synchronization, but does not advertise semantic features. Configure
-the BIF roots in `initialize.initializationOptions`:
+The client should send the project `rootUri` in `initialize`. For explicit
+compiler configuration, put options such as these in
+`initialize.initializationOptions`:
 
 ```json
-{"artifactRoots":["/path/to/nimcache"]}
+{
+  "compilerPath": "/path/to/nim",
+  "entryPoints": ["main.nim"],
+  "importPaths": ["src"],
+  "cacheRoot": ".nimdex/nimcache"
+}
 ```
 
-With roots configured, Nimdex builds an owned snapshot and advertises verified
-`documentSymbol`, `workspace/symbol`, and declaration `hover` results. Stale
-or unsaved source that differs from the indexed artifact is suppressed rather
-than served by a language shim. Offline BIF loading and semantic extraction
-use independent Sigils worker-pool actors for parallelism.
+Nimdex currently provides document symbols, workspace symbols, hover, full
+document synchronization, and compiler diagnostics. Unsaved changes are
+synchronized, but position-sensitive semantic results remain unavailable
+until a matching compiler snapshot exists.
 
-## Test
+## How it works
 
-Run the full test suite:
+Nimdex probes the configured compiler and requires `--genBif:on`. The daemon
+runs a controlled compile into a project/configuration/source-specific cache,
+safely loads the generated BIF files through Binny, and converts them into
+owned semantic records. BIF loading and indexing use Sigils worker pools; the
+blocking compiler process runs outside those workers.
+
+The LSP publishes a complete stamped snapshot only after refresh succeeds,
+preserving the last valid snapshot when a later build fails or is cancelled.
+The CLI uses the same protocol messages as an editor rather than calling the
+compiler or indexer through a separate shortcut.
+
+Nimdex uses the generic LSP/JSON-RPC protocol and does not depend on the
+`deps/langserver/` language backend or `nimsuggest`.
+
+## Development
+
+Run the full test suite with:
 
 ```sh
-nim test
+atlas-run tests
 ```
-
-Run a single test:
-
-```sh
-nim r tests/tyour_package_name.nim
-```
-
-## Layout
-
-- `src/your_package_name.nim`: package module after renaming.
-- `tests/tyour_package_name.nim`: unit tests after renaming.
-- `config.nims`: shared Nim switches and the `nim test` task.
-- `.github/workflows/ci.yml`: GitHub Actions CI.
-- `scripts/rename_template.sh`: one-shot template bootstrap rename.
-# nimdex

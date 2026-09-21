@@ -7,6 +7,7 @@ import sigils/rpcs/jsonrpc
 import sigils/rpcs/json/jrStdio as jrStdio
 
 import ./bifindex
+import ./compiler
 import ./documents
 import ./language
 import ./lsptransport
@@ -16,6 +17,8 @@ const
   LspServerNotInitialized* = -32002'i32 ## LSP error for pre-initialization requests.
   LspAnalysisUnavailable* = -32001'i32 ## No compiler-backed snapshot is installed.
   LspServerBusy* = -32003'i32 ## The bounded language queue has no capacity.
+  LspCompilerUnavailable* = -32004'i32 ## The required Nim compiler is unavailable.
+  LspDebugMethod* = "nimdex/debug" ## Nimdex diagnostics/introspection method.
   LspRequestCancelled* = -32800'i32 ## LSP cancellation response code.
   LspContentModified* = -32801'i32 ## Work was superseded by a newer stamp.
   LspExitSuccess* = 0 ## Exit status after a valid shutdown and exit sequence.
@@ -51,6 +54,14 @@ type
 
   BifIndexTrigger = ref object of AgentActor
 
+  CompilerRefreshCompletion = object
+    result: CompilerRefreshResult
+
+  CompilerRefreshJob = ref object of AgentActor
+    request: CompilerRefreshRequest
+
+  CompilerRefreshTrigger = ref object of AgentActor
+
   LspServer* = ref object of DynamicAgent ## A Nimdex LSP session and its worker bridge.
     adapter: JsonRpcAdapter
     dispatcher: JsonRpcDispatcher
@@ -58,6 +69,9 @@ type
     home: SigilThreadPtr
     workspace: Workspace
     artifactRoots: seq[string]
+    configuredCompilerPath: string
+    compiler: CompilerCapabilities
+    compilerEnabled: bool
     semanticCapabilities: bool
     semanticReady: bool
     semanticLoading: bool
@@ -75,6 +89,21 @@ type
     queued: seq[LspQueuedRequest]
     indexThread: ptr SigilThreadDefault
     indexJob: AgentProxy[BifIndexJob]
+    compilerThread: ptr SigilThreadDefault
+    compilerJob: AgentProxy[CompilerRefreshJob]
+    compilerCancellation: CompilerCancellation
+    compilerLoading: bool
+    compilerRefreshPending: bool
+    publishedDiagnosticUris: Table[string, bool]
+    activeSnapshot: SemanticSnapshot
+    lastCompilerCachePath: string
+    lastCompilerCommands: seq[string]
+    lastCompilerArtifacts: seq[string]
+    lastCompilerExitCode: int
+    lastCompilerStdoutBytes: int
+    lastCompilerStderrBytes: int
+    lastCompilerError: string
+    lastCompilerCancelled: bool
 
 let
   initializeSelector = selector[JsonNode, JsonNode]("initialize")
@@ -87,9 +116,14 @@ let
   documentSymbolSelector = selector[JsonNode, JsonNode]("textDocument/documentSymbol")
   workspaceSymbolSelector = selector[JsonNode, JsonNode]("workspace/symbol")
   hoverSelector = selector[JsonNode, JsonNode]("textDocument/hover")
+  debugSelector = selector[JsonNode, JsonNode](LspDebugMethod)
 
 proc indexRequested(source: BifIndexTrigger) {.signal.}
 proc indexCompleted(source: BifIndexJob, completion: sink BifIndexCompletion) {.signal.}
+proc compilerRefreshRequested(source: CompilerRefreshTrigger) {.signal.}
+proc compilerRefreshCompleted(
+  source: CompilerRefreshJob, completion: sink CompilerRefreshCompletion
+) {.signal.}
 
 proc runBifIndex(job: BifIndexJob) {.slot.} =
   var completion = BifIndexCompletion()
@@ -101,6 +135,45 @@ proc runBifIndex(job: BifIndexJob) {.slot.} =
   except Defect as error:
     completion.error = "BIF indexing worker failure: " & error.msg
   emit job.indexCompleted(completion)
+
+proc compilerFailure(
+    request: CompilerRefreshRequest, message: string
+): CompilerRefreshResult =
+  result.compiler = request.capabilities
+  result.stamp = AnalysisStamp(
+    valid: true,
+    projectId: request.workspace.projectId,
+    documentGeneration: request.documentGeneration,
+    configurationGeneration: request.workspace.configurationGeneration,
+    configurationFingerprint: request.workspace.configurationFingerprint,
+    compilerFingerprint: request.capabilities.fingerprint,
+  )
+  result.error = message
+  let entryPoints = discoverCompilerEntryPoints(request.workspace)
+  let sourcePath =
+    if entryPoints.len > 0:
+      entryPoints[0]
+    else:
+      request.workspace.rootPath
+  result.diagnostics.add(
+    CompilerDiagnostic(
+      sourcePath: sourcePath,
+      sourceUri: documentUriFromPath(sourcePath),
+      severity: cdsError,
+      message: message,
+    )
+  )
+
+proc runCompilerRefresh(job: CompilerRefreshJob) {.slot.} =
+  var completion = CompilerRefreshCompletion()
+  try:
+    completion.result = runCompilerRefresh(job.request)
+  except CatchableError as error:
+    completion.result = compilerFailure(job.request, error.msg)
+  except Defect as error:
+    completion.result =
+      compilerFailure(job.request, "compiler refresh worker failure: " & error.msg)
+  emit job.compilerRefreshCompleted(completion)
 
 proc raiseLspError(code: int32, message: string) {.noreturn.} =
   let error = newException(RpcRouteError, message)
@@ -164,6 +237,110 @@ proc artifactRootsFromInitialize(params: JsonNode): seq[string] =
   if options.kind != JObject:
     return
   result = stringArray(options, "artifactRoots", "initialize initializationOptions")
+
+type CompilerInitializeOptions = object
+  configured: bool
+  autoCompileSet: bool
+  autoCompile: bool
+  compilerPath: string
+  cacheRoot: string
+  entryPoints: seq[string]
+  importPaths: seq[string]
+  nimArguments: seq[string]
+
+proc initializationOptions(params: JsonNode): JsonNode =
+  if params.kind == JObject and params.hasKey("initializationOptions"):
+    return params["initializationOptions"]
+  newJObject()
+
+proc compilerOptionsFromInitialize(
+    params: JsonNode, serverCompilerPath: string
+): CompilerInitializeOptions =
+  let options = initializationOptions(params)
+  if serverCompilerPath.len > 0:
+    result.configured = true
+  if options.kind != JObject:
+    if serverCompilerPath.len > 0:
+      result.configured = true
+      result.compilerPath = serverCompilerPath
+    return
+
+  result.compilerPath = serverCompilerPath
+  if options.hasKey("compiler"):
+    result.configured = true
+    let compiler = options["compiler"]
+    case compiler.kind
+    of JString:
+      result.compilerPath = compiler.getStr()
+    of JObject:
+      if compiler.hasKey("path"):
+        if compiler["path"].kind != JString:
+          raiseLspError(RpcInvalidParams, "initialize compiler.path must be a string")
+        result.compilerPath = compiler["path"].getStr()
+      elif compiler.hasKey("compilerPath"):
+        if compiler["compilerPath"].kind != JString:
+          raiseLspError(
+            RpcInvalidParams, "initialize compiler.compilerPath must be a string"
+          )
+        result.compilerPath = compiler["compilerPath"].getStr()
+    else:
+      raiseLspError(
+        RpcInvalidParams,
+        "initialize initializationOptions.compiler must be a string or object",
+      )
+  if options.hasKey("compilerPath"):
+    result.configured = true
+    if options["compilerPath"].kind != JString:
+      raiseLspError(
+        RpcInvalidParams,
+        "initialize initializationOptions.compilerPath must be a string",
+      )
+    result.compilerPath = options["compilerPath"].getStr()
+  if options.hasKey("cacheRoot"):
+    result.configured = true
+    result.cacheRoot =
+      requireString(options, "cacheRoot", "initialize initializationOptions")
+  if options.hasKey("entryPoints"):
+    result.configured = true
+    result.entryPoints =
+      stringArray(options, "entryPoints", "initialize initializationOptions")
+  if options.hasKey("importPaths"):
+    result.configured = true
+    result.importPaths =
+      stringArray(options, "importPaths", "initialize initializationOptions")
+  if options.hasKey("nimArguments"):
+    result.configured = true
+    result.nimArguments =
+      stringArray(options, "nimArguments", "initialize initializationOptions")
+  if options.hasKey("autoCompile"):
+    if options["autoCompile"].kind != JBool:
+      raiseLspError(
+        RpcInvalidParams,
+        "initialize initializationOptions.autoCompile must be a boolean",
+      )
+    result.autoCompileSet = true
+    result.autoCompile = options["autoCompile"].getBool()
+    result.configured = result.autoCompile
+
+proc resolveWorkspacePaths(rootUri: string, paths: openArray[string]): seq[string] =
+  let rootPath = pathFromDocumentUri(rootUri)
+  for path in paths:
+    if path.len == 0:
+      continue
+    result.add(
+      if rootPath.len > 0 and not isAbsolute(path):
+        normalizeDocumentPath(rootPath / path)
+      else:
+        normalizeDocumentPath(path)
+    )
+
+proc resolveCompilerPath(rootUri, path: string): string =
+  if path.len == 0:
+    return
+  let rootPath = pathFromDocumentUri(rootUri)
+  if rootPath.len > 0 and not isAbsolute(path) and (DirSep in path or AltSep in path):
+    return normalizeDocumentPath(rootPath / path)
+  path
 
 proc resolveArtifactRoots(rootUri: string, roots: openArray[string]): seq[string] =
   let rootPath = pathFromDocumentUri(rootUri)
@@ -336,12 +513,144 @@ proc requireLanguageSuccess(response: LanguageResponse) =
         RpcInternalError
     raiseLspError(code, response.error)
 
+proc addJsonStrings(node: JsonNode, name: string, values: openArray[string]) =
+  var array = newJArray()
+  for value in values:
+    array.add(%value)
+  node[name] = array
+
+proc addUniquePath(paths: var seq[string], path: string) =
+  if path.len == 0:
+    return
+  let normalized = normalizeDocumentPath(path)
+  if normalized.len > 0 and normalized notin paths:
+    paths.add(normalized)
+
+proc configurationPaths(server: LspServer): seq[string] =
+  var roots: seq[string]
+  roots.add(server.workspace.rootPath)
+  roots.add(server.workspace.importPaths)
+  for root in roots:
+    if root.len == 0:
+      continue
+    var current = normalizeDocumentPath(root)
+    while current.len > 0:
+      for name in ["nim.cfg", "config.nims"]:
+        let candidate = current / name
+        if fileExists(candidate):
+          result.addUniquePath(candidate)
+      if dirExists(current):
+        for kind, path in walkDir(current):
+          if kind != pcFile:
+            continue
+          let extension = path.splitFile().ext.toLowerAscii()
+          if extension == ".nimble":
+            result.addUniquePath(path)
+      let parent = current.parentDir
+      if parent == current:
+        break
+      current = parent
+
+proc compilerLibraryPaths(server: LspServer): seq[string] =
+  if server.compiler.compilerPath.len > 0:
+    let compilerRoot = server.compiler.compilerPath.parentDir.parentDir
+    let standardLibrary = compilerRoot / "lib"
+    if dirExists(standardLibrary):
+      result.addUniquePath(standardLibrary)
+  if server.workspace.rootPath.len > 0:
+    let projectLibrary = server.workspace.rootPath / "lib"
+    if dirExists(projectLibrary):
+      result.addUniquePath(projectLibrary)
+  for path in server.workspace.importPaths:
+    result.addUniquePath(path)
+
+proc symbolCount(snapshot: SemanticSnapshot): int =
+  for module in snapshot.modules:
+    result += module.symbols.len
+
+proc debugLsp(server: LspServer, params: JsonNode): JsonNode =
+  discard params
+  server.requireRunning()
+
+  result = newJObject()
+  result["method"] = %LspDebugMethod
+
+  let workspace = newJObject()
+  workspace["rootUri"] = %server.workspace.rootUri
+  workspace["rootPath"] = %server.workspace.rootPath
+  workspace["projectId"] = %server.workspace.projectId
+  workspace["cacheRoot"] = %server.workspace.cacheRoot
+  workspace["configurationGeneration"] = %server.workspace.configurationGeneration
+  workspace["configurationFingerprint"] = %($server.workspace.configurationFingerprint)
+  addJsonStrings(workspace, "entryPoints", server.workspace.entryPoints)
+  addJsonStrings(workspace, "importPaths", server.workspace.importPaths)
+  addJsonStrings(workspace, "nimArguments", server.workspace.nimArguments)
+  addJsonStrings(workspace, "artifactRoots", server.workspace.artifactRoots)
+  result["workspace"] = workspace
+
+  let compiler = newJObject()
+  compiler["path"] = %server.compiler.compilerPath
+  compiler["version"] = %server.compiler.version
+  compiler["revision"] = %server.compiler.revision
+  compiler["available"] = %server.compiler.available
+  compiler["supportsGenBif"] = %server.compiler.supportsGenBif
+  compiler["fingerprint"] = %($server.compiler.fingerprint)
+  compiler["enabled"] = %server.compilerEnabled
+  compiler["error"] = %server.compiler.error
+  result["compiler"] = compiler
+
+  let paths = newJObject()
+  addJsonStrings(paths, "libraryPaths", server.compilerLibraryPaths())
+  addJsonStrings(paths, "configurationPaths", server.configurationPaths())
+  result["paths"] = paths
+
+  let refresh = newJObject()
+  refresh["cachePath"] = %server.lastCompilerCachePath
+  refresh["exitCode"] = %server.lastCompilerExitCode
+  refresh["stdoutBytes"] = %server.lastCompilerStdoutBytes
+  refresh["stderrBytes"] = %server.lastCompilerStderrBytes
+  refresh["error"] = %server.lastCompilerError
+  refresh["cancelled"] = %server.lastCompilerCancelled
+  addJsonStrings(refresh, "commandLines", server.lastCompilerCommands)
+  addJsonStrings(refresh, "artifactPaths", server.lastCompilerArtifacts)
+  result["refresh"] = refresh
+
+  var semanticNode: JsonNode = newJObject()
+  semanticNode["ready"] = %server.semanticReady
+  semanticNode["loading"] = %server.semanticLoading
+  semanticNode["failed"] = %server.semanticFailed
+  semanticNode["moduleCount"] = %server.activeSnapshot.moduleCount()
+  semanticNode["symbolCount"] = %server.activeSnapshot.symbolCount()
+  semanticNode["tokenCount"] = %server.activeSnapshot.tokenCount()
+  semanticNode["failureCount"] = %server.activeSnapshot.failureCount()
+  semanticNode["sourceFingerprint"] = %($server.activeSnapshot.sourceFingerprint)
+  var modules = newJArray()
+  for module in server.activeSnapshot.modules:
+    let value = newJObject()
+    value["artifactPath"] = %module.artifactPath
+    value["sourcePath"] = %module.sourcePath
+    value["sourceUri"] = %module.sourceUri
+    value["tokenCount"] = %module.tokenCount
+    value["tagCount"] = %module.tagCount
+    value["stringCount"] = %module.stringCount
+    value["symbolPoolCount"] = %module.symbolPoolCount
+    value["filenameCount"] = %module.filenameCount
+    value["symbolCount"] = %module.symbols.len
+    addJsonStrings(value, "sourceFiles", module.sourceFiles)
+    addJsonStrings(value, "tags", module.tags)
+    modules.add(value)
+  semanticNode["modules"] = modules
+  result["semantic"] = semanticNode
+
 proc installSemanticIndex(server: LspServer) =
   if not server.semanticCapabilities:
     return
   try:
     var snapshot = buildBifIndex(server.workspace, server.artifactRoots)
+    server.activeSnapshot = snapshot
     server.language.installIndex(snapshot)
+    server.semanticReady = true
+    server.semanticFailed = false
   except CatchableError:
     ## Capability advertisement remains useful when a refresh cannot be
     ## completed, but the language actor will correctly return no results
@@ -359,6 +668,8 @@ proc submitLanguageRequest(
   kind: LanguageRequestKind,
   stamp: LanguageStamp,
 ): bool
+
+proc initializeLsp(server: LspServer, params: JsonNode): JsonNode
 
 proc stopSemanticIndex(server: LspServer) =
   if server.indexThread.isNil:
@@ -388,18 +699,184 @@ proc startSemanticIndex(server: LspServer) =
   thread.start()
   emit trigger.indexRequested()
 
+proc stopCompilerRefresh(server: LspServer) =
+  if not server.compilerThread.isNil:
+    server.compilerCancellation.cancelCompiler()
+    server.compilerThread.send(ThreadSignal(kind: Exit))
+    server.compilerThread.join()
+    server.compilerThread = nil
+    server.compilerJob = nil
+  if not server.compilerCancellation.isNil:
+    server.compilerCancellation.releaseCompilerCancellation()
+    server.compilerCancellation = nil
+  server.compilerLoading = false
+
+proc compilerDiagnosticPosition(
+    server: LspServer, diagnostic: CompilerDiagnostic
+): tuple[start, finish: TextPosition] =
+  result.start = TextPosition(line: 0, character: 0)
+  result.finish = result.start
+  if diagnostic.sourcePath.len == 0 or not diagnostic.hasLocation or
+      not fileExists(diagnostic.sourcePath):
+    result.start = TextPosition(
+      line: max(int(diagnostic.line) - 1, 0), character: max(int(diagnostic.column), 0)
+    )
+    result.finish = result.start
+    return
+  try:
+    let document = initDocumentSnapshot(
+      diagnostic.sourceUri, readFile(diagnostic.sourcePath), 0, server.positionEncoding
+    )
+    let line = max(int(diagnostic.line) - 1, 0)
+    let offset = document.lineStartOffset(line) + max(int(diagnostic.column), 0)
+    if not document.tryPositionAt(offset, result.start):
+      result.start = TextPosition(line: line, character: 0)
+    let finishOffset = min(offset + 1, document.lineEndOffset(line))
+    if not document.tryPositionAt(finishOffset, result.finish):
+      result.finish = result.start
+  except CatchableError:
+    discard
+
+proc lspPosition(position: TextPosition): JsonNode
+
+proc compilerDiagnosticSeverity(diagnostic: CompilerDiagnostic): int =
+  case diagnostic.severity
+  of cdsError: 1
+  of cdsWarning: 2
+  of cdsInformation: 3
+  of cdsHint: 4
+
+proc compilerDiagnosticJson(
+    server: LspServer, diagnostic: CompilerDiagnostic
+): JsonNode =
+  let positions = server.compilerDiagnosticPosition(diagnostic)
+  result = newJObject()
+  let range = newJObject()
+  range["start"] = lspPosition(positions.start)
+  range["end"] = lspPosition(positions.finish)
+  result["range"] = range
+  result["severity"] = %diagnostic.compilerDiagnosticSeverity()
+  result["source"] = %"nim"
+  result["message"] = %diagnostic.message
+
+proc publishCompilerDiagnostics(
+    server: LspServer, diagnostics: openArray[CompilerDiagnostic]
+) =
+  if server.dispatcher.isNil:
+    return
+  var grouped = initTable[string, seq[CompilerDiagnostic]]()
+  for diagnostic in diagnostics:
+    let uri =
+      if diagnostic.sourceUri.len > 0:
+        diagnostic.sourceUri
+      elif diagnostic.sourcePath.len > 0:
+        documentUriFromPath(diagnostic.sourcePath)
+      else:
+        server.workspace.rootUri
+    if uri.len > 0:
+      grouped.mgetOrPut(uri, @[]).add(diagnostic)
+
+  var uris = initTable[string, bool]()
+  for uri in server.publishedDiagnosticUris.keys:
+    uris[uri] = true
+  for uri in grouped.keys:
+    uris[uri] = true
+
+  for uri in uris.keys:
+    var params = newJObject()
+    params["uri"] = %uri
+    var values = newJArray()
+    if uri in grouped:
+      for diagnostic in grouped[uri]:
+        values.add(server.compilerDiagnosticJson(diagnostic))
+    params["diagnostics"] = values
+    server.dispatcher.sendJsonRpcNotification("textDocument/publishDiagnostics", params)
+
+  server.publishedDiagnosticUris.clear()
+  for uri in grouped.keys:
+    server.publishedDiagnosticUris[uri] = true
+
+proc receiveCompilerRefreshCompletion(
+  server: LspServer, completion: CompilerRefreshCompletion
+) {.slot.}
+
+proc runCompilerRefreshSynchronously(server: LspServer)
+
+proc startCompilerRefresh(server: LspServer) =
+  if not server.compilerEnabled or server.compilerLoading:
+    return
+  server.compilerLoading = true
+  server.semanticLoading = true
+  if not server.semanticReady:
+    server.semanticFailed = false
+  server.compilerRefreshPending = false
+  let cancellation = newCompilerCancellation()
+  server.compilerCancellation = cancellation
+  let thread = newSigilThread()
+  let request = CompilerRefreshRequest(
+    workspace: server.workspace,
+    capabilities: server.compiler,
+    documentGeneration: server.documentGeneration,
+    cancellation: cancellation,
+  )
+  var job = CompilerRefreshJob(request: request)
+  let proxy = job.moveToThread(thread)
+  server.compilerThread = thread
+  server.compilerJob = proxy
+  let trigger = CompilerRefreshTrigger()
+  connectThreaded(trigger, compilerRefreshRequested, proxy, runCompilerRefresh)
+  connectThreaded(
+    proxy, compilerRefreshCompleted, server, receiveCompilerRefreshCompletion(LspServer)
+  )
+  thread.start()
+  emit trigger.compilerRefreshRequested()
+
+proc requestCompilerRefresh(server: LspServer) =
+  if not server.compilerEnabled:
+    return
+  if server.compilerLoading:
+    server.compilerRefreshPending = true
+    server.compilerCancellation.cancelCompiler()
+  elif server.asynchronousSession:
+    server.startCompilerRefresh()
+  else:
+    server.runCompilerRefreshSynchronously()
+
+proc runCompilerRefreshSynchronously(server: LspServer) =
+  if not server.compilerEnabled:
+    return
+  let cancellation = newCompilerCancellation()
+  server.compilerCancellation = cancellation
+  let completion = CompilerRefreshCompletion(
+    result: runCompilerRefresh(
+      CompilerRefreshRequest(
+        workspace: server.workspace,
+        capabilities: server.compiler,
+        documentGeneration: server.documentGeneration,
+        cancellation: cancellation,
+      )
+    )
+  )
+  server.receiveCompilerRefreshCompletion(completion)
+
 proc currentLanguageStamp(server: LspServer): LanguageStamp =
   LanguageStamp(
     valid: true,
+    projectId: server.workspace.projectId,
     documentGeneration: server.documentGeneration,
     configurationGeneration: server.workspace.configurationGeneration,
+    configurationFingerprint: server.workspace.configurationFingerprint,
+    compilerFingerprint: if server.compilerEnabled: server.compiler.fingerprint else: 0,
   )
 
 proc stampMatches(a, b: LanguageStamp): bool =
   a.valid == b.valid and (
     not a.valid or (
+      (a.projectId.len == 0 or b.projectId.len == 0 or a.projectId == b.projectId) and
       a.documentGeneration == b.documentGeneration and
-      a.configurationGeneration == b.configurationGeneration
+      a.configurationGeneration == b.configurationGeneration and
+      a.configurationFingerprint == b.configurationFingerprint and
+      a.compilerFingerprint == b.compilerFingerprint
     )
   )
 
@@ -670,6 +1147,8 @@ proc submitAsyncLspRequest(
     let accepted = server.submitLanguageRequest(request, id, request.kind, stamp)
     if accepted and request.kind in {lrkOpen, lrkChange, lrkClose}:
       server.documentGeneration = stamp.documentGeneration
+      if request.kind == lrkChange:
+        server.requestCompilerRefresh()
   except RpcRouteError as error:
     if hasResponse:
       server.sendError(id, error.code, error.msg)
@@ -710,6 +1189,22 @@ proc dispatchIncomingJsonRpc(server: LspServer, data: string) =
       discard
     return
 
+  if methodName == "initialize":
+    ## Keep the transport-independent Sigils route for direct adapter users,
+    ## while preserving the prerequisite message on the asynchronous stdio
+    ## path where Nimdex owns response dispatch.
+    try:
+      let value = server.initializeLsp(root.requestParams())
+      if not id.isNil:
+        server.dispatcher.sendJsonRpcMessage(successResponse(id, value))
+    except RpcRouteError as error:
+      if not id.isNil:
+        server.sendError(id, error.code, error.msg)
+    except CatchableError as error:
+      if not id.isNil:
+        server.sendError(id, RpcInternalError, error.msg)
+    return
+
   if methodName == "shutdown":
     let response = server.adapter.handleJsonRpc(data)
     if response.isSome():
@@ -742,6 +1237,33 @@ proc receiveJsonRpcStopped(server: LspServer) {.slot.} =
   if not server.isNil:
     server.inputStopped = true
 
+proc compilerStampMatches(server: LspServer, stamp: AnalysisStamp): bool =
+  let current = server.currentLanguageStamp()
+  stamp.valid and stamp.projectId == current.projectId and
+    stamp.documentGeneration == current.documentGeneration and
+    stamp.configurationGeneration == current.configurationGeneration and
+    stamp.configurationFingerprint == current.configurationFingerprint and
+    stamp.compilerFingerprint == current.compilerFingerprint
+
+proc drainQueuedLanguageRequests(
+    server: LspServer, available: bool, errorMessage: string
+) =
+  if server.queued.len == 0:
+    return
+  let queued = move(server.queued)
+  for item in queued:
+    if not available:
+      server.sendError(
+        item.id,
+        LspAnalysisUnavailable,
+        "analysis unavailable: " & (
+          if errorMessage.len > 0: errorMessage
+          else: "compiler-backed analysis is unavailable"
+        ),
+      )
+    else:
+      discard server.submitLanguageRequest(item.request, item.id, item.kind, item.stamp)
+
 proc receiveBifIndexCompletion(
     server: LspServer, completion: BifIndexCompletion
 ) {.slot.} =
@@ -749,46 +1271,114 @@ proc receiveBifIndexCompletion(
     return
   server.semanticLoading = false
   if completion.ok:
+    server.activeSnapshot = completion.snapshot
     server.language.installIndex(completion.snapshot)
     server.semanticReady = true
+    server.semanticFailed = false
   else:
     server.semanticFailed = true
 
   server.stopSemanticIndex()
+  server.drainQueuedLanguageRequests(
+    completion.ok, if completion.ok: "" else: completion.error
+  )
 
-  if server.queued.len == 0:
+proc receiveCompilerRefreshCompletion(
+    server: LspServer, completion: CompilerRefreshCompletion
+) {.slot.} =
+  if server.isNil:
     return
-  let queued = move(server.queued)
-  for item in queued:
-    if not completion.ok:
-      server.sendError(
-        item.id,
-        LspAnalysisUnavailable,
-        "analysis unavailable: " &
-          (
-            if completion.error.len > 0: completion.error
-            else: "BIF index is unavailable"
-          ),
-      )
-      continue
-    discard server.submitLanguageRequest(item.request, item.id, item.kind, item.stamp)
+
+  let refresh = completion.result
+  let current = server.compilerStampMatches(refresh.stamp)
+  let restart = server.compilerRefreshPending and not server.exitRequested
+  if current:
+    server.lastCompilerCachePath = refresh.cachePath
+    server.lastCompilerCommands = refresh.commandLines
+    server.lastCompilerArtifacts = refresh.artifactPaths
+    server.lastCompilerExitCode = refresh.exitCode
+    server.lastCompilerStdoutBytes = refresh.stdout.len
+    server.lastCompilerStderrBytes = refresh.stderr.len
+    server.lastCompilerError = refresh.error
+    server.lastCompilerCancelled = refresh.cancelled
+  server.compilerRefreshPending = false
+  server.semanticLoading = false
+  server.stopCompilerRefresh()
+
+  if not current:
+    if restart and server.state == lssRunning:
+      server.startCompilerRefresh()
+    return
+  if refresh.cancelled:
+    if restart and server.state == lssRunning:
+      server.startCompilerRefresh()
+    return
+
+  server.publishCompilerDiagnostics(refresh.diagnostics)
+  if refresh.ok:
+    ## The language actor receives the complete snapshot as one owned message;
+    ## the old snapshot remains visible until this message is delivered.
+    server.activeSnapshot = refresh.snapshot
+    server.language.installIndex(refresh.snapshot)
+    server.semanticReady = true
+    server.semanticFailed = false
+    server.drainQueuedLanguageRequests(true, "")
+  else:
+    ## A failed build never replaces a previously installed semantic snapshot.
+    ## Only an initial failure leaves queued requests unavailable.
+    server.semanticFailed = not server.semanticReady
+    server.drainQueuedLanguageRequests(false, refresh.error)
+
+  if restart and server.state == lssRunning:
+    server.startCompilerRefresh()
 
 proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
   if server.state != lssCreated:
     raiseLspError(RpcInvalidRequest, "server has already been initialized")
   let initializeParams = requireObject(params, "initialize params")
   server.positionEncoding = negotiatePositionEncoding(params)
+  let rootUri = rootUriFromInitialize(initializeParams)
+  let compilerOptions =
+    compilerOptionsFromInitialize(initializeParams, server.configuredCompilerPath)
   let configuredRoots =
     if server.artifactRoots.len > 0:
       server.artifactRoots
     else:
       artifactRootsFromInitialize(initializeParams)
-  let rootUri = rootUriFromInitialize(initializeParams)
+
+  var compilerRequested = compilerOptions.configured
+  if not compilerRequested and not compilerOptions.autoCompileSet and
+      configuredRoots.len == 0 and rootUri.len > 0:
+    ## A normal workspace with a discoverable Nim entry point uses the
+    ## compiler-backed path by default. Artifact-only mode remains available
+    ## for explicit phase-2 compatibility roots.
+    let candidateWorkspace = initWorkspace(rootUri)
+    compilerRequested = discoverCompilerEntryPoints(candidateWorkspace).len > 0
+
+  let resolvedCompilerPath = resolveCompilerPath(rootUri, compilerOptions.compilerPath)
+  var resolvedCacheRoot = ""
+  if compilerOptions.cacheRoot.len > 0:
+    resolvedCacheRoot = resolveWorkspacePaths(rootUri, @[compilerOptions.cacheRoot])[0]
   server.workspace = initWorkspace(
-    rootUri, artifactRoots = resolveArtifactRoots(rootUri, configuredRoots)
+    rootUri,
+    entryPoints = resolveWorkspacePaths(rootUri, compilerOptions.entryPoints),
+    importPaths = resolveWorkspacePaths(rootUri, compilerOptions.importPaths),
+    nimArguments = compilerOptions.nimArguments,
+    artifactRoots = resolveArtifactRoots(rootUri, configuredRoots),
+    compilerPath = resolvedCompilerPath,
+    cacheRoot = resolvedCacheRoot,
   )
   server.artifactRoots = server.workspace.artifactRoots
-  server.semanticCapabilities = server.artifactRoots.len > 0
+  if compilerRequested:
+    server.compiler = probeCompiler(server.workspace.compilerPath)
+    let prerequisite = server.compiler.requireCompiler()
+    if prerequisite.len > 0:
+      raiseLspError(LspCompilerUnavailable, prerequisite)
+    server.compilerEnabled = true
+  else:
+    server.compiler = CompilerCapabilities()
+    server.compilerEnabled = false
+  server.semanticCapabilities = server.compilerEnabled or server.artifactRoots.len > 0
 
   server.state = lssInitializing
   result = newJObject()
@@ -816,7 +1406,12 @@ proc initializedLsp(server: LspServer, params: JsonNode): JsonNode =
       raiseLspError(LspServerNotInitialized, "server is not initialized")
     raiseLspError(RpcInvalidRequest, "unexpected initialized notification")
   server.state = lssRunning
-  if server.asynchronousSession:
+  if server.compilerEnabled:
+    if server.asynchronousSession:
+      server.startCompilerRefresh()
+    else:
+      server.runCompilerRefreshSynchronously()
+  elif server.asynchronousSession:
     server.startSemanticIndex()
   else:
     server.installSemanticIndex()
@@ -844,6 +1439,7 @@ proc didOpenLsp(server: LspServer, params: JsonNode): JsonNode =
   let response =
     server.language.request(parseOpenRequest(params, server.positionEncoding))
   requireLanguageSuccess(response)
+  inc server.documentGeneration
   newJNull()
 
 proc didChangeLsp(server: LspServer, params: JsonNode): JsonNode =
@@ -851,12 +1447,15 @@ proc didChangeLsp(server: LspServer, params: JsonNode): JsonNode =
   let response =
     server.language.request(parseChangeRequest(params, server.positionEncoding))
   requireLanguageSuccess(response)
+  inc server.documentGeneration
+  server.requestCompilerRefresh()
   newJNull()
 
 proc didCloseLsp(server: LspServer, params: JsonNode): JsonNode =
   server.requireRunning()
   let response = server.language.request(parseCloseRequest(params))
   requireLanguageSuccess(response)
+  inc server.documentGeneration
   newJNull()
 
 proc documentSymbolsLsp(server: LspServer, params: JsonNode): JsonNode =
@@ -906,6 +1505,7 @@ proc registerLspRoutes(server: LspServer) =
   discard
     server.addMethod(workspaceSymbolSelector, toDynamicMethod(workspaceSymbolsLsp))
   discard server.addMethod(hoverSelector, toDynamicMethod(hoverLsp))
+  discard server.addMethod(debugSelector, toDynamicMethod(debugLsp))
 
   server.adapter.registerSelectorMethod("initialize", server, initializeSelector)
   server.adapter.registerSelectorMethod("initialized", server, initializedSelector)
@@ -925,8 +1525,11 @@ proc registerLspRoutes(server: LspServer) =
     "workspace/symbol", server, workspaceSymbolSelector
   )
   server.adapter.registerSelectorMethod("textDocument/hover", server, hoverSelector)
+  server.adapter.registerSelectorMethod(LspDebugMethod, server, debugSelector)
 
-proc newNimdexLspServer*(workers = 1, artifactRoots: seq[string] = @[]): LspServer =
+proc newNimdexLspServer*(
+    workers = 1, artifactRoots: seq[string] = @[], compilerPath = ""
+): LspServer =
   ## Create an LSP server with worker-owned document state.
   startLocalThreadDefault()
   result = LspServer(
@@ -934,10 +1537,12 @@ proc newNimdexLspServer*(workers = 1, artifactRoots: seq[string] = @[]): LspServ
     language: newLanguageRuntime(workers),
     home: getCurrentSigilThread(),
     artifactRoots: artifactRoots,
+    configuredCompilerPath: compilerPath,
     state: lssCreated,
     exitStatus: LspExitSuccess,
     pending: initTable[LanguageWorkId, LspPendingRequest](),
     pendingByClientId: initTable[string, seq[LanguageWorkId]](),
+    publishedDiagnosticUris: initTable[string, bool](),
   )
   result.registerLspRoutes()
 
@@ -962,6 +1567,7 @@ proc close*(server: LspServer) =
   if not server.isNil:
     server.cancelAllLanguageWork()
     server.stopSemanticIndex()
+    server.stopCompilerRefresh()
     server.language.close()
 
 proc runNimdexLspStdio*(
@@ -969,13 +1575,14 @@ proc runNimdexLspStdio*(
     output: File = stdout,
     workers = 1,
     artifactRoots: seq[string] = @[],
+    compilerPath = "",
 ): int =
   ## Serve LSP Content-Length messages until EOF or an exit notification.
   ##
   ## Input and output deliberately have different owners: the reader actor can
   ## block in File.readChar while the home thread continues to dispatch worker
   ## completions and flush framed responses.
-  let server = newNimdexLspServer(workers, artifactRoots)
+  let server = newNimdexLspServer(workers, artifactRoots, compilerPath)
   server.asynchronousSession = true
   let dispatcher = newJsonRpcDispatcher(server.adapter)
   server.dispatcher = dispatcher
