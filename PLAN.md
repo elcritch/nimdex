@@ -1,6 +1,6 @@
 # Binny-backed LSP plan
 
-Status: Phase 2 implemented. This document describes the remaining
+Status: Phase 3 implemented. This document describes the remaining
 implementation stages and the compatibility gates for each one.
 
 ## Goal
@@ -210,7 +210,23 @@ Keep references, rename, completion, formatting, code actions, semantic tokens, 
 
 ### Phase 3: responsive asynchronous runtime
 
-Before compiler refreshes run in the background, replace the single response slot with explicit correlated work state:
+Implemented in the current tree. `LanguageRuntime` now assigns internal work
+IDs, keeps separate active/retired reservations, returns owned completion
+records, enforces a bounded queue, and uses shared cancellation checkpoints.
+Language queries carry document/configuration stamps; stale completions are
+rejected before publication. LSP request IDs are correlated independently of
+those internal IDs, `$/cancelRequest` settles exactly one request, and
+shutdown defers its response until admitted language work has retired.
+
+The LSP stdio path uses a reader-only `JsonRpcIoAgent` on a dedicated Sigils
+thread and keeps the framed writer on the home thread. This lets the home
+scheduler pump Sigils worker completions and flush JSON-RPC responses while
+stdin is idle. The existing Sigils framing and dispatcher output primitives
+remain the transport boundary; no dependency-local Sigils changes are needed
+for this phase.
+
+The completed runtime now provides explicit correlated work state before
+compiler refreshes are introduced:
 
 - map internal work IDs to pending requests and completion callbacks;
 - settle all pending requests on success, failure, cancellation, worker exception, and shutdown;
@@ -219,7 +235,11 @@ Before compiler refreshes run in the background, replace the single response slo
 - prevent a completed old job from publishing over a newer document/configuration stamp;
 - provide an idle-input path that can flush completed responses and outbound diagnostics.
 
-Extend Sigils generically where needed for deferred JSON-RPC completion and responsive stdio. Do not return a placeholder response and later emit a second response with the same ID. Preserve `jrStdio` framing and keep stdout exclusively for framed JSON-RPC bytes.
+The implementation uses the existing Sigils JSON-RPC dispatcher output and
+framing primitives, with a Nimdex reader-only transport actor for responsive
+stdio. It does not return a placeholder response and later emit a second
+response with the same ID. `jrStdio` framing is preserved and stdout remains
+exclusively framed JSON-RPC bytes.
 
 ### Phase 4: compiler refresh and diagnostics
 

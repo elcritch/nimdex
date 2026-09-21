@@ -1,6 +1,6 @@
 ## Worker-pool language components used by the Nimdex LSP server.
 
-import std/[os, strutils, tables, times]
+import std/[atomics, os, strutils, tables, times]
 
 import ./documents
 import ./semantic
@@ -8,6 +8,13 @@ import ./semantic
 import sigils
 
 type
+  LanguageWorkId* = uint64 ## Internal identity for one submitted operation.
+
+  LanguageStamp* = object ## Version of the ordered language state used by work.
+    valid*: bool
+    documentGeneration*: uint64
+    configurationGeneration*: uint64
+
   LanguageRequestKind* = enum ## Operations supported by the language component.
     lrkOpen ## Store a newly opened document.
     lrkChange ## Replace an open document's full text.
@@ -30,6 +37,7 @@ type
     line*: int ## Zero-based line for a hover query.
     character*: int ## Zero-based character for a hover query.
     positionEncoding*: PositionEncoding ## Client character-unit encoding.
+    stamp*: LanguageStamp ## Expected ordered state for query operations.
 
   LanguageResponse* = object
     ## The deterministic result returned by worker-owned language state.
@@ -40,6 +48,21 @@ type
     preview*: string ## Hover text when compiler-backed analysis is available.
     symbols*: seq[LanguageSymbol] ## Owned symbols returned by an indexed query.
     error*: string ## A diagnostic description when `ok` is false.
+    cancelled*: bool ## Whether the operation stopped at a cancellation checkpoint.
+    superseded*: bool ## Whether the request's state stamp was no longer current.
+    stamp*: LanguageStamp ## State stamp at the point of completion.
+
+  LanguageCancellation = object
+    cancelled: Atomic[bool]
+
+  LanguageWork = object
+    id: LanguageWorkId
+    request: LanguageRequest
+    cancellation: ptr LanguageCancellation
+
+  LanguageCompletion* = object
+    id*: LanguageWorkId
+    response*: LanguageResponse
 
   LanguageSource = ref object of AgentActor
 
@@ -47,10 +70,11 @@ type
     documents: DocumentStore
     semantic: SemanticSnapshot
     hasSemantic: bool
+    documentGeneration: uint64
+    configurationGeneration: uint64
 
   LanguageReply = ref object of AgentActor
-    responseReady: bool
-    response: LanguageResponse
+    completions: seq[LanguageCompletion]
 
   LanguageRuntime* = ref object ## Main-thread bridge to worker-owned language state.
     home: SigilThreadPtr
@@ -58,13 +82,45 @@ type
     source: LanguageSource
     reply: LanguageReply
     serviceProxy: AgentProxy[LanguageService]
+    nextWorkId: LanguageWorkId
+    pending: Table[LanguageWorkId, ptr LanguageCancellation]
+    retired: Table[LanguageWorkId, ptr LanguageCancellation]
+    maxPending: int
     closed: bool
 
-proc languageRequest(source: LanguageSource, request: LanguageRequest) {.signal.}
-proc languageResponse(source: LanguageService, response: LanguageResponse) {.signal.}
+proc languageWork(source: LanguageSource, work: sink LanguageWork) {.signal.}
+proc languageResponse(
+  source: LanguageService, completion: sink LanguageCompletion
+) {.signal.}
+
 proc semanticSnapshotReady(
   source: LanguageSource, snapshot: sink SemanticSnapshot
 ) {.signal.}
+
+proc newLanguageCancellation(): ptr LanguageCancellation =
+  result = cast[ptr LanguageCancellation](allocShared0(sizeof(LanguageCancellation)))
+  result[].cancelled.store(false, moRelaxed)
+
+proc isCancelled(cancellation: ptr LanguageCancellation): bool =
+  not cancellation.isNil and cancellation.cancelled.load(moAcquire)
+
+proc cancelledResponse(
+    work: LanguageWork, stamp: LanguageStamp = LanguageStamp()
+): LanguageCompletion =
+  LanguageCompletion(
+    id: work.id,
+    response: LanguageResponse(
+      ok: false, cancelled: true, error: "language request was cancelled", stamp: stamp
+    ),
+  )
+
+proc markCancelled(cancellation: ptr LanguageCancellation) =
+  if not cancellation.isNil:
+    cancellation.cancelled.store(true, moRelease)
+
+proc releaseCancellation(cancellation: ptr LanguageCancellation) =
+  if not cancellation.isNil:
+    deallocShared(cancellation)
 
 proc sourceDocumentFor(
     self: LanguageService,
@@ -177,6 +233,7 @@ proc addDocumentSymbols(
     uri: string,
     positionEncoding: PositionEncoding,
     response: var LanguageResponse,
+    cancellation: ptr LanguageCancellation,
 ) =
   if not self.hasSemantic:
     response.ok = false
@@ -185,9 +242,19 @@ proc addDocumentSymbols(
     return
   var sourceDocuments = initTable[string, DocumentSnapshot]()
   for module in self.semantic.modules:
+    if cancellation.isCancelled():
+      response.ok = false
+      response.cancelled = true
+      response.error = "language request was cancelled"
+      return
     if module.sourceUri != uri or not self.moduleIsCurrent(module):
       continue
     for symbol in module.symbols:
+      if cancellation.isCancelled():
+        response.ok = false
+        response.cancelled = true
+        response.error = "language request was cancelled"
+        return
       if symbol.location.uri != uri or not symbol.location.valid:
         continue
       var document: DocumentSnapshot
@@ -203,6 +270,7 @@ proc addWorkspaceSymbols(
     query: string,
     positionEncoding: PositionEncoding,
     response: var LanguageResponse,
+    cancellation: ptr LanguageCancellation,
 ) =
   if not self.hasSemantic:
     response.ok = false
@@ -211,9 +279,19 @@ proc addWorkspaceSymbols(
     return
   var sourceDocuments = initTable[string, DocumentSnapshot]()
   for module in self.semantic.modules:
+    if cancellation.isCancelled():
+      response.ok = false
+      response.cancelled = true
+      response.error = "language request was cancelled"
+      return
     if not self.moduleIsCurrent(module):
       continue
     for symbol in module.symbols:
+      if cancellation.isCancelled():
+        response.ok = false
+        response.cancelled = true
+        response.error = "language request was cancelled"
+        return
       if not symbol.location.valid or not symbol.symbolMatchesQuery(query):
         continue
       var document: DocumentSnapshot
@@ -225,7 +303,10 @@ proc addWorkspaceSymbols(
   response.found = response.symbols.len > 0
 
 proc findHoverSymbol(
-    self: LanguageService, request: LanguageRequest, response: var LanguageResponse
+    self: LanguageService,
+    request: LanguageRequest,
+    response: var LanguageResponse,
+    cancellation: ptr LanguageCancellation,
 ) =
   if not self.hasSemantic:
     response.ok = false
@@ -235,9 +316,19 @@ proc findHoverSymbol(
   let position = TextPosition(line: request.line, character: request.character)
   var sourceDocuments = initTable[string, DocumentSnapshot]()
   for module in self.semantic.modules:
+    if cancellation.isCancelled():
+      response.ok = false
+      response.cancelled = true
+      response.error = "language request was cancelled"
+      return
     if not self.moduleIsCurrent(module):
       continue
     for symbol in module.symbols:
+      if cancellation.isCancelled():
+        response.ok = false
+        response.cancelled = true
+        response.error = "language request was cancelled"
+        return
       if not symbol.location.valid or symbol.location.uri != response.uri:
         continue
       var document: DocumentSnapshot
@@ -264,17 +355,25 @@ proc findHoverSymbol(
 proc installSemanticSnapshot(
     self: LanguageService, snapshot: sink SemanticSnapshot
 ) {.slot.} =
+  self.configurationGeneration = snapshot.configurationGeneration
   self.semantic = snapshot
   self.hasSemantic = true
 
-proc processLanguageRequest(self: LanguageService, request: LanguageRequest) {.slot.} =
-  var response = LanguageResponse(ok: true, uri: request.uri, version: request.version)
+proc processLanguageWork(self: LanguageService, work: LanguageWork) {.slot.} =
+  if work.cancellation.isCancelled():
+    emit self.languageResponse(work.cancelledResponse())
+    return
+
+  var response =
+    LanguageResponse(ok: true, uri: work.request.uri, version: work.request.version)
   try:
-    response.uri = normalizeDocumentUri(request.uri)
-    case request.kind
+    response.uri = normalizeDocumentUri(work.request.uri)
+    case work.request.kind
     of lrkOpen:
+      inc self.documentGeneration
       case self.documents.openDocument(
-        request.uri, request.text, request.version, request.positionEncoding
+        work.request.uri, work.request.text, work.request.version,
+        work.request.positionEncoding,
       )
       of dusApplied:
         discard
@@ -285,8 +384,10 @@ proc processLanguageRequest(self: LanguageService, request: LanguageRequest) {.s
         response.ok = false
         response.error = "document could not be opened"
     of lrkChange:
+      inc self.documentGeneration
       case self.documents.updateDocument(
-        request.uri, request.text, request.version, request.positionEncoding
+        work.request.uri, work.request.text, work.request.version,
+        work.request.positionEncoding,
       )
       of dusApplied:
         discard
@@ -300,25 +401,69 @@ proc processLanguageRequest(self: LanguageService, request: LanguageRequest) {.s
         response.ok = false
         response.error = "document change was not applied"
     of lrkClose:
-      discard self.documents.closeDocument(request.uri)
+      inc self.documentGeneration
+      discard self.documents.closeDocument(work.request.uri)
     of lrkDocumentSymbols:
-      self.addDocumentSymbols(response.uri, request.positionEncoding, response)
+      if work.request.stamp.valid and (
+        work.request.stamp.documentGeneration != self.documentGeneration or
+        work.request.stamp.configurationGeneration != self.configurationGeneration
+      ):
+        response.ok = false
+        response.superseded = true
+        response.error = "language request was superseded by newer state"
+      else:
+        self.addDocumentSymbols(
+          response.uri, work.request.positionEncoding, response, work.cancellation
+        )
     of lrkWorkspaceSymbols:
-      self.addWorkspaceSymbols(request.query, request.positionEncoding, response)
+      if work.request.stamp.valid and (
+        work.request.stamp.documentGeneration != self.documentGeneration or
+        work.request.stamp.configurationGeneration != self.configurationGeneration
+      ):
+        response.ok = false
+        response.superseded = true
+        response.error = "language request was superseded by newer state"
+      else:
+        self.addWorkspaceSymbols(
+          work.request.query, work.request.positionEncoding, response, work.cancellation
+        )
     of lrkHover:
-      self.findHoverSymbol(request, response)
+      if work.request.stamp.valid and (
+        work.request.stamp.documentGeneration != self.documentGeneration or
+        work.request.stamp.configurationGeneration != self.configurationGeneration
+      ):
+        response.ok = false
+        response.superseded = true
+        response.error = "language request was superseded by newer state"
+      else:
+        self.findHoverSymbol(work.request, response, work.cancellation)
+    response.stamp = LanguageStamp(
+      valid: work.request.stamp.valid,
+      documentGeneration: self.documentGeneration,
+      configurationGeneration: self.configurationGeneration,
+    )
   except CatchableError as error:
     response.ok = false
     response.error = "language state error: " & error.msg
+  except Defect as error:
+    response.ok = false
+    response.error = "language worker failure: " & error.msg
 
-  emit self.languageResponse(response)
+  if work.cancellation.isCancelled() and response.ok:
+    response.ok = false
+    response.cancelled = true
+    response.error = "language request was cancelled"
+  emit self.languageResponse(LanguageCompletion(id: work.id, response: response))
 
-proc receiveLanguageResponse(self: LanguageReply, response: LanguageResponse) {.slot.} =
-  self.response = response
-  self.responseReady = true
+proc receiveLanguageResponse(
+    self: LanguageReply, completion: LanguageCompletion
+) {.slot.} =
+  self.completions.add(completion)
 
-proc newLanguageRuntime*(workers = 1): LanguageRuntime =
+proc newLanguageRuntime*(workers = 1, maxPending = 512): LanguageRuntime =
   ## Start a Sigils worker pool and attach one serialized document-state actor.
+  if maxPending < 1:
+    raise newException(ValueError, "language maxPending must be positive")
   startLocalThreadDefault()
   let pool = newSigilThreadPool(workers = workers)
   pool.start()
@@ -331,11 +476,13 @@ proc newLanguageRuntime*(workers = 1): LanguageRuntime =
     source: LanguageSource(),
     reply: LanguageReply(),
     serviceProxy: serviceProxy,
+    nextWorkId: 1,
+    pending: initTable[LanguageWorkId, ptr LanguageCancellation](),
+    retired: initTable[LanguageWorkId, ptr LanguageCancellation](),
+    maxPending: maxPending,
   )
 
-  connectThreaded(
-    result.source, languageRequest, result.serviceProxy, processLanguageRequest
-  )
+  connectThreaded(result.source, languageWork, result.serviceProxy, processLanguageWork)
   connectThreaded(
     result.serviceProxy,
     languageResponse,
@@ -356,22 +503,111 @@ proc installIndex*(runtime: LanguageRuntime, snapshot: sink SemanticSnapshot) =
     return
   emit runtime.source.semanticSnapshotReady(snapshot)
 
-proc request*(runtime: LanguageRuntime, request: LanguageRequest): LanguageResponse =
-  ## Run one language operation and wait while pumping the caller's scheduler.
-  if runtime.isNil or runtime.closed:
-    return LanguageResponse(ok: false, error: "language runtime is closed")
+proc pendingCount*(runtime: LanguageRuntime): int =
+  ## Return active and cancelled-but-not-retired work reservations.
+  if runtime.isNil:
+    return 0
+  runtime.pending.len + runtime.retired.len
 
-  runtime.reply.responseReady = false
-  emit runtime.source.languageRequest(request)
-  while not runtime.reply.responseReady:
+proc submit*(runtime: LanguageRuntime, request: LanguageRequest): LanguageWorkId =
+  ## Queue one owned language operation and return its internal identity.
+  ## A zero result means that the runtime is closed or at capacity.
+  if runtime.isNil or runtime.closed or runtime.pendingCount() >= runtime.maxPending:
+    return 0
+
+  var id = runtime.nextWorkId
+  if id == 0:
+    id = 1
+  runtime.nextWorkId = id + 1
+  let cancellation = newLanguageCancellation()
+  runtime.pending[id] = cancellation
+  try:
+    emit runtime.source.languageWork(
+      LanguageWork(id: id, request: request, cancellation: cancellation)
+    )
+    id
+  except CatchableError:
+    runtime.pending.del(id)
+    cancellation.releaseCancellation()
+    0
+  except Defect:
+    runtime.pending.del(id)
+    cancellation.releaseCancellation()
+    0
+
+proc cancel*(runtime: LanguageRuntime, id: LanguageWorkId): bool =
+  ## Request cancellation at the shared checkpoint token.
+  if runtime.isNil or runtime.closed or id notin runtime.pending:
+    return false
+  runtime.pending[id].markCancelled()
+  true
+
+proc abandon*(runtime: LanguageRuntime, id: LanguageWorkId): bool =
+  ## Settle a protocol request while retaining the worker's capacity credit.
+  if runtime.isNil or id notin runtime.pending:
+    return false
+  runtime.retired[id] = runtime.pending[id]
+  runtime.pending.del(id)
+  true
+
+proc takeCompleted*(runtime: LanguageRuntime): seq[LanguageCompletion] =
+  ## Drain worker completions after the caller has pumped its home scheduler.
+  if runtime.isNil:
+    return
+  for completion in runtime.reply.completions:
+    if completion.id in runtime.pending:
+      let cancellation = runtime.pending[completion.id]
+      runtime.pending.del(completion.id)
+      cancellation.releaseCancellation()
+      result.add(completion)
+    elif completion.id in runtime.retired:
+      let cancellation = runtime.retired[completion.id]
+      runtime.retired.del(completion.id)
+      cancellation.releaseCancellation()
+    ## Unknown completions belong to a closed or failed request and are dropped.
+  runtime.reply.completions.setLen(0)
+
+proc pump*(runtime: LanguageRuntime, blocking: BlockingKinds = NonBlocking): int =
+  ## Run home-thread deliveries so callers can drain asynchronous completions.
+  if runtime.isNil:
+    return 0
+  case blocking
+  of Blocking:
+    if runtime.home.poll(Blocking): 1 else: 0
+  of NonBlocking:
+    runtime.home.pollAll(NonBlocking)
+
+proc request*(runtime: LanguageRuntime, request: LanguageRequest): LanguageResponse =
+  ## Compatibility helper for direct callers. Asynchronous LSP dispatch uses
+  ## `submit` and `takeCompleted` instead of occupying a shared response slot.
+  let id = runtime.submit(request)
+  if id == 0:
+    if runtime.isNil or runtime.closed:
+      return LanguageResponse(ok: false, error: "language runtime is closed")
+    return LanguageResponse(ok: false, error: "language request queue is full")
+
+  while true:
     discard runtime.home.poll(Blocking)
-  runtime.reply.response
+    for completion in runtime.takeCompleted():
+      if completion.id == id:
+        return completion.response
 
 proc close*(runtime: LanguageRuntime) =
-  ## Stop the language worker pool after all submitted operations have settled.
+  ## Stop the language worker pool after cancelling all admitted operations.
   if runtime.isNil or runtime.closed:
     return
   runtime.closed = true
+  for cancellation in runtime.pending.values:
+    cancellation.markCancelled()
+  for cancellation in runtime.retired.values:
+    cancellation.markCancelled()
   runtime.serviceProxy = nil
   runtime.pool.stop()
   runtime.pool.join()
+  for cancellation in runtime.pending.values:
+    cancellation.releaseCancellation()
+  for cancellation in runtime.retired.values:
+    cancellation.releaseCancellation()
+  runtime.pending.clear()
+  runtime.retired.clear()
+  runtime.reply.completions.setLen(0)
