@@ -2,6 +2,7 @@
 
 import std/[json, os, strutils, syncio, tables]
 
+import chronicles
 import sigils
 import sigils/rpcs/jsonrpc
 import sigils/rpcs/json/jrStdio as jrStdio
@@ -125,15 +126,31 @@ proc compilerRefreshCompleted(
   source: CompilerRefreshJob, completion: sink CompilerRefreshCompletion
 ) {.signal.}
 
+proc symbolCount(snapshot: SemanticSnapshot): int
+
 proc runBifIndex(job: BifIndexJob) {.slot.} =
   var completion = BifIndexCompletion()
+  info "Starting configured BIF index job",
+    projectId = job.workspace.projectId,
+    workspaceRoot = job.workspace.rootPath,
+    artifactRoots = job.artifactRoots
   try:
     completion.snapshot = buildBifIndex(job.workspace, job.artifactRoots)
     completion.ok = true
+    info "Configured BIF index job completed",
+      projectId = job.workspace.projectId,
+      moduleCount = completion.snapshot.moduleCount(),
+      symbolCount = completion.snapshot.symbolCount(),
+      tokenCount = completion.snapshot.tokenCount(),
+      failureCount = completion.snapshot.failureCount()
   except CatchableError as error:
     completion.error = error.msg
+    warn "Configured BIF index job failed",
+      projectId = job.workspace.projectId, failure = error.msg
   except Defect as error:
     completion.error = "BIF indexing worker failure: " & error.msg
+    warn "Configured BIF index worker failed",
+      projectId = job.workspace.projectId, failure = error.msg
   emit job.indexCompleted(completion)
 
 proc compilerFailure(
@@ -651,11 +668,12 @@ proc installSemanticIndex(server: LspServer) =
     server.language.installIndex(snapshot)
     server.semanticReady = true
     server.semanticFailed = false
-  except CatchableError:
+  except CatchableError as error:
     ## Capability advertisement remains useful when a refresh cannot be
     ## completed, but the language actor will correctly return no results
     ## until a complete snapshot is installed.
-    discard
+    warn "Unable to install semantic index",
+      projectId = server.workspace.projectId, failure = error.msg
 
 proc receiveBifIndexCompletion(
   server: LspServer, completion: BifIndexCompletion
@@ -687,6 +705,10 @@ proc startSemanticIndex(server: LspServer) =
     return
   server.semanticLoading = true
   server.semanticFailed = false
+  info "Starting semantic index",
+    projectId = server.workspace.projectId,
+    workspaceRoot = server.workspace.rootPath,
+    artifactRoots = server.artifactRoots
   let thread = newSigilThread()
   var job =
     BifIndexJob(workspace: server.workspace, artifactRoots: server.artifactRoots)
@@ -807,6 +829,13 @@ proc startCompilerRefresh(server: LspServer) =
     return
   server.compilerLoading = true
   server.semanticLoading = true
+  info "Starting compiler refresh",
+    projectId = server.workspace.projectId,
+    workspaceRoot = server.workspace.rootPath,
+    compilerPath = server.compiler.compilerPath,
+    entryPoints = server.workspace.entryPoints,
+    importPaths = server.workspace.importPaths,
+    cacheRoot = server.workspace.cacheRoot
   if not server.semanticReady:
     server.semanticFailed = false
   server.compilerRefreshPending = false
@@ -1141,6 +1170,13 @@ proc submitAsyncLspRequest(
     else:
       return
 
+    debug "Processing LSP language operation",
+      methodName = methodName,
+      uri = request.uri,
+      version = request.version,
+      textBytes = request.text.len,
+      query = request.query
+
     var stamp = server.currentLanguageStamp()
     if request.kind in {lrkOpen, lrkChange, lrkClose}:
       inc stamp.documentGeneration
@@ -1163,7 +1199,8 @@ proc dispatchIncomingJsonRpc(server: LspServer, data: string) =
   var root: JsonNode
   try:
     root = parseJson(data)
-  except CatchableError:
+  except CatchableError as error:
+    warn "Received invalid JSON-RPC message", failure = error.msg
     let response = server.adapter.handleJsonRpc(data)
     if response.isSome():
       server.dispatcher.sendJsonRpcMessage(response.get())
@@ -1182,6 +1219,13 @@ proc dispatchIncomingJsonRpc(server: LspServer, data: string) =
       root["id"]
     else:
       nil
+  debug "Received JSON-RPC message",
+    methodName = methodName,
+    requestId =
+      if id.isNil:
+        "notification"
+      else:
+        $id
   if methodName == "$/cancelRequest" and id.isNil:
     try:
       server.cancelClientRequest(parseCancelId(root.requestParams()))
@@ -1236,6 +1280,7 @@ proc receiveJsonRpcRequest(server: LspServer, request: JsonRpcRequest) {.slot.} 
 proc receiveJsonRpcStopped(server: LspServer) {.slot.} =
   if not server.isNil:
     server.inputStopped = true
+    info "Nimdex LSP input stream stopped", projectId = server.workspace.projectId
 
 proc compilerStampMatches(server: LspServer, stamp: AnalysisStamp): bool =
   let current = server.currentLanguageStamp()
@@ -1271,12 +1316,20 @@ proc receiveBifIndexCompletion(
     return
   server.semanticLoading = false
   if completion.ok:
+    info "Installing semantic index",
+      projectId = server.workspace.projectId,
+      moduleCount = completion.snapshot.moduleCount(),
+      symbolCount = completion.snapshot.symbolCount(),
+      tokenCount = completion.snapshot.tokenCount(),
+      failureCount = completion.snapshot.failureCount()
     server.activeSnapshot = completion.snapshot
     server.language.installIndex(completion.snapshot)
     server.semanticReady = true
     server.semanticFailed = false
   else:
     server.semanticFailed = true
+    warn "Semantic index failed",
+      projectId = server.workspace.projectId, failure = completion.error
 
   server.stopSemanticIndex()
   server.drainQueuedLanguageRequests(
@@ -1306,16 +1359,27 @@ proc receiveCompilerRefreshCompletion(
   server.stopCompilerRefresh()
 
   if not current:
+    debug "Discarding superseded compiler refresh",
+      projectId = server.workspace.projectId,
+      documentGeneration = refresh.stamp.documentGeneration,
+      currentDocumentGeneration = server.documentGeneration
     if restart and server.state == lssRunning:
       server.startCompilerRefresh()
     return
   if refresh.cancelled:
+    info "Compiler refresh was cancelled", projectId = server.workspace.projectId
     if restart and server.state == lssRunning:
       server.startCompilerRefresh()
     return
 
   server.publishCompilerDiagnostics(refresh.diagnostics)
   if refresh.ok:
+    info "Installing compiler-backed semantic index",
+      projectId = server.workspace.projectId,
+      moduleCount = refresh.snapshot.moduleCount(),
+      symbolCount = refresh.snapshot.symbolCount(),
+      tokenCount = refresh.snapshot.tokenCount(),
+      artifactCount = refresh.artifactPaths.len
     ## The language actor receives the complete snapshot as one owned message;
     ## the old snapshot remains visible until this message is delivered.
     server.activeSnapshot = refresh.snapshot
@@ -1324,6 +1388,12 @@ proc receiveCompilerRefreshCompletion(
     server.semanticFailed = false
     server.drainQueuedLanguageRequests(true, "")
   else:
+    warn "Compiler refresh failed",
+      projectId = server.workspace.projectId,
+      compilerPath = refresh.compiler.compilerPath,
+      exitCode = refresh.exitCode,
+      cachePath = refresh.cachePath,
+      failure = refresh.error
     ## A failed build never replaces a previously installed semantic snapshot.
     ## Only an initial failure leaves queued requests unavailable.
     server.semanticFailed = not server.semanticReady
@@ -1369,15 +1439,34 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
     cacheRoot = resolvedCacheRoot,
   )
   server.artifactRoots = server.workspace.artifactRoots
+  info "Initialized Nimdex workspace",
+    rootUri = server.workspace.rootUri,
+    workspaceRoot = server.workspace.rootPath,
+    projectId = server.workspace.projectId,
+    compilerRequested = compilerRequested,
+    compilerPath = server.workspace.compilerPath,
+    cacheRoot = server.workspace.cacheRoot,
+    entryPoints = server.workspace.entryPoints,
+    importPaths = server.workspace.importPaths,
+    artifactRoots = server.workspace.artifactRoots,
+    nimArgumentCount = server.workspace.nimArguments.len
   if compilerRequested:
     server.compiler = probeCompiler(server.workspace.compilerPath)
     let prerequisite = server.compiler.requireCompiler()
     if prerequisite.len > 0:
+      warn "Nimdex cannot use the configured Nim compiler",
+        compilerPath = server.compiler.compilerPath, failure = prerequisite
       raiseLspError(LspCompilerUnavailable, prerequisite)
     server.compilerEnabled = true
+    info "Compiler-backed analysis enabled",
+      compilerPath = server.compiler.compilerPath,
+      compilerVersion = server.compiler.version,
+      compilerRevision = server.compiler.revision,
+      supportsGenBif = server.compiler.supportsGenBif
   else:
     server.compiler = CompilerCapabilities()
     server.compilerEnabled = false
+  debug "Resolved Nim library paths", libraryPaths = server.compilerLibraryPaths()
   server.semanticCapabilities = server.compilerEnabled or server.artifactRoots.len > 0
 
   server.state = lssInitializing
@@ -1582,6 +1671,8 @@ proc runNimdexLspStdio*(
   ## Input and output deliberately have different owners: the reader actor can
   ## block in File.readChar while the home thread continues to dispatch worker
   ## completions and flush framed responses.
+  info "Starting Nimdex LSP server",
+    compilerPath = compilerPath, artifactRoots = artifactRoots, workers = workers
   let server = newNimdexLspServer(workers, artifactRoots, compilerPath)
   server.asynchronousSession = true
   let dispatcher = newJsonRpcDispatcher(server.adapter)
@@ -1635,5 +1726,6 @@ proc runNimdexLspStdio*(
       readerThread.join()
     server.close()
     writer.stopIo()
+    info "Nimdex LSP server stopped", exitStatus = server.exitStatus()
 
   server.exitStatus()

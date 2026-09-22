@@ -2,6 +2,8 @@
 
 import std/[algorithm, atomics, os, osproc, strutils]
 
+import chronicles
+
 import ./bifindex
 import ./documents
 import ./semantic
@@ -68,6 +70,10 @@ type
     fingerprint: uint64
     paths: seq[string]
 
+proc symbolCount(snapshot: SemanticSnapshot): int =
+  for module in snapshot.modules:
+    result += module.symbols.len
+
 proc newCompilerCancellation*(): CompilerCancellation =
   result = cast[CompilerCancellation](allocShared0(sizeof(CompilerCancellationState)))
   result[].cancelled.store(false, moRelaxed)
@@ -124,6 +130,12 @@ proc runExternalCommand(
   let stdoutPath = captureDir / ".nimdex-compiler.stdout"
   let stderrPath = captureDir / ".nimdex-compiler.stderr"
   let command = commandLine(executable, arguments)
+  debug "Running Nim command",
+    compilerPath = executable,
+    workingDirectory = workingDir,
+    command = command,
+    stdoutPath = stdoutPath,
+    stderrPath = stderrPath
 
   when defined(windows):
     let shell =
@@ -149,6 +161,11 @@ proc runExternalCommand(
   process.close()
   result.stdout = readIfPresent(stdoutPath)
   result.stderr = readIfPresent(stderrPath)
+  debug "Nim command completed",
+    compilerPath = executable,
+    exitCode = result.exitCode,
+    stdoutBytes = result.stdout.len,
+    stderrBytes = result.stderr.len
 
 proc compilerRevision(version: string): string =
   for line in version.splitLines:
@@ -160,6 +177,7 @@ proc compilerRevision(version: string): string =
 proc probeCompiler*(path = ""): CompilerCapabilities =
   ## Probe the selected executable without assuming a particular Nim release.
   result.compilerPath = resolveCompilerPath(path)
+  info "Probing Nim compiler", requestedPath = path, compilerPath = result.compilerPath
   if result.compilerPath.len == 0:
     result.error =
       if path.len > 0:
@@ -167,6 +185,7 @@ proc probeCompiler*(path = ""): CompilerCapabilities =
       else:
         "Nimdex requires a Nim compiler with --genBif:on"
     result.fingerprint = stableTextHash(result.error)
+    warn "Nim compiler was not found", requestedPath = path, failure = result.error
     return
 
   let captureDir = getTempDir() / ("nimdex-compiler-probe-" & $getCurrentProcessId())
@@ -186,8 +205,22 @@ proc probeCompiler*(path = ""): CompilerCapabilities =
       result.error =
         "Nimdex requires a Nim compiler that supports --genBif:on: " &
         result.compilerPath
+    if result.available and result.supportsGenBif:
+      info "Nim compiler is ready",
+        compilerPath = result.compilerPath,
+        version = result.version,
+        revision = result.revision,
+        supportsGenBif = result.supportsGenBif
+    else:
+      warn "Nim compiler probe failed",
+        compilerPath = result.compilerPath,
+        available = result.available,
+        supportsGenBif = result.supportsGenBif,
+        failure = result.error
   except CatchableError as error:
     result.error = "unable to run Nim compiler probe: " & error.msg
+    warn "Nim compiler probe raised an exception",
+      compilerPath = result.compilerPath, failure = error.msg
 
   var fingerprintInput =
     result.compilerPath & "\0" & result.version & "\0" & result.revision & "\0" &
@@ -442,7 +475,16 @@ proc runCompilerRefresh*(request: CompilerRefreshRequest): CompilerRefreshResult
   )
 
   let entryPoints = request.workspace.discoverCompilerEntryPoints()
+  info "Preparing compiler-backed analysis",
+    projectId = request.workspace.projectId,
+    workspaceRoot = request.workspace.rootPath,
+    compilerPath = result.compiler.compilerPath,
+    entryPoints = entryPoints,
+    importPaths = request.workspace.importPaths,
+    cacheRoot = request.workspace.cacheRoot,
+    nimArgumentCount = request.workspace.nimArguments.len
   if entryPoints.len == 0:
+    warn "No Nim entry point found", workspaceRoot = request.workspace.rootPath
     result.addBuildFailure(
       "no Nim entry point was configured or discovered for the workspace",
       request.workspace.rootPath,
@@ -450,6 +492,7 @@ proc runCompilerRefresh*(request: CompilerRefreshRequest): CompilerRefreshResult
     return
   for argument in request.workspace.nimArguments:
     if argument.forbiddenCompilerArgument():
+      warn "Rejected unsupported Nim compiler argument", argument = argument
       result.addBuildFailure(
         "unsupported compiler argument for controlled refresh: " & argument,
         entryPoints[0],
@@ -458,6 +501,7 @@ proc runCompilerRefresh*(request: CompilerRefreshRequest): CompilerRefreshResult
 
   let prerequisite = result.compiler.requireCompiler()
   if prerequisite.len > 0:
+    warn "Compiler-backed analysis prerequisite failed", failure = prerequisite
     result.addBuildFailure(prerequisite, entryPoints[0])
     return
   if request.cancellation.isCompilerCancelled():
@@ -477,6 +521,7 @@ proc runCompilerRefresh*(request: CompilerRefreshRequest): CompilerRefreshResult
       $result.compiler.fingerprint & "-" & $request.workspace.configurationFingerprint &
       "-" & $sources.fingerprint
     )
+  info "Using Nimdex compiler cache", cachePath = result.cachePath
   ensureDirectory(result.cachePath)
 
   var buildFailed = false
@@ -487,6 +532,10 @@ proc runCompilerRefresh*(request: CompilerRefreshRequest): CompilerRefreshResult
       return
     let arguments = request.compilerArguments(result.cachePath, entryPoint)
     result.commandLines.add(commandLine(result.compiler.compilerPath, arguments))
+    info "Compiling Nim entry point",
+      compilerPath = result.compiler.compilerPath,
+      entryPoint = entryPoint,
+      workspaceRoot = request.workspace.rootPath
     let process = runExternalCommand(
       result.compiler.compilerPath, arguments, request.workspace.rootPath,
       result.cachePath,
@@ -496,6 +545,11 @@ proc runCompilerRefresh*(request: CompilerRefreshRequest): CompilerRefreshResult
     result.stderr.add(process.stderr)
     if process.exitCode != 0:
       buildFailed = true
+      warn "Nim compiler failed",
+        compilerPath = result.compiler.compilerPath,
+        entryPoint = entryPoint,
+        exitCode = process.exitCode,
+        stderr = process.stderr
       break
 
   result.diagnostics = collectCompilerDiagnostics(
@@ -512,7 +566,15 @@ proc runCompilerRefresh*(request: CompilerRefreshRequest): CompilerRefreshResult
     return
 
   result.artifactPaths = discoverBifArtifacts(@[result.cachePath])
+  info "Discovered compiler-generated BIF artifacts",
+    cachePath = result.cachePath,
+    artifactCount = result.artifactPaths.len,
+    artifactPaths = result.artifactPaths
   if result.artifactPaths.len == 0:
+    warn "Nim compiler produced no semantic BIF artifacts",
+      compilerPath = result.compiler.compilerPath,
+      entryPoints = entryPoints,
+      cachePath = result.cachePath
     result.addBuildFailure(
       "Nim compiler produced no semantic BIF artifacts", entryPoints[0]
     )
@@ -536,3 +598,9 @@ proc runCompilerRefresh*(request: CompilerRefreshRequest): CompilerRefreshResult
   result.snapshot.sourceFingerprint = sources.fingerprint
   result.snapshot.analysisStamp = result.stamp
   result.ok = true
+  info "Compiler-backed analysis completed",
+    projectId = request.workspace.projectId,
+    moduleCount = result.snapshot.moduleCount(),
+    symbolCount = result.snapshot.symbolCount(),
+    tokenCount = result.snapshot.tokenCount(),
+    artifactCount = result.artifactPaths.len

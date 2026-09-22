@@ -15,6 +15,13 @@ Install the project dependencies with Atlas:
 atlas install
 ```
 
+## Logging
+
+Nimdex writes structured Chronicles logs to `stderr` so LSP/JSON-RPC output on
+`stdout` remains clean. Debug builds include debug-level details; release builds
+default to info-level summaries. Compile with
+`-d:chronicles_log_level=TRACE` to include per-symbol indexing traces.
+
 ## Command line
 
 Run the CLI directly from a checkout:

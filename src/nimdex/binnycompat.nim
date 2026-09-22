@@ -7,6 +7,7 @@
 import std/tables
 
 import binny/bif_safe
+import chronicles
 
 type
   BinnyArtifactStatus* = enum
@@ -145,15 +146,39 @@ proc inspectBinnyArtifact*(
     path: string, limits = DefaultBinnyLoadLimits
 ): BinnyArtifactReport =
   ## Safely load and summarize one BIF without exposing Binny-owned storage.
+  debug "Opening BIF artifact",
+    artifactPath = path,
+    maxFileBytes = limits.maxFileBytes,
+    maxTokens = limits.maxTokens,
+    maxPoolEntries = limits.maxPoolEntries,
+    maxStringBytes = limits.maxStringBytes,
+    maxIndexEntries = limits.maxIndexEntries
   result.path = path
   var module: BifModule
   var failure: BifLoadFailure
   if not tryLoad(path, module, failure, limits):
     result.status = basLoadFailed
     result.failure = failure
+    warn "Failed to load BIF artifact",
+      artifactPath = path, failureKind = $failure.kind, failure = failure.message
     return
 
   result = inspectLoadedArtifact(module, path)
+  if result.status == basReady:
+    debug "Opened BIF artifact",
+      artifactPath = result.path,
+      sourcePath = result.sourcePath,
+      tokenCount = result.tokenCount,
+      declarationCount = result.declarations.len,
+      tagCount = result.tagCount,
+      stringCount = result.stringCount,
+      symbolPoolCount = result.symbolCount,
+      filenameCount = result.filenameCount
+  else:
+    warn "Loaded BIF artifact with incomplete metadata",
+      artifactPath = result.path,
+      sourcePath = result.sourcePath,
+      metadataError = result.metadataError
 
 proc isReady*(report: BinnyArtifactReport): bool =
   ## Return whether the artifact passed both binary and phase-0 metadata checks.

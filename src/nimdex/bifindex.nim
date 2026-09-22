@@ -3,6 +3,7 @@
 import std/[algorithm, cpuinfo, os, strutils, tables, times]
 
 import binny/bif_safe
+import chronicles
 import sigils
 
 import ./binnycompat
@@ -52,20 +53,32 @@ proc indexCompleted(worker: BifLoadWorker, item: BifIndexResult) {.signal.}
 
 proc indexArtifact(worker: BifLoadWorker) {.slot.} =
   var indexed: BifIndexResult
+  debug "Indexing BIF artifact", artifactPath = worker.artifactPath
   try:
     let report = inspectBinnyArtifact(worker.artifactPath, worker.limits)
     indexed.artifactPath = report.path
     if report.isReady():
       indexed.ready = true
       indexed.module = moduleFromReport(report, worker.projectId)
+      debug "Indexed BIF module",
+        artifactPath = indexed.module.artifactPath,
+        sourcePath = indexed.module.sourcePath,
+        symbolCount = indexed.module.symbols.len,
+        tokenCount = indexed.module.tokenCount
     else:
       indexed.failure = failureFromReport(report)
+      warn "Skipping BIF artifact that could not be indexed",
+        artifactPath = indexed.failure.artifactPath,
+        failureKind = $indexed.failure.kind,
+        failure = indexed.failure.message
   except CatchableError as error:
     ## The safe loader normally reports malformed input as data. Keep an
     ## unexpected filesystem/runtime failure from stranding the whole batch.
     indexed.artifactPath = worker.artifactPath
     indexed.failure =
       AnalysisFailure(artifactPath: worker.artifactPath, kind: afIo, message: error.msg)
+    warn "Unexpected error while indexing BIF artifact",
+      artifactPath = worker.artifactPath, failure = error.msg
   emit worker.indexCompleted(indexed)
 
 proc collectArtifact(collector: BifLoadCollector, result: BifIndexResult) {.slot.} =
@@ -91,8 +104,11 @@ proc indexArtifactsInPool(
   if artifacts.len == 0:
     return
 
+  let workerCount = requestedWorkerCount(options, artifacts.len)
+  info "Starting parallel BIF indexing",
+    artifactCount = artifacts.len, workerCount = workerCount, projectId = projectId
   startLocalThreadDefault()
-  let pool = newSigilThreadPool(workers = requestedWorkerCount(options, artifacts.len))
+  let pool = newSigilThreadPool(workers = workerCount)
   pool.start()
 
   var collector = BifLoadCollector(expected: artifacts.len)
@@ -257,8 +273,16 @@ proc buildBifIndex*(
     workspace.configurationFingerprint,
   )
   let roots = if artifactRoots.len > 0: artifactRoots else: workspace.artifactRoots
+  info "Discovering BIF artifacts",
+    projectId = workspace.projectId,
+    artifactRoots = roots,
+    maxArtifacts = options.maxArtifacts
   let artifacts = discoverBifArtifacts(roots)
+  debug "Discovered BIF artifacts",
+    artifactCount = artifacts.len, artifactPaths = artifacts
   if options.maxArtifacts >= 0 and artifacts.len > options.maxArtifacts:
+    warn "BIF artifact limit exceeded",
+      artifactCount = artifacts.len, maxArtifacts = options.maxArtifacts
     result.addFailure(
       AnalysisFailure(
         kind: afArtifactLimit, message: "BIF artifact count exceeds configured limit"
@@ -278,8 +302,18 @@ proc buildBifIndex*(
     proc(a, b: BifIndexResult): int =
       cmp(a.artifactPath, b.artifactPath)
   )
+  var indexedSymbolCount = 0
   for item in indexed:
     if not item.ready:
       result.addFailure(item.failure)
       continue
+    indexedSymbolCount += item.module.symbols.len
     result.addModule(item.module)
+  info "Completed BIF indexing",
+    projectId = workspace.projectId,
+    discoveredArtifacts = artifacts.len,
+    indexedArtifacts = selectedArtifacts.len,
+    moduleCount = result.moduleCount(),
+    symbolCount = indexedSymbolCount,
+    tokenCount = result.tokenCount(),
+    failureCount = result.failureCount()

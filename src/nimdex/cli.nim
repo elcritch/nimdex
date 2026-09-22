@@ -1,7 +1,8 @@
 ## A small LSP/JSON-RPC client and daemon entry point for Nimdex.
 
-import std/[json, os, options, osproc, streams, strutils, syncio]
+import std/[json, os, options, osproc, streams, strutils, syncio, typedthreads]
 
+import chronicles
 import sigils/rpcs/json/jrFraming
 
 import ./documents
@@ -39,8 +40,14 @@ type
     input: Stream
     output: Stream
     errorOutput: Stream
+    errorDrainState: RpcErrorDrain
+    errorDrainThread: Thread[ptr RpcErrorDrain]
     parser: JsonRpcFrameParser
     notifications: seq[JsonNode]
+
+  RpcErrorDrain = object
+    stream: Stream
+    logPath: string
 
   RpcReadResult = object
     found: bool
@@ -349,7 +356,28 @@ proc readResponse(session: RpcSession, id: int, diagnosticOutput: File): RpcCall
       result.response = read.frame
       return
 
+proc drainRpcErrors(state: ptr RpcErrorDrain) {.thread.} =
+  var logFile: File
+  let saveLogs = open(logFile, state.logPath, fmWrite)
+  defer:
+    if saveLogs:
+      logFile.close()
+
+  var buffer = newString(4096)
+  while true:
+    let bytesRead = state.stream.readData(addr buffer[0], buffer.len)
+    if bytesRead <= 0:
+      break
+    if saveLogs:
+      discard logFile.writeBuffer(addr buffer[0], bytesRead)
+
 proc newRpcSession(root, daemonPath: string): RpcSession =
+  debug "Starting Nimdex daemon for CLI request",
+    projectRoot = root, daemonPath = daemonPath, workingDirectory = root
+  let errorLogPath =
+    getTempDir() / ("nimdex-cli-daemon-" & $getCurrentProcessId() & ".stderr")
+  if fileExists(errorLogPath):
+    removeFile(errorLogPath)
   result = RpcSession(
     process: startProcess(
       if daemonPath.len > 0:
@@ -365,6 +393,9 @@ proc newRpcSession(root, daemonPath: string): RpcSession =
   result.input = result.process.inputStream()
   result.output = result.process.outputStream()
   result.errorOutput = result.process.errorStream()
+  result.errorDrainState =
+    RpcErrorDrain(stream: result.errorOutput, logPath: errorLogPath)
+  createThread(result.errorDrainThread, drainRpcErrors, addr result.errorDrainState)
 
 proc stopRpcSession(session: RpcSession, diagnosticOutput: File) =
   if session.isNil or session.process.isNil:
@@ -375,9 +406,16 @@ proc stopRpcSession(session: RpcSession, diagnosticOutput: File) =
     except CatchableError:
       discard
   discard session.process.waitForExit()
-  let daemonErrors = session.errorOutput.readAll().strip()
+  joinThread(session.errorDrainThread)
+  let daemonErrors =
+    if fileExists(session.errorDrainState.logPath):
+      readFile(session.errorDrainState.logPath).strip()
+    else:
+      ""
   if daemonErrors.len > 0:
     diagnosticOutput.writeLine(daemonErrors)
+  if fileExists(session.errorDrainState.logPath):
+    removeFile(session.errorDrainState.logPath)
   session.process.close()
 
 proc responseError(response: JsonNode): string =
@@ -514,6 +552,16 @@ proc runProjectCommand(
   if root.error.len > 0:
     errorOutput.writeLine("nimdex: " & root.error)
     return 2
+
+  info "Running Nimdex CLI command",
+    command = $options.command,
+    projectRoot = root.path,
+    compilerPath = options.compilerPath,
+    cacheRoot = options.cacheRoot,
+    entryPoints = options.entryPoints,
+    importPaths = options.importPaths,
+    artifactRoots = options.artifactRoots,
+    query = options.query
 
   var params = newJObject()
   let waitsForCompiler = options.command in {cliCheck, cliDebug}

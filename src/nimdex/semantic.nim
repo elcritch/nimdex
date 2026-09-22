@@ -2,6 +2,8 @@
 
 import std/[strutils, tables]
 
+import chronicles
+
 type
   AnalysisStamp* = object ## Identity of the source/configuration used by analysis.
     valid*: bool
@@ -116,10 +118,23 @@ proc addLocationRef(
   snapshot.locationIndex.mgetOrPut(locationKey(location), @[]).add(reference)
 
 proc addModule*(snapshot: var SemanticSnapshot, module: sink ModuleSnapshot) =
+  debug "Adding module to semantic index",
+    artifactPath = module.artifactPath,
+    sourcePath = module.sourcePath,
+    symbolCount = module.symbols.len,
+    tokenCount = module.tokenCount
   let moduleIndex = snapshot.modules.len
   snapshot.modules.add(module)
   for symbolIndex, symbol in snapshot.modules[moduleIndex].symbols:
     let reference = SymbolRef(moduleIndex: moduleIndex, symbolIndex: symbolIndex)
+    trace "Indexing semantic symbol",
+      name = symbol.name,
+      qualifiedName = symbol.qualifiedName,
+      kind = symbol.kind,
+      modulePath = symbol.modulePath,
+      sourcePath = symbol.location.path,
+      line = symbol.location.line,
+      column = symbol.location.column
     snapshot.addNameRef(symbol.name, reference)
     snapshot.addNameRef(symbol.qualifiedName, reference)
     snapshot.addLocationRef(symbol.location, reference)
