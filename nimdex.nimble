@@ -1,11 +1,9 @@
 version       = "0.1.0"
-author        = "Your Name"
-description   = "A Nim package."
+author        = "elcritch"
+description   = "Compiler-backed Nim LSP server and command-line client."
 license       = "MIT"
 srcDir        = "src"
-bin            = @[
-  "nimdex"
-]
+bin           = @["nimdex"]
 
 requires "nim >= 2.0.0"
 

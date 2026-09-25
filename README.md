@@ -9,11 +9,21 @@ Nimdex needs a Nim compiler that supports `--genBif:on`. This checkout
 includes one at `deps/nim-devel/bin/nim`; another environment must provide an
 equivalent compiler.
 
-Install the project dependencies with Atlas:
+Install the `nimdex` command with Nimble:
 
 ```sh
-atlas install
+nimble install https://github.com/elcritch/nimdex
+nimdex version
 ```
+
+Ensure Nimble's binary directory (usually `~/.nimble/bin`) is on `PATH`.
+The Nimble package installs the Nimdex executable and its library dependencies;
+it does not install a BIF-capable Nim compiler. Pass one with `--compiler PATH`
+if it is not the default `nim` on `PATH`.
+
+For development from a checkout, install project dependencies with
+`atlas install`. To install the current checkout as a command, run
+`nimble install` from the repository root.
 
 ## Logging
 
@@ -45,13 +55,13 @@ the layout if the package or head directories change before initialization.
 
 ## Command line
 
-Run the CLI directly from a checkout:
+Run the installed CLI:
 
 ```sh
-nim r src/nimdex.nim -- check /path/to/project
-nim r src/nimdex.nim -- symbols /path/to/project
-nim r src/nimdex.nim -- symbols /path/to/project exportedRoutine
-nim r src/nimdex.nim -- debug /path/to/project
+nimdex check /path/to/project --compiler /path/to/bif-enabled/nim
+nimdex symbols /path/to/project
+nimdex symbols /path/to/project exportedRoutine
+nimdex debug /path/to/project
 ```
 
 The project defaults to the current directory. The commands start a short-
@@ -68,16 +78,10 @@ modules, source mappings, pool counts, and token counts. It also shows
 
 ### Query a running daemon
 
-Build once from this checkout:
-
-```sh
-deps/nim-devel/bin/nim c -d:release -o:/tmp/nimdex src/nimdex.nim
-```
-
 Start a listening daemon in one terminal, from this repository root:
 
 ```sh
-/tmp/nimdex daemon . --listen 49152 --compiler deps/nim-devel/bin/nim
+nimdex daemon . --listen 49152 --compiler deps/nim-devel/bin/nim
 ```
 
 The daemon logs `Nimdex CLI listener ready` with
@@ -87,10 +91,10 @@ In another terminal, query the same project without
 starting a new analysis process:
 
 ```sh
-/tmp/nimdex check . --connect 49152
-/tmp/nimdex symbols . --connect 49152 --query newCompilerCancellation
-/tmp/nimdex debug . --connect 49152 | jq '.moduleGraph.actualHeads'
-/tmp/nimdex stop --connect 49152
+nimdex check . --connect 49152
+nimdex symbols . --connect 49152 --query newCompilerCancellation
+nimdex debug . --connect 49152 | jq '.moduleGraph.actualHeads'
+nimdex stop --connect 49152
 ```
 
 Set `--compiler`, `--frontend track`, `--entry-point`, and other analysis
@@ -127,7 +131,7 @@ Useful options are:
 Start the daemon directly when an editor launches an LSP server:
 
 ```sh
-nim r src/nimdex.nim -- daemon
+nimdex daemon
 ```
 
 The client should send the project `rootUri` in `initialize`. Nimdex discovers
