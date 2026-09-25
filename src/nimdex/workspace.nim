@@ -7,6 +7,10 @@ import ./projectlayout
 
 export projectlayout
 
+type CompilerFrontend* = enum
+  cfCompile = "compile"
+  cfTrack = "track"
+
 type Workspace* = object
   rootUri*: string
   rootPath*: string
@@ -17,6 +21,7 @@ type Workspace* = object
   nimArguments*: seq[string]
   artifactRoots*: seq[string]
   compilerPath*: string
+  compilerFrontend*: CompilerFrontend
   cacheRoot*: string
   configurationGeneration*: uint64
   configurationFingerprint*: uint64
@@ -44,6 +49,7 @@ proc initWorkspace*(
     compilerPath: string = "",
     cacheRoot: string = "",
     configurationGeneration: uint64 = 0,
+    compilerFrontend = cfCompile,
 ): Workspace =
   result.rootUri = normalizeDocumentUri(rootUri)
   if result.rootUri.len == 0:
@@ -58,6 +64,7 @@ proc initWorkspace*(
   result.nimArguments = nimArguments
   result.artifactRoots = normalizedPaths(artifactRoots)
   result.compilerPath = compilerPath
+  result.compilerFrontend = compilerFrontend
   if result.compilerPath.len > 0 and (
     isAbsolute(result.compilerPath) or DirSep in result.compilerPath or
     AltSep in result.compilerPath
@@ -83,6 +90,7 @@ proc initWorkspace*(
   for path in result.artifactRoots:
     appendConfigPart(fingerprintInput, "artifact", path)
   appendConfigPart(fingerprintInput, "compiler", result.compilerPath)
+  appendConfigPart(fingerprintInput, "frontend", $result.compilerFrontend)
   appendConfigPart(fingerprintInput, "cache", result.cacheRoot)
   appendConfigPart(fingerprintInput, "generation", $result.configurationGeneration)
   result.configurationFingerprint = stableTextHash(fingerprintInput)

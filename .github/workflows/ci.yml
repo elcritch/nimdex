@@ -50,6 +50,12 @@ jobs:
           nim c -d:release --skipUserCfg --skipParentCfg koch.nim
           ./koch boot -d:release --skipUserCfg --skipParentCfg
 
+      - name: Verify incremental frontend companions
+        working-directory: deps/nim-devel
+        run: |
+          test -x bin/nifler
+          test -x bin/nifmake
+
       - name: Run tests
         run: |
           export PATH="$GITHUB_WORKSPACE/deps/nim-devel/bin:$PATH"

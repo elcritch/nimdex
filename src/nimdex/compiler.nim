@@ -1,6 +1,6 @@
 ## Controlled Nim compiler refreshes and owned compiler diagnostics.
 
-import std/[algorithm, atomics, os, osproc, strutils, times]
+import std/[algorithm, atomics, os, osproc, strutils, tables, times]
 
 import chronicles
 
@@ -8,6 +8,7 @@ import ./bifindex
 import ./documents
 import ./compilerinputs
 import ./headcache
+import ./incremental
 import ./semantic
 import ./workspace
 
@@ -23,6 +24,9 @@ type
     help*: string
     available*: bool
     supportsGenBif*: bool
+    supportsTrack*: bool
+    niflerPath*: string
+    nifmakePath*: string
     fingerprint*: uint64
     error*: string
 
@@ -191,6 +195,12 @@ proc compilerRevision(version: string): string =
       if trimmed.len > "git hash:".len:
         return trimmed["git hash:".len .. ^1].strip()
 
+proc compilerCompanion(compilerPath, name: string): string =
+  let sibling = compilerPath.parentDir / (name & ExeExt)
+  if fileExists(sibling):
+    return normalizeDocumentPath(sibling)
+  findExe(name)
+
 proc probeCompiler*(path = ""): CompilerCapabilities =
   ## Probe the selected executable without assuming a particular Nim release.
   result.compilerPath = resolveCompilerPath(path)
@@ -215,6 +225,11 @@ proc probeCompiler*(path = ""): CompilerCapabilities =
     result.help = helpResult.stdout & helpResult.stderr
     result.available = versionResult.exitCode == 0 and helpResult.exitCode == 0
     result.supportsGenBif = result.help.contains("--genBif")
+    for line in result.help.splitLines():
+      if line.strip().startsWith("track "):
+        result.supportsTrack = true
+    result.niflerPath = compilerCompanion(result.compilerPath, "nifler")
+    result.nifmakePath = compilerCompanion(result.compilerPath, "nifmake")
     result.revision = compilerRevision(result.version)
     if not result.available:
       result.error = "unable to probe Nim compiler: " & result.compilerPath
@@ -242,14 +257,17 @@ proc probeCompiler*(path = ""): CompilerCapabilities =
   var fingerprintInput =
     result.compilerPath & "\0" & result.version & "\0" & result.revision & "\0" &
     $result.supportsGenBif
-  if fileExists(result.compilerPath):
-    fingerprintInput.add(
-      "\0" & $getFileSize(result.compilerPath) & "\0" &
-        $getLastModificationTime(result.compilerPath)
-    )
+  for path in [result.compilerPath, result.niflerPath, result.nifmakePath]:
+    fingerprintInput.add("\0" & path)
+    if fileExists(path):
+      fingerprintInput.add(
+        "\0" & $getFileSize(path) & "\0" & $getLastModificationTime(path)
+      )
   result.fingerprint = stableTextHash(fingerprintInput)
 
-proc requireCompiler*(capabilities: CompilerCapabilities): string =
+proc requireCompiler*(
+    capabilities: CompilerCapabilities, frontend = cfCompile
+): string =
   ## Return an actionable prerequisite error, or an empty string when ready.
   if not capabilities.available:
     return
@@ -259,6 +277,11 @@ proc requireCompiler*(capabilities: CompilerCapabilities): string =
         "Nimdex requires a usable Nim compiler"
   if not capabilities.supportsGenBif:
     return "Nimdex requires a Nim compiler that supports --genBif:on"
+  if frontend == cfTrack:
+    if not capabilities.supportsTrack:
+      return "the selected Nim compiler does not advertise the track frontend"
+    if capabilities.niflerPath.len == 0 or capabilities.nifmakePath.len == 0:
+      return "the track frontend requires nifler and nifmake beside Nim or on PATH"
 
 proc diagnosticSeverityValue(
     label: string
@@ -393,8 +416,8 @@ proc compilerArguments(
     request: CompilerRefreshRequest, cachePath, entryPoint: string
 ): seq[string] =
   # This compiler's `check --genBif:on` drops semantic statements in SemPass.
-  # Keep C generation until check emits complete declarations/includes.
-  result.add("c")
+  # The default retains C generation; track uses the existing IC frontend.
+  result.add(if request.workspace.compilerFrontend == cfTrack: "track" else: "c")
   for argument in request.workspace.nimArguments:
     result.add(argument)
   for importPath in request.workspace.importPaths:
@@ -402,7 +425,8 @@ proc compilerArguments(
   ## These options are appended after user switches so the refresh command is
   ## always an artifact-only, BIF-producing build in its private cache.
   result.add("--genBif:on")
-  result.add("--compileOnly:on")
+  if request.workspace.compilerFrontend == cfCompile:
+    result.add("--compileOnly:on")
   result.add("--colors:off")
   result.add("--filenames:abs")
   result.add("--nimcache:" & cachePath)
@@ -436,12 +460,40 @@ proc buildHead(
     HeadAnalysis(headPath: entryPoint, cachePath: cachePath, reuseKey: reuseKey)
   ensureDirectory(cachePath)
   forgetHead(cachePath)
-  # Removed imports must not leave orphan BIFs in the new analysis.
-  for path in discoverBifArtifacts(@[cachePath]):
-    removeFile(path)
-  let beforePaths = configurationInputs(request.workspace, entryPoint) & @[entryPoint]
+  let incremental = request.workspace.compilerFrontend == cfTrack
+  # The IC driver owns and may reset this directory. Keep manifests and process
+  # captures outside it, and retain its outputs for per-module rebuild decisions.
+  let compilerCache =
+    if incremental:
+      cachePath / "frontend"
+    else:
+      cachePath
+  var configPaths = configurationInputs(request.workspace, entryPoint)
+  if incremental:
+    let contextPath = cachePath / "frontend-context"
+    var reset = request.forceRebuild
+    if fileExists(compilerCache / "ic_config.cfg.nif"):
+      try:
+        for path in incrementalConfigurationInputs(compilerCache):
+          if path notin configPaths:
+            configPaths.add(path)
+      except CatchableError:
+        reset = true
+    configPaths.sort()
+    let frontendKey = $reuseKey & ":" & $fingerprintInputs(configPaths)
+    # Filename inventory/environment changes can alter import resolution or
+    # static evaluation without changing the compiler's timestamp inputs. Also
+    # invalidate precompiled config when a previously absent config is created.
+    if reset or readIfPresent(contextPath) != frontendKey:
+      if dirExists(compilerCache):
+        removeDir(compilerCache)
+    writeFile(contextPath, frontendKey)
+  else:
+    for path in discoverBifArtifacts(@[compilerCache]):
+      removeFile(path)
+  let beforePaths = configPaths & @[entryPoint]
   let beforeFingerprint = fingerprintInputs(beforePaths)
-  let arguments = request.compilerArguments(cachePath, entryPoint)
+  let arguments = request.compilerArguments(compilerCache, entryPoint)
   result.command = commandLine(request.capabilities.compilerPath, arguments)
   let compileStarted = getTime()
   info "Compiling Nim head", entryPoint = entryPoint, cachePath = cachePath
@@ -459,7 +511,11 @@ proc buildHead(
     return
   if request.cancellation.isCompilerCancelled():
     return
-  result.analysis.artifactPaths = discoverBifArtifacts(@[cachePath])
+  result.analysis.artifactPaths =
+    if incremental:
+      incrementalArtifacts(compilerCache, entryPoint)
+    else:
+      discoverBifArtifacts(@[compilerCache])
   if result.analysis.artifactPaths.len == 0:
     result.error = "Nim compiler produced no semantic BIF artifacts"
     return
@@ -468,18 +524,57 @@ proc buildHead(
   if snapshot.failureCount() > 0:
     result.error = "one or more generated BIF artifacts could not be indexed"
     return
+  if not snapshot.containsModule(entryPoint):
+    result.error = "compiler artifacts do not contain the requested head"
+    return
   snapshot.recordHead(entryPoint)
   result.analysis.inputPaths = resolvedInputs(
     request.workspace, entryPoint, snapshot, process.stdout & process.stderr
   )
+  if incremental:
+    for path in incrementalConfigurationInputs(compilerCache):
+      if path notin result.analysis.inputPaths:
+        result.analysis.inputPaths.add(path)
+      if path notin configPaths:
+        configPaths.add(path)
+    result.analysis.inputPaths.sort()
+    configPaths.sort()
   result.analysis.inputFingerprint = fingerprintInputs(result.analysis.inputPaths)
+  var sourceTimes: Table[string, int64]
   for path in result.analysis.inputPaths:
-    if fileExists(path) and getLastModificationTime(path) > compileStarted:
-      result.error = "compiler inputs changed during analysis; retry refresh"
-      return
+    if fileExists(path):
+      let modified = getLastModificationTime(path)
+      sourceTimes[path] = int64(modified.toUnixFloat() * 1_000_000_000.0)
+      if modified > compileStarted:
+        result.error = "compiler inputs changed during analysis; retry refresh"
+        return
   if fingerprintInputs(beforePaths) != beforeFingerprint:
     result.error = "compiler inputs changed during analysis; retry refresh"
     return
+  if incremental:
+    writeFile(
+      cachePath / "frontend-context", $reuseKey & ":" & $fingerprintInputs(configPaths)
+    )
+    # Successful incremental checks can retain byte-identical BIFs with older
+    # mtimes than their source (for example after a comment-only edit). Stamp
+    # owned locations with the validated build time; never touch compiler files.
+    let validatedTime = int64(compileStarted.toUnixFloat() * 1_000_000_000.0)
+    for module in snapshot.modules.mitems:
+      if sourceTimes.getOrDefault(module.sourcePath) > module.artifactModifiedUnix:
+        module.artifactModifiedUnix = validatedTime
+      var changed = false
+      for symbol in module.symbols:
+        if sourceTimes.getOrDefault(symbol.location.path) >
+            symbol.location.artifactModifiedUnix:
+          changed = true
+          break
+      if changed:
+        var symbols = module.symbols
+        for symbol in symbols.mitems:
+          if sourceTimes.getOrDefault(symbol.location.path) >
+              symbol.location.artifactModifiedUnix:
+            symbol.location.artifactModifiedUnix = validatedTime
+        module.setSymbols(move(symbols))
   new(result.analysis.snapshot)
   result.analysis.snapshot[] = move(snapshot)
   result.analysis.diagnostics = result.diagnostics
@@ -553,7 +648,7 @@ proc runCompilerRefresh*(
       )
       return
 
-  let prerequisite = result.compiler.requireCompiler()
+  let prerequisite = result.compiler.requireCompiler(request.workspace.compilerFrontend)
   if prerequisite.len > 0:
     warn "Compiler-backed analysis prerequisite failed", failure = prerequisite
     result.addBuildFailure(prerequisite, entryPoints[0])
@@ -581,8 +676,8 @@ proc runCompilerRefresh*(
   let inventory = sourceInventory(request.workspace)
   let reuseKey = stableTextHash(
     $result.compiler.fingerprint & "\0" & $request.workspace.configurationFingerprint &
-      "\0" & $inventory & "\0" & $compilerEnvironmentFingerprint() &
-      "\0c-compileOnly-bif-v" & $HeadCacheVersion
+      "\0" & $inventory & "\0" & $compilerEnvironmentFingerprint() & "\0" &
+      $request.workspace.compilerFrontend & "-bif-v" & $HeadCacheVersion
   )
   var artifactCache: BifReuseCache
   var inputCache: InputFingerprints

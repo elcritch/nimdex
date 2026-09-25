@@ -49,6 +49,7 @@ Useful options are:
 
 ```text
 --compiler PATH       Select the Nim compiler
+--frontend MODE       compile (default) or track (incremental)
 --cache-root PATH     Store generated artifacts in PATH
 --entry-point PATH    Add a Nim entry point (repeatable)
 --import-path PATH    Add a Nim import path (repeatable)
@@ -110,6 +111,35 @@ runs `nim c --compileOnly:on --genBif:on` into a separate cache for each compile
 configuration, and entry point. This generates C and semantic BIFs but skips
 native compilation and linking. The current compiler's `nim check --genBif:on`
 omits declarations and include metadata, so it cannot yet replace this command.
+
+The optional incremental frontend uses `nim track` to check modules and emit
+semantic BIFs without generating C or running the native toolchain:
+
+```sh
+nimdex check /path/to/project --frontend track
+nimdex daemon --frontend track
+```
+
+Editors can select it with `"compilerFrontend": "track"` in
+`initializationOptions`. It requires the matching `nifler` and `nifmake`
+companions supplied with `deps/nim-devel/`. Each actual head retains its own
+compiler cache: unchanged modules are skipped, and dependency metadata decides
+which importers need rechecking. Only the current resolved module closure is
+indexed, so removed imports leave no stale symbols even though their old files
+remain in the compiler cache. Compiler state is separate from Nimdex's
+persistent semantic records. `compile` and `track` use distinct cache contexts.
+
+This mode is opt-in while broader compiler compatibility is evaluated.
+`nimcheck` conditionals and the incremental compiler's method dispatch behavior
+can differ from `nim c`; switch back with `--frontend compile` when needed.
+After a partial rebuild, diagnostics currently reflect modules checked in that
+invocation; warnings from skipped modules may disappear. Whole-head cache reuse
+retains its saved diagnostics. Complete diagnostic persistence across partial
+builds remains a gate before enabling this mode by default.
+Configuration, environment, and source-inventory changes conservatively reset
+the incremental compiler cache. Compilation work is still separate per head;
+sharing those artifacts across heads is future work.
+
 The daemon safely loads the generated BIF files through Binny and converts them into
 owned semantic records. BIF loading and indexing use Sigils worker pools; the
 blocking compiler process runs outside those workers.
@@ -144,6 +174,8 @@ heads. Changing environment variables between sessions invalidates reuse.
 `nimdex/debug` exposes pending/completed/failed heads, selected contexts, and
 `restoredHeads` alongside compilation and BIF reuse counts. Its optional
 `{"summaryOnly": true}` parameters omit module details for inexpensive polling.
+The compiler report also includes the selected `frontend`, `supportsTrack`,
+and the resolved companion executable paths.
 
 The CLI uses the same protocol messages as an editor rather than calling the
 compiler or indexer through a separate shortcut.

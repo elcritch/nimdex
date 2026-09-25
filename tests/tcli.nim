@@ -94,6 +94,11 @@ block cli_help:
   doAssert run.output.contains("Usage: nimdex")
   doAssert run.output.contains("symbols")
 
+block cli_frontend_validation:
+  let run = runCli(["check", "--frontend", "unknown"])
+  doAssert run.status == 2
+  doAssert run.errors.contains("--frontend must be compile or track")
+
 block interactive_head_loading:
   let root = normalizeDocumentPath(
     getTempDir() / ("nimdex-stdio-heads-" & $getCurrentProcessId())
@@ -106,7 +111,9 @@ block interactive_head_loading:
   writeFile(good, "const healthy* = 1\n")
   writeFile(bad, "proc broken( = discard\n")
   let compiler = currentSourcePath.parentDir.parentDir / "deps/nim-devel/bin/nim"
-  let process = startProcess(testDaemon(), args = ["daemon"], options = {poUsePath})
+  let process = startProcess(
+    testDaemon(), args = ["daemon", "--frontend", "track"], options = {poUsePath}
+  )
   var errorThread: Thread[Stream]
   createThread(errorThread, drainProtocolErrors, process.errorStream())
   defer:
@@ -171,11 +178,14 @@ block cli_symbols:
 
 block cli_debug:
   let cacheRoot = getTempDir() / ("nimdex-cli-debug-cache-" & $getCurrentProcessId())
-  let run = runExternalCli(["debug", FixtureRoot, "--cache-root", cacheRoot])
+  let run = runExternalCli(
+    ["debug", FixtureRoot, "--cache-root", cacheRoot, "--frontend", "track"]
+  )
   doAssert run.status == 0, run.output
   doAssert run.output.contains("\"compiler\"")
   doAssert run.output.contains("\"artifactPaths\"")
   doAssert run.output.contains("\"tokenCount\"")
+  doAssert run.output.contains("\"frontend\": \"track\"")
 
 block cli_package_layout:
   let root = getTempDir() / ("nimdex-cli-layout-" & $getCurrentProcessId())

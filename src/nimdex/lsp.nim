@@ -74,6 +74,7 @@ type
     workspace: Workspace
     artifactRoots: seq[string]
     configuredCompilerPath: string
+    configuredCompilerFrontend: CompilerFrontend
     compiler: CompilerCapabilities
     compilerEnabled: bool
     semanticCapabilities: bool
@@ -294,6 +295,7 @@ type CompilerInitializeOptions = object
   autoCompileSet: bool
   autoCompile: bool
   compilerPath: string
+  compilerFrontend: CompilerFrontend
   cacheRoot: string
   entryPoints: seq[string]
   importPaths: seq[string]
@@ -306,10 +308,11 @@ proc initializationOptions(params: JsonNode): JsonNode =
   newJObject()
 
 proc compilerOptionsFromInitialize(
-    params: JsonNode, serverCompilerPath: string
+    params: JsonNode, serverCompilerPath: string, serverFrontend: CompilerFrontend
 ): CompilerInitializeOptions =
   let options = initializationOptions(params)
-  if serverCompilerPath.len > 0:
+  result.compilerFrontend = serverFrontend
+  if serverCompilerPath.len > 0 or serverFrontend != cfCompile:
     result.configured = true
   if options.kind != JObject:
     if serverCompilerPath.len > 0:
@@ -318,6 +321,17 @@ proc compilerOptionsFromInitialize(
     return
 
   result.compilerPath = serverCompilerPath
+  if options.hasKey("compilerFrontend"):
+    result.configured = true
+    let frontend =
+      requireString(options, "compilerFrontend", "initialize initializationOptions")
+    case frontend
+    of "compile":
+      result.compilerFrontend = cfCompile
+    of "track":
+      result.compilerFrontend = cfTrack
+    else:
+      raiseLspError(RpcInvalidParams, "compilerFrontend must be compile or track")
   if options.hasKey("compiler"):
     result.configured = true
     let compiler = options["compiler"]
@@ -658,6 +672,10 @@ proc debugLsp(server: LspServer, params: JsonNode): JsonNode =
   compiler["revision"] = %server.compiler.revision
   compiler["available"] = %server.compiler.available
   compiler["supportsGenBif"] = %server.compiler.supportsGenBif
+  compiler["frontend"] = %($server.workspace.compilerFrontend)
+  compiler["supportsTrack"] = %server.compiler.supportsTrack
+  compiler["niflerPath"] = %server.compiler.niflerPath
+  compiler["nifmakePath"] = %server.compiler.nifmakePath
   compiler["fingerprint"] = %($server.compiler.fingerprint)
   compiler["enabled"] = %server.compilerEnabled
   compiler["error"] = %server.compiler.error
@@ -1660,8 +1678,9 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
   let initializeParams = requireObject(params, "initialize params")
   server.positionEncoding = negotiatePositionEncoding(params)
   let rootUri = rootUriFromInitialize(initializeParams)
-  let compilerOptions =
-    compilerOptionsFromInitialize(initializeParams, server.configuredCompilerPath)
+  let compilerOptions = compilerOptionsFromInitialize(
+    initializeParams, server.configuredCompilerPath, server.configuredCompilerFrontend
+  )
   let configuredRoots =
     if server.artifactRoots.len > 0:
       server.artifactRoots
@@ -1688,6 +1707,7 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
     nimArguments = compilerOptions.nimArguments,
     artifactRoots = resolveArtifactRoots(rootUri, configuredRoots),
     compilerPath = resolvedCompilerPath,
+    compilerFrontend = compilerOptions.compilerFrontend,
     cacheRoot = resolvedCacheRoot,
   )
   server.artifactRoots = server.workspace.artifactRoots
@@ -1714,7 +1734,8 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
     nimArgumentCount = server.workspace.nimArguments.len
   if compilerRequested:
     server.compiler = probeCompiler(server.workspace.compilerPath)
-    let prerequisite = server.compiler.requireCompiler()
+    let prerequisite =
+      server.compiler.requireCompiler(server.workspace.compilerFrontend)
     if prerequisite.len > 0:
       warn "Nimdex cannot use the configured Nim compiler",
         compilerPath = server.compiler.compilerPath, failure = prerequisite
@@ -1947,7 +1968,10 @@ proc registerLspRoutes(server: LspServer) =
   server.adapter.registerSelectorMethod(LspDebugMethod, server, debugSelector)
 
 proc newNimdexLspServer*(
-    workers = 1, artifactRoots: seq[string] = @[], compilerPath = ""
+    workers = 1,
+    artifactRoots: seq[string] = @[],
+    compilerPath = "",
+    compilerFrontend = cfCompile,
 ): LspServer =
   ## Create an LSP server with worker-owned document state.
   startLocalThreadDefault()
@@ -1957,6 +1981,7 @@ proc newNimdexLspServer*(
     home: getCurrentSigilThread(),
     artifactRoots: artifactRoots,
     configuredCompilerPath: compilerPath,
+    configuredCompilerFrontend: compilerFrontend,
     state: lssCreated,
     exitStatus: LspExitSuccess,
     pending: initTable[LanguageWorkId, LspPendingRequest](),
@@ -1998,6 +2023,7 @@ proc runNimdexLspStdio*(
     workers = 1,
     artifactRoots: seq[string] = @[],
     compilerPath = "",
+    compilerFrontend = cfCompile,
 ): int =
   ## Serve LSP Content-Length messages until EOF or an exit notification.
   ##
@@ -2006,7 +2032,8 @@ proc runNimdexLspStdio*(
   ## completions and flush framed responses.
   info "Starting Nimdex LSP server",
     compilerPath = compilerPath, artifactRoots = artifactRoots, workers = workers
-  let server = newNimdexLspServer(workers, artifactRoots, compilerPath)
+  let server =
+    newNimdexLspServer(workers, artifactRoots, compilerPath, compilerFrontend)
   server.asynchronousSession = true
   let dispatcher = newJsonRpcDispatcher(server.adapter)
   server.dispatcher = dispatcher

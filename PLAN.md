@@ -2,15 +2,16 @@
 
 Status: Phases 0–4b implemented. Phase 4c now includes progressive head loading,
 failure isolation, context selection, and persistent semantic records.
-The local `nim track` frontend has been probed; Nimdex integration and compiler
-artifact sharing across heads remain unimplemented. This document describes
+Per-head `nim track` integration is implemented as an opt-in frontend; compiler
+artifact sharing across heads remains unimplemented. This document describes
 the remaining implementation stages and the compatibility gates for each one.
 
 ## Next work in order
 
-1. Integrate the existing incremental frontend used by `nim track`, retaining
-   a dedicated compiler cache for each actual head. This first implementation
-   can live entirely in Nimdex with the current `deps/nim-devel/` toolchain.
+1. Complete the compatibility gates for the opt-in `nim track` frontend before
+   making it the default, especially persistence of diagnostics from skipped
+   modules. Per-head integration now lives entirely in Nimdex and uses the
+   current `deps/nim-devel/` toolchain without compiler changes.
 2. Validate reuse of compiler artifacts across compatible heads, starting with
    prefilling separate head caches. Incrementality within one head does not
    establish safe reuse between different heads.
@@ -442,7 +443,23 @@ failed-head diagnostics without disconnecting the client early.
 All 13 test files pass with `atlas-run tests --nim=deps/nim-devel/bin/nim`,
 and the release daemon builds with that compiler.
 
-#### Incremental frontend: first implement per-head reuse
+#### Incremental frontend: per-head reuse, implemented as opt-in
+
+Select this mode with CLI `--frontend track`, daemon `--frontend track`, or
+`initializationOptions.compilerFrontend = "track"`. The default remains
+`compile`. `src/nimdex/incremental.nim` reads the compiler's current build rules
+to map source paths to artifacts, then traverses safely loaded `.s.deps.bif`
+sidecars from the actual head and system root. This avoids reproducing the
+compiler's module suffix hashing. Loaded config sources come from the IC
+configuration artifact, since replayed configuration can omit ordinary hints.
+
+Each head keeps compiler files under its own `frontend/` directory, alongside
+Nimdex-owned captures and manifests. Source/configuration/environment validation
+still gates publication. Configuration changes (including newly created config
+files), source-inventory changes, and forced refreshes reset compiler state.
+Ordinary source edits preserve it. Validated source timestamps are recorded in
+owned locations when byte-identical BIFs retain older mtimes; unchanged symbol
+payloads remain shared.
 
 The existing local compiler provides a frontend-only entry through `nim track`:
 
@@ -475,25 +492,25 @@ were rewritten; the full semantic compatibility suite is still required.
 
 Implementation checklist (Nimdex scope):
 
-- [ ] Add an explicit frontend selection and capability probe for `track` plus
+- [x] Add an explicit frontend selection and capability probe for `track` plus
   compatible `nifler`/`nifmake`. Keep the current
   `c --compileOnly:on --genBif:on` path available; record the selected mode in
   cache identity and debug output. Missing tools, missing artifacts, and
   unsupported configurations need distinct errors from source compile errors.
-- [ ] Keep compiler state in a dedicated directory per compiler, configuration,
+- [x] Keep compiler state in a dedicated directory per compiler, configuration,
   mode, and actual head. The IC driver can delete its entire cache directory
   when `ic.version` changes, so persistent Nimdex manifests and semantic records
   must live outside that directory.
-- [ ] Preserve compiler artifacts across refreshes in incremental mode.
-  `buildHead` currently removes old BIFs before compiling; that behavior must
-  change for this mode. Preserve the existing validated whole-head memory/disk
+- [x] Preserve compiler artifacts across refreshes in incremental mode.
+  `buildHead` only removes old BIFs in the default compilation mode.
+  Preserve the existing validated whole-head memory/disk
   reuse so an unchanged save can still avoid invoking the compiler entirely.
-- [ ] Obtain the current resolved dependency closure after a successful build.
+- [x] Obtain the current resolved dependency closure after a successful build.
   Load only its semantic artifacts and reconcile graph ownership when imports
   change. A directory scan alone would retain orphan BIFs from earlier builds.
   Include implicit/system dependencies, includes, and discovered macro imports.
-- [ ] Preserve active-head priority, progressive publication, diagnostics,
-  failure isolation, preferred contexts, and source/configuration stamps.
+- [x] Preserve active-head priority, progressive publication, failure isolation,
+  preferred contexts, source/configuration stamps, and fresh compiler errors.
   Verify required artifacts even after exit status zero: the driver can emit
   build instructions without executing them when `nifmake` is unavailable.
 - [ ] Compare semantic output against the current frontend for declarations,
@@ -501,7 +518,7 @@ Implementation checklist (Nimdex scope):
   duplicate module names, test configurations, and `isMainModule`. Treat mode
   differences such as `nimcheck` and the current `nim m` vtable behavior as
   compatibility gates; do not reuse records across modes by source path alone.
-- [ ] Add deterministic regressions for unchanged builds, body/interface edits,
+- [x] Add deterministic regressions for unchanged builds, body/interface edits,
   compile-time body dependencies, changed/removed imports, configuration changes,
   and recovery after failure. Assert semantic results and rebuild behavior;
   keep elapsed timings observational.
@@ -510,6 +527,50 @@ Implementation checklist (Nimdex scope):
   all-head completion, compiler/module work, BIF loads, and cache size separately.
 - [ ] Provision and verify the matching compiler companions in CI before
   enabling this mode by default.
+
+All 14 test files pass with
+`atlas-run tests --nim=deps/nim-devel/bin/nim --only-errors`, and the release
+daemon builds with the same compiler.
+Fixtures verify source declarations/positions against `compile`, no C/native
+outputs, per-module edge-cookie timestamps on body/interface edits, compile-time
+body dependencies, macro-generated and implicit imports, includes, actual-head
+and test-config variants, newly created config files, removed imports, corrupt
+dependency metadata, restart restoration, and failed-build recovery. A real
+stdio session uses `track` while checking healthy queries and failed-head
+diagnostics. A comment-only edit preserves BIF mtimes while LSP symbols remain
+available. Generated package/helper entries differ between frontends; parity
+checks use the same source-token validation as LSP queries.
+
+Remaining diagnostic gate: a manual probe confirms that `nim track` emits
+warnings only for modules rechecked during that invocation. A warning in an
+unchanged head disappears from compiler output after a body-only dependency
+edit. Nimdex's whole-head reuse retains diagnostics, but a partial compiler
+rebuild currently replaces them with that invocation's output. Persisting and
+invalidating diagnostics per compilation unit, including include/generic
+locations, needs a compiler-supported attribution scheme or a proven adapter
+before making `track` the default. Do not assume that a silent skipped module
+has become warning-free.
+
+CI's pinned `koch boot` already builds the companion tools; the workflow now
+checks that both executables exist. Hosted execution remains unverified.
+
+Repository probe with the release daemon and 15 actual heads (2026-09-25):
+
+| Run | First document symbols | Full refresh | Compiler calls | BIF loads |
+| --- | ---: | ---: | ---: | ---: |
+| Empty `track` cache | 6.97 s | 78.50 s | 15 | 211 |
+| New daemon, persisted `track` cache | 0.95 s | 1.81 s | 0 | 0 |
+| Unchanged save in that daemon | — | 0.33 s | 0 | 0 |
+
+All heads succeeded. The cold refresh reused 1,973 identical artifacts while
+extracting 211 unique module records; the cache occupied about 562 MiB with no
+C files or native objects. The cold full-refresh duration comes from the
+compiler worker's start/completion logs; restart/save durations are measured
+through LSP. This is a 15-head checkout with additional implementation and tests,
+so it is not a controlled comparison with the earlier 14-head baseline. No
+cold-start speedup is established. The edit regressions prove skipped module
+work; a repository-scale edit benchmark and cross-head compiler reuse remain
+follow-ups.
 
 Completion criterion: the existing language and compiler fixtures pass using
 the incremental frontend; edits rebuild the expected module closure, removed

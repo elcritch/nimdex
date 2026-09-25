@@ -8,6 +8,7 @@ import sigils/rpcs/json/jrFraming
 import ./documents
 import ./lsp
 import ./projectlayout
+import ./workspace
 
 const NimdexVersion = "0.1.0"
 
@@ -24,6 +25,7 @@ type
     command: CliCommand
     projectPath: string
     compilerPath: string
+    compilerFrontend: string
     cacheRoot: string
     entryPoints: seq[string]
     importPaths: seq[string]
@@ -75,6 +77,7 @@ proc writeUsage(output: File) =
   output.writeLine("Options:")
   output.writeLine("  --project PATH       Project directory")
   output.writeLine("  --compiler PATH      Nim compiler or executable name")
+  output.writeLine("  --frontend MODE      compile (default) or track (incremental)")
   output.writeLine("  --cache-root PATH    Nimdex compiler cache directory")
   output.writeLine("  --entry-point PATH   Nim entry point; may be repeated")
   output.writeLine("  --import-path PATH   Nim import path; may be repeated")
@@ -183,6 +186,15 @@ proc parseCli(args: openArray[string]): CliParseResult =
         result.error = parsed.error
         return
       result.options.cacheRoot = parsed.value
+    of "--frontend":
+      let parsed = optionValue(args, index, argument)
+      if parsed.error.len > 0:
+        result.error = parsed.error
+        return
+      if parsed.value notin ["compile", "track"]:
+        result.error = "--frontend must be compile or track"
+        return
+      result.options.compilerFrontend = parsed.value
     of "--entry-point":
       result.error = addOptionValue(result.options.entryPoints, args, index, argument)
       if result.error.len > 0:
@@ -252,6 +264,8 @@ proc initializeMessage(options: CliOptions, root: string): string =
 
   var initializationOptions = newJObject()
   initializationOptions["autoCompile"] = %true
+  if options.compilerFrontend.len > 0:
+    initializationOptions["compilerFrontend"] = %options.compilerFrontend
   if options.compilerPath.len > 0:
     initializationOptions["compilerPath"] = %options.compilerPath
   if options.cacheRoot.len > 0:
@@ -644,6 +658,12 @@ proc runNimdexCli*(
     output.writeLine("nimdex " & NimdexVersion)
     0
   of cliDaemon:
-    runNimdexLspStdio(input, output, compilerPath = parsed.options.compilerPath)
+    runNimdexLspStdio(
+      input,
+      output,
+      compilerPath = parsed.options.compilerPath,
+      compilerFrontend =
+        if parsed.options.compilerFrontend == "track": cfTrack else: cfCompile,
+    )
   of cliCheck, cliSymbols, cliDebug:
     runProjectCommand(parsed.options, output, errorOutput, daemonPath)
