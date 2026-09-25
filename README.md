@@ -35,7 +35,8 @@ in its current file and 8 MiB in a `.1` rotation. Editor LSP diagnostics are
 still published normally.
 The CLI relays concise compiler progress: a start message for each head with
 its project directory and cache run ID, a running heartbeat every five seconds,
-each completed head with its completed/total count, and the compile log path.
+compiler completion with exit code and elapsed time, each completed head with
+its completed/total count, and the compile log path.
 Detailed compiler warnings stay in the per-head log.
 
 When launched from a directory containing a `.nimble` file, Nimdex parses its

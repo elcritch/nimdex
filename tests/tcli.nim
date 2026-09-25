@@ -216,7 +216,12 @@ block cli_symbols:
   doAssert run.status == 0, run.output
   doAssert run.output.contains("exportedRoutine")
   doAssert run.output.contains("Nim compiler starting"), run.output
+  doAssert run.output.contains("Nim compiler done"), run.output
   doAssert run.output.contains("Nim compiler progress"), run.output
+  doAssert run.output.find("Nim compiler starting") <
+    run.output.find("Nim compiler done")
+  doAssert run.output.find("Nim compiler done") <
+    run.output.find("Nim compiler progress")
   doAssert run.output.contains("-compile.log"), run.output
   var listedHidden = false
   for line in run.output.splitLines:
@@ -321,6 +326,8 @@ block cli_diagnostic_capture:
   writeFile(broken, "proc broken( = discard\n")
   let run = runExternalCli(["check", root, "--entry-point", broken])
   doAssert run.status != 0, run.output
+  doAssert run.output.contains("Nim compiler done"), run.output
+  doAssert run.output.contains("exitCode"), run.output
   doAssert run.output.contains("Compiler diagnostics captured"), run.output
   doAssert run.output.contains(".diagnostics.log"), run.output
   doAssert not run.output.contains("nimdex: file://"), run.output
@@ -347,9 +354,12 @@ when defined(posix):
     doAssert run.status == 0, run.output
     let starting = run.output.find("Nim compiler starting")
     let heartbeat = run.output.find("Nim compiler still running")
+    let done = run.output.find("Nim compiler done")
     doAssert starting >= 0 and starting < heartbeat, run.output
+    doAssert heartbeat < done, run.output
     doAssert run.output.contains("Nim compiler still running"), run.output
     doAssert run.output.contains("elapsedSeconds"), run.output
+    doAssert run.output.contains("elapsedMilliseconds"), run.output
 
 block persistent_cli_service:
   let repositoryRoot = currentSourcePath.parentDir.parentDir

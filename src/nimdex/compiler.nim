@@ -620,6 +620,7 @@ proc buildHead(
   let arguments = request.compilerArguments(compilerCache, entryPoint)
   result.command = commandLine(request.capabilities.compilerPath, arguments)
   let compileStarted = getTime()
+  let compilerStarted = getMonoTime()
   info "Nim compiler starting",
     workingDir = request.workspace.rootPath,
     entryPoint = entryPoint,
@@ -628,6 +629,13 @@ proc buildHead(
     request.capabilities.compilerPath, arguments, request.workspace.rootPath, cachePath,
     request.cancellation, entryPoint,
   )
+  info "Nim compiler done",
+    entryPoint = entryPoint,
+    cacheRunId = cachePath.extractFilename(),
+    exitCode = process.exitCode,
+    elapsedMilliseconds = (getMonoTime() - compilerStarted).inMilliseconds,
+    stdoutBytes = process.stdout.len,
+    stderrBytes = process.stderr.len
   try:
     let compileLog = saveHeadCompilerLog(cachePath, entryPoint, result.command, process)
     info "Nim compiler output captured",

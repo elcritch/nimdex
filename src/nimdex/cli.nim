@@ -79,6 +79,7 @@ type
     clkNone
     clkStarting
     clkRunning
+    clkDone
     clkHead
     clkCapture
 
@@ -95,6 +96,8 @@ type
     progressStatus: string
     progressLog: string
     progressElapsed: int
+    progressElapsedMilliseconds: int
+    progressExitCode: int
     progressCompleted: int
     progressTotal: int
     progressStdoutBytes: int
@@ -534,6 +537,14 @@ proc relayCompilerProgress(raw: string, context: pointer) {.nimcall, gcsafe.} =
         elapsedSeconds = state.progressElapsed,
         stdoutBytes = state.progressStdoutBytes,
         stderrBytes = state.progressStderrBytes
+    of clkDone:
+      info "Nim compiler done",
+        entryPoint = state.progressHead,
+        cacheRunId = state.progressCacheRunId,
+        exitCode = state.progressExitCode,
+        elapsedMilliseconds = state.progressElapsedMilliseconds,
+        stdoutBytes = state.progressStdoutBytes,
+        stderrBytes = state.progressStderrBytes
     of clkHead:
       info "Nim compiler progress",
         entryPoint = state.progressHead,
@@ -555,6 +566,8 @@ proc relayCompilerProgress(raw: string, context: pointer) {.nimcall, gcsafe.} =
       state.progressKind = clkStarting
     elif line.contains("Nim compiler still running"):
       state.progressKind = clkRunning
+    elif line.contains("Nim compiler done"):
+      state.progressKind = clkDone
     elif line.contains("Nim compiler progress"):
       state.progressKind = clkHead
     elif line.contains("Nim compiler output captured"):
@@ -567,6 +580,8 @@ proc relayCompilerProgress(raw: string, context: pointer) {.nimcall, gcsafe.} =
     state.progressStatus = ""
     state.progressLog = ""
     state.progressElapsed = 0
+    state.progressElapsedMilliseconds = 0
+    state.progressExitCode = 0
     state.progressCompleted = 0
     state.progressTotal = 0
     state.progressStdoutBytes = 0
@@ -590,12 +605,17 @@ proc relayCompilerProgress(raw: string, context: pointer) {.nimcall, gcsafe.} =
     state.progressStatus = value
   of "compileLog":
     state.progressLog = value
-  of "elapsedSeconds", "completedHeads", "totalHeads", "stdoutBytes", "stderrBytes":
+  of "elapsedSeconds", "elapsedMilliseconds", "exitCode", "completedHeads",
+      "totalHeads", "stdoutBytes", "stderrBytes":
     try:
       let number = parseInt(value)
       case name
       of "elapsedSeconds":
         state.progressElapsed = number
+      of "elapsedMilliseconds":
+        state.progressElapsedMilliseconds = number
+      of "exitCode":
+        state.progressExitCode = number
       of "completedHeads":
         state.progressCompleted = number
       of "totalHeads":
