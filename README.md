@@ -45,6 +45,40 @@ modules, source mappings, pool counts, and token counts. It also shows
 `moduleGraph.actualHeads`, imports/includes, reverse importers, each source's
 `headFiles`, and counts of compiled/reused heads and loaded/reused artifacts.
 
+### Query a running daemon
+
+Build once from this checkout:
+
+```sh
+deps/nim-devel/bin/nim c -d:release -o:/tmp/nimdex src/nimdex.nim
+```
+
+Start a listening daemon in one terminal, from this repository root:
+
+```sh
+/tmp/nimdex daemon . --listen 49152 --compiler deps/nim-devel/bin/nim
+```
+
+The daemon prints `nimdex listening on 127.0.0.1:49152` when it is ready to
+accept CLI requests. In another terminal, query the same project without
+starting a new analysis process:
+
+```sh
+/tmp/nimdex check . --connect 49152
+/tmp/nimdex symbols . --connect 49152 --query newCompilerCancellation
+/tmp/nimdex debug . --connect 49152 | jq '.moduleGraph.actualHeads'
+/tmp/nimdex stop --connect 49152
+```
+
+Set `--compiler`, `--frontend track`, `--entry-point`, and other analysis
+options on `daemon` when starting it. Queries reuse that configuration and its
+in-memory semantic index. `--entry-point tests/tnavigation.nim` limits the
+initial analysis to one head; otherwise Nimdex discovers the package and
+`tests/t*.nim` heads. The listener accepts connections only on loopback and
+serves one project. Use a different port for another project. Passing
+`--listen 0` chooses a free port and prints it. The plain `daemon` command
+still uses stdin/stdout LSP transport for editors.
+
 Useful options are:
 
 ```text
@@ -57,6 +91,8 @@ Useful options are:
 --nim-arg ARG         Pass a controlled argument to Nim (repeatable)
 --query TEXT          Filter symbols by name
 --debug               Include the detailed daemon report with symbols
+--listen PORT         Listen for CLI requests (daemon only)
+--connect PORT        Query an existing listening daemon
 ```
 
 ## Editor integration

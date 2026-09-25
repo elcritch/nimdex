@@ -1,10 +1,11 @@
 ## A small LSP/JSON-RPC client and daemon entry point for Nimdex.
 
-import std/[json, os, options, osproc, streams, strutils, syncio, typedthreads]
+import std/[json, net, os, options, osproc, streams, strutils, syncio, typedthreads]
 
 import chronicles
 import sigils/rpcs/json/jrFraming
 
+import ./cliipc
 import ./documents
 import ./lsp
 import ./projectlayout
@@ -18,6 +19,7 @@ type
     cliSymbols
     cliDebug
     cliDaemon
+    cliStop
     cliHelp
     cliVersion
 
@@ -33,6 +35,8 @@ type
     nimArguments: seq[string]
     query: string
     debug: bool
+    listenPort: int
+    connectPort: int
 
   CliParseResult = object
     options: CliOptions
@@ -46,7 +50,6 @@ type
     errorDrainState: RpcErrorDrain
     errorDrainThread: Thread[ptr RpcErrorDrain]
     parser: JsonRpcFrameParser
-    notifications: seq[JsonNode]
 
   RpcErrorDrain = object
     stream: Stream
@@ -69,6 +72,7 @@ proc writeUsage(output: File) =
   output.writeLine("  check       Ask a daemon for a project analysis summary")
   output.writeLine("  symbols     List project symbols through the daemon")
   output.writeLine("  debug       Print daemon/compiler/BIF diagnostics")
+  output.writeLine("  stop        Shut down a listening daemon")
   output.writeLine("  help        Show this help")
   output.writeLine("  version     Show the Nimdex version")
   output.writeLine("")
@@ -87,6 +91,12 @@ proc writeUsage(output: File) =
   )
   output.writeLine("  --query TEXT         Filter symbols by name")
   output.writeLine("  --debug              Include the detailed daemon report")
+  output.writeLine(
+    "  --listen PORT        Serve CLI requests on 127.0.0.1 (daemon only)"
+  )
+  output.writeLine(
+    "  --connect PORT       Query a listening daemon instead of starting one"
+  )
   output.writeLine("  -h, --help           Show this help")
 
 proc optionValue(
@@ -108,6 +118,8 @@ proc addOptionValue(
 
 proc parseCli(args: openArray[string]): CliParseResult =
   result.options.command = cliCheck
+  result.options.listenPort = -1
+  result.options.connectPort = -1
   var commandSeen = false
   var positional: seq[string]
   var index = 0
@@ -146,6 +158,11 @@ proc parseCli(args: openArray[string]): CliParseResult =
         commandSeen = true
         inc index
         continue
+      of "stop":
+        result.options.command = cliStop
+        commandSeen = true
+        inc index
+        continue
       of "help":
         result.options.command = cliHelp
         commandSeen = true
@@ -168,6 +185,23 @@ proc parseCli(args: openArray[string]): CliParseResult =
       commandSeen = true
     of "--debug":
       result.options.debug = true
+    of "--listen", "--connect":
+      let parsed = optionValue(args, index, argument)
+      if parsed.error.len > 0:
+        result.error = parsed.error
+        return
+      try:
+        let port = parseInt(parsed.value)
+        if port < 0 or port > 65535 or (argument == "--connect" and port == 0):
+          result.error = argument & " requires a valid port (1 to 65535)"
+          return
+        if argument == "--listen":
+          result.options.listenPort = port
+        else:
+          result.options.connectPort = port
+      except ValueError:
+        result.error = argument & " requires a numeric port"
+        return
     of "-p", "--project":
       let parsed = optionValue(args, index, argument)
       if parsed.error.len > 0:
@@ -227,6 +261,24 @@ proc parseCli(args: openArray[string]): CliParseResult =
   if result.options.command in {cliHelp, cliVersion}:
     if positional.len > 0:
       result.error = "unexpected argument: " & positional[0]
+    return
+
+  if result.options.listenPort >= 0 and result.options.command != cliDaemon:
+    result.error = "--listen requires daemon"
+    return
+  if result.options.connectPort >= 0 and result.options.command == cliDaemon:
+    result.error = "--connect is for CLI queries or stop"
+    return
+  if result.options.command == cliStop and result.options.connectPort < 0:
+    result.error = "stop requires --connect PORT"
+    return
+  if result.options.connectPort >= 0 and (
+    result.options.compilerPath.len > 0 or result.options.compilerFrontend.len > 0 or
+    result.options.cacheRoot.len > 0 or result.options.entryPoints.len > 0 or
+    result.options.importPaths.len > 0 or result.options.artifactRoots.len > 0 or
+    result.options.nimArguments.len > 0
+  ):
+    result.error = "set analysis options when starting the listening daemon"
     return
 
   if positional.len > 0:
@@ -365,7 +417,6 @@ proc readResponse(session: RpcSession, id: int, diagnosticOutput: File): RpcCall
       result.error = "Nimdex daemon did not return a response"
       return
     if read.frame.kind == JObject and read.frame.hasKey("method"):
-      session.notifications.add(read.frame)
       reportNotification(read.frame, diagnosticOutput)
     if read.frame.isResponseFor(id):
       result.response = read.frame
@@ -373,7 +424,7 @@ proc readResponse(session: RpcSession, id: int, diagnosticOutput: File): RpcCall
 
 proc drainRpcErrors(state: ptr RpcErrorDrain) {.thread.} =
   var logFile: File
-  let saveLogs = open(logFile, state.logPath, fmWrite)
+  let saveLogs = state.logPath.len > 0 and open(logFile, state.logPath, fmWrite)
   defer:
     if saveLogs:
       logFile.close()
@@ -385,13 +436,18 @@ proc drainRpcErrors(state: ptr RpcErrorDrain) {.thread.} =
       break
     if saveLogs:
       discard logFile.writeBuffer(addr buffer[0], bytesRead)
+    else:
+      discard stderr.writeBuffer(addr buffer[0], bytesRead)
 
-proc newRpcSession(root, daemonPath: string): RpcSession =
+proc newRpcSession(root, daemonPath: string, persistent = false): RpcSession =
   debug "Starting Nimdex daemon for CLI request",
     projectRoot = root, daemonPath = daemonPath, workingDirectory = root
   let errorLogPath =
-    getTempDir() / ("nimdex-cli-daemon-" & $getCurrentProcessId() & ".stderr")
-  if fileExists(errorLogPath):
+    if persistent:
+      ""
+    else:
+      getTempDir() / ("nimdex-cli-daemon-" & $getCurrentProcessId() & ".stderr")
+  if errorLogPath.len > 0 and fileExists(errorLogPath):
     removeFile(errorLogPath)
   result = RpcSession(
     process: startProcess(
@@ -423,13 +479,15 @@ proc stopRpcSession(session: RpcSession, diagnosticOutput: File) =
   discard session.process.waitForExit()
   joinThread(session.errorDrainThread)
   let daemonErrors =
-    if fileExists(session.errorDrainState.logPath):
+    if session.errorDrainState.logPath.len > 0 and
+        fileExists(session.errorDrainState.logPath):
       readFile(session.errorDrainState.logPath).strip()
     else:
       ""
   if daemonErrors.len > 0:
     diagnosticOutput.writeLine(daemonErrors)
-  if fileExists(session.errorDrainState.logPath):
+  if session.errorDrainState.logPath.len > 0 and
+      fileExists(session.errorDrainState.logPath):
     removeFile(session.errorDrainState.logPath)
   session.process.close()
 
@@ -441,29 +499,27 @@ proc responseError(response: JsonNode): string =
     return error["message"].getStr()
   $error
 
-proc runDaemonRequest(
+proc initializeSession(
+    session: RpcSession, options: CliOptions, root: string, diagnosticOutput: File
+): string =
+  session.send(initializeMessage(options, root))
+  let initialized = session.readResponse(1, diagnosticOutput)
+  if initialized.error.len > 0:
+    return initialized.error
+  let initializeError = responseError(initialized.response)
+  if initializeError.len > 0:
+    return "initialize failed: " & initializeError
+  session.send(rpcNotification("initialized", newJObject()))
+
+proc requestOnSession(
+    session: RpcSession,
     options: CliOptions,
-    root: string,
     methodName: string,
     params: JsonNode,
-    requestId: int,
     diagnosticOutput: File,
-    daemonPath: string,
 ): tuple[response: JsonNode, debug: JsonNode, error: string] =
-  var session: RpcSession
+  const requestId = 2
   try:
-    session = newRpcSession(root, daemonPath)
-    session.send(initializeMessage(options, root))
-    let initialized = session.readResponse(1, diagnosticOutput)
-    if initialized.error.len > 0:
-      result.error = initialized.error
-      return
-    let initializeError = responseError(initialized.response)
-    if initializeError.len > 0:
-      result.error = "initialize failed: " & initializeError
-      return
-
-    session.send(rpcNotification("initialized", newJObject()))
     if options.command in {cliCheck, cliDebug}:
       # Project-wide commands need the final outcome of every discovered head.
       # Document queries in an editor can already use completed heads.
@@ -507,12 +563,36 @@ proc runDaemonRequest(
         result.error = debugError
         return
       result.debug = debugResponse.response["result"]
+  except CatchableError as error:
+    result.error = error.msg
 
-    session.send(rpcRequest(requestId + 2, "shutdown", newJObject()))
-    discard session.readResponse(requestId + 2, diagnosticOutput)
+proc shutdownSession(session: RpcSession, diagnosticOutput: File) =
+  if session.isNil or session.process.isNil or not session.process.running():
+    return
+  try:
+    session.send(rpcRequest(4, "shutdown", newJObject()))
+    discard session.readResponse(4, diagnosticOutput)
+  except CatchableError:
+    discard
+
+proc runDaemonRequest(
+    options: CliOptions,
+    root: string,
+    methodName: string,
+    params: JsonNode,
+    diagnosticOutput: File,
+    daemonPath: string,
+): tuple[response: JsonNode, debug: JsonNode, error: string] =
+  var session: RpcSession
+  try:
+    session = newRpcSession(root, daemonPath)
+    result.error = session.initializeSession(options, root, diagnosticOutput)
+    if result.error.len == 0:
+      result = session.requestOnSession(options, methodName, params, diagnosticOutput)
   except CatchableError as error:
     result.error = error.msg
   finally:
+    session.shutdownSession(diagnosticOutput)
     session.stopRpcSession(diagnosticOutput)
 
 proc printSymbols(response: JsonNode, output: File): int =
@@ -576,6 +656,150 @@ proc projectEntryPoint(options: CliOptions, root: string): string =
   if layout.heads.len > 0:
     return layout.heads[0]
 
+proc projectRequest(
+    options: CliOptions, root: string
+): tuple[methodName: string, params: JsonNode] =
+  result.params = newJObject()
+  if options.command in {cliCheck, cliDebug}:
+    result.params["textDocument"] =
+      %*{"uri": documentUriFromPath(options.projectEntryPoint(root))}
+    result.methodName = "textDocument/documentSymbol"
+  else:
+    result.params["query"] = %options.query
+    result.methodName = "workspace/symbol"
+
+proc callListeningDaemon(port: int, request: JsonNode): JsonNode =
+  let socket = newSocket()
+  try:
+    socket.connect("127.0.0.1", Port(port))
+    socket.sendCliMessage($request)
+    result = parseJson(socket.receiveCliMessage())
+  finally:
+    socket.close()
+
+proc runConnectedRequest(
+    options: CliOptions, root: string
+): tuple[response: JsonNode, debug: JsonNode, error: string] =
+  try:
+    let request =
+      %*{
+        "command": $options.command,
+        "root": root,
+        "query": options.query,
+        "debug": options.debug,
+      }
+    let reply = callListeningDaemon(options.connectPort, request)
+    if reply.kind != JObject:
+      result.error = "listening daemon returned an invalid response"
+    elif reply.hasKey("error") and reply["error"].kind == JString:
+      result.error = reply["error"].getStr()
+    else:
+      result.response = reply["response"]
+      result.debug = reply["debug"]
+  except CatchableError as error:
+    result.error =
+      "could not query 127.0.0.1:" & $options.connectPort & ": " & error.msg
+
+proc serviceReply(
+    session: RpcSession,
+    serverOptions: CliOptions,
+    root: string,
+    request: JsonNode,
+    diagnosticOutput: File,
+): JsonNode =
+  if request.kind != JObject:
+    return %*{"error": "invalid CLI request"}
+  let command = request{"command"}.getStr("")
+  if command notin ["cliCheck", "cliSymbols", "cliDebug"]:
+    return %*{"error": "unknown CLI command: " & command}
+  if request{"root"}.getStr("") != root:
+    return %*{"error": "daemon serves " & root & "; specify that project"}
+  var options = serverOptions
+  case command
+  of "cliCheck":
+    options.command = cliCheck
+  of "cliSymbols":
+    options.command = cliSymbols
+  of "cliDebug":
+    options.command = cliDebug
+  else:
+    discard
+  options.query = request{"query"}.getStr("")
+  options.debug = request{"debug"}.getBool(false)
+  let projectRequest = options.projectRequest(root)
+  let reply = session.requestOnSession(
+    options, projectRequest.methodName, projectRequest.params, diagnosticOutput
+  )
+  if reply.error.len > 0:
+    return %*{"error": reply.error}
+  result = newJObject()
+  result["response"] =
+    if reply.response.isNil:
+      newJNull()
+    else:
+      reply.response
+  result["debug"] =
+    if reply.debug.isNil:
+      newJNull()
+    else:
+      reply.debug
+
+proc runCliService(
+    options: CliOptions, output, errorOutput: File, daemonPath: string
+): int =
+  let project = options.projectRoot()
+  if project.error.len > 0:
+    errorOutput.writeLine("nimdex: " & project.error)
+    return 2
+  let listener = newSocket()
+  var session: RpcSession
+  try:
+    listener.bindAddr(Port(options.listenPort), "127.0.0.1")
+    listener.listen()
+    session = newRpcSession(project.path, daemonPath, persistent = true)
+    let initError = session.initializeSession(options, project.path, errorOutput)
+    if initError.len > 0:
+      errorOutput.writeLine("nimdex: " & initError)
+      return 1
+    output.writeLine("nimdex listening on 127.0.0.1:" & $listener.getLocalAddr()[1])
+    output.flushFile()
+    while true:
+      var client: Socket
+      listener.accept(client)
+      var stopping = false
+      try:
+        let request = parseJson(client.receiveCliMessage(timeoutMs = 5000))
+        if request.kind == JObject and request{"command"}.getStr("") == "stop":
+          client.sendCliMessage($(%*{"stopping": true}))
+          stopping = true
+        else:
+          if not session.process.running():
+            session.stopRpcSession(errorOutput)
+            session = newRpcSession(project.path, daemonPath, persistent = true)
+            let initError =
+              session.initializeSession(options, project.path, errorOutput)
+            if initError.len > 0:
+              raise newException(IOError, initError)
+          let reply = session.serviceReply(options, project.path, request, errorOutput)
+          client.sendCliMessage($reply)
+      except CatchableError as error:
+        try:
+          client.sendCliMessage($(%*{"error": error.msg}))
+        except CatchableError:
+          discard
+      finally:
+        client.close()
+      if stopping:
+        break
+  except CatchableError as error:
+    errorOutput.writeLine("nimdex: " & error.msg)
+    return 1
+  finally:
+    listener.close()
+    session.shutdownSession(errorOutput)
+    session.stopRpcSession(errorOutput)
+  0
+
 proc runProjectCommand(
     options: CliOptions, output, errorOutput: File, daemonPath: string
 ): int =
@@ -594,45 +818,56 @@ proc runProjectCommand(
     artifactRoots = options.artifactRoots,
     query = options.query
 
-  var params = newJObject()
-  let waitsForCompiler = options.command in {cliCheck, cliDebug}
-  let methodName =
-    if waitsForCompiler:
-      let textDocument = newJObject()
-      textDocument["uri"] = %documentUriFromPath(options.projectEntryPoint(root.path))
-      params["textDocument"] = textDocument
-      "textDocument/documentSymbol"
+  let projectQuery = options.projectRequest(root.path)
+  let reply =
+    if options.connectPort >= 0:
+      runConnectedRequest(options, root.path)
     else:
-      params["query"] = %options.query
-      "workspace/symbol"
-  let request =
-    runDaemonRequest(options, root.path, methodName, params, 2, errorOutput, daemonPath)
-  if request.error.len > 0:
-    errorOutput.writeLine("nimdex: " & request.error)
+      runDaemonRequest(
+        options, root.path, projectQuery.methodName, projectQuery.params, errorOutput,
+        daemonPath,
+      )
+  if reply.error.len > 0:
+    errorOutput.writeLine("nimdex: " & reply.error)
     return 1
 
   if options.command == cliSymbols:
-    result = printSymbols(request.response, output)
+    result = printSymbols(reply.response, output)
     if options.debug:
-      if request.debug.kind == JObject:
-        errorOutput.writeLine(request.debug.pretty())
+      if reply.debug.kind == JObject:
+        errorOutput.writeLine(reply.debug.pretty())
       else:
         errorOutput.writeLine("nimdex: daemon returned no debug report")
   elif options.command == cliCheck:
-    if request.debug.isNil or request.debug.kind != JObject:
+    if reply.debug.isNil or reply.debug.kind != JObject:
       return 1
-    let semantic = request.debug["semantic"]
+    let semantic = reply.debug["semantic"]
     if not semantic["ready"].getBool():
       errorOutput.writeLine("nimdex: semantic snapshot is not ready")
       return 1
-    result = printSummary(request.debug, output)
+    result = printSummary(reply.debug, output)
   else:
-    if not request.debug.isNil and request.debug.kind == JObject:
-      output.writeLine(request.debug.pretty())
-    elif request.response.kind == JObject and request.response.hasKey("result"):
-      output.writeLine(request.response["result"].pretty())
+    if not reply.debug.isNil and reply.debug.kind == JObject:
+      output.writeLine(reply.debug.pretty())
+    elif reply.response.kind == JObject and reply.response.hasKey("result"):
+      output.writeLine(reply.response["result"].pretty())
     else:
-      output.writeLine(request.response.pretty())
+      output.writeLine(reply.response.pretty())
+
+proc runStopCommand(options: CliOptions, output, errorOutput: File): int =
+  try:
+    let reply = callListeningDaemon(options.connectPort, %*{"command": "stop"})
+    if reply.kind != JObject or not reply.hasKey("stopping") or
+        not reply["stopping"].getBool():
+      errorOutput.writeLine("nimdex: listening daemon did not acknowledge stop")
+      return 1
+    output.writeLine("nimdex daemon stopped")
+  except CatchableError as error:
+    errorOutput.writeLine(
+      "nimdex: could not stop 127.0.0.1:" & $options.connectPort & ": " & error.msg
+    )
+    return 1
+  0
 
 proc runNimdexCli*(
     args: openArray[string],
@@ -658,12 +893,17 @@ proc runNimdexCli*(
     output.writeLine("nimdex " & NimdexVersion)
     0
   of cliDaemon:
-    runNimdexLspStdio(
-      input,
-      output,
-      compilerPath = parsed.options.compilerPath,
-      compilerFrontend =
-        if parsed.options.compilerFrontend == "track": cfTrack else: cfCompile,
-    )
+    if parsed.options.listenPort >= 0:
+      runCliService(parsed.options, output, errorOutput, daemonPath)
+    else:
+      runNimdexLspStdio(
+        input,
+        output,
+        compilerPath = parsed.options.compilerPath,
+        compilerFrontend =
+          if parsed.options.compilerFrontend == "track": cfTrack else: cfCompile,
+      )
+  of cliStop:
+    runStopCommand(parsed.options, output, errorOutput)
   of cliCheck, cliSymbols, cliDebug:
     runProjectCommand(parsed.options, output, errorOutput, daemonPath)

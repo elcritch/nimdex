@@ -1,4 +1,4 @@
-import std/[assertions, json, os, osproc, streams, strutils]
+import std/[assertions, json, net, os, osproc, streams, strutils]
 
 import nimdex/cli
 import nimdex/documents
@@ -98,6 +98,14 @@ block cli_frontend_validation:
   let run = runCli(["check", "--frontend", "unknown"])
   doAssert run.status == 2
   doAssert run.errors.contains("--frontend must be compile or track")
+
+block cli_connection_validation:
+  let run = runCli(["check", "--connect", "0"])
+  doAssert run.status == 2
+  doAssert run.errors.contains("--connect requires a valid port")
+  let options = runCli(["check", "--connect", "49152", "--frontend", "track"])
+  doAssert options.status == 2
+  doAssert options.errors.contains("set analysis options when starting")
 
 block interactive_head_loading:
   let root = normalizeDocumentPath(
@@ -200,3 +208,56 @@ block cli_package_layout:
   doAssert run.status == 0, run.output
   doAssert run.output.contains("\"actualHeads\"")
   doAssert run.output.contains("tpackage.nim")
+
+block persistent_cli_service:
+  let repositoryRoot = currentSourcePath.parentDir.parentDir
+  let compiler = repositoryRoot / "deps/nim-devel/bin/nim"
+  let cacheRoot = getTempDir() / ("nimdex-cli-service-cache-" & $getCurrentProcessId())
+  let process = startProcess(
+    testDaemon(),
+    args = [
+      "daemon", FixtureRoot, "--listen", "0", "--compiler", compiler, "--cache-root",
+      cacheRoot,
+    ],
+    options = {poUsePath},
+  )
+  var errorThread: Thread[Stream]
+  createThread(errorThread, drainProtocolErrors, process.errorStream())
+  defer:
+    if process.running():
+      process.kill()
+      discard process.waitForExit()
+    joinThread(errorThread)
+    process.close()
+
+  let ready = process.outputStream().readLine()
+  doAssert ready.startsWith("nimdex listening on 127.0.0.1:"), ready
+  let port = ready.split(':')[1]
+
+  let checked = runExternalCli(["check", FixtureRoot, "--connect", port])
+  doAssert checked.status == 0, checked.output
+  doAssert checked.output.contains("modules:")
+
+  let aborted = newSocket()
+  aborted.connect("127.0.0.1", Port(parseInt(port)))
+  aborted.send("\x00\x00")
+  aborted.close()
+
+  let symbols = runExternalCli(
+    ["symbols", FixtureRoot, "--connect", port, "--query", "exportedRoutine"]
+  )
+  doAssert symbols.status == 0, symbols.output
+  doAssert symbols.output.contains("exportedRoutine")
+
+  let debug = runExternalCli(["debug", FixtureRoot, "--connect", port])
+  doAssert debug.status == 0, debug.output
+  doAssert debug.output.contains("\"actualHeads\"")
+
+  let wrongRoot = runExternalCli(["check", repositoryRoot, "--connect", port])
+  doAssert wrongRoot.status == 1, wrongRoot.output
+  doAssert wrongRoot.output.contains("daemon serves")
+
+  let stopped = runExternalCli(["stop", "--connect", port])
+  doAssert stopped.status == 0, stopped.output
+  doAssert stopped.output.contains("nimdex daemon stopped")
+  doAssert process.waitForExit(10000) == 0
