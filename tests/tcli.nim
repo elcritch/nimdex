@@ -127,7 +127,10 @@ block cli_help:
 block cli_frontend_validation:
   let run = runCli(["check", "--frontend", "unknown"])
   doAssert run.status == 2
-  doAssert run.errors.contains("--frontend must be compile or track")
+  doAssert run.errors.contains("--frontend must be compile, track, or ic")
+  let ic = runCli(["check", "--connect", "49152", "--frontend", "ic"])
+  doAssert ic.status == 2
+  doAssert ic.errors.contains("set analysis options when starting")
 
 block cli_connection_validation:
   let run = runCli(["check", "--connect", "0"])
@@ -226,6 +229,15 @@ block cli_debug:
   doAssert run.output.contains("\"artifactPaths\"")
   doAssert run.output.contains("\"tokenCount\"")
   doAssert run.output.contains("\"frontend\": \"track\"")
+
+block cli_ic_debug:
+  let cacheRoot = getTempDir() / ("nimdex-cli-ic-cache-" & $getCurrentProcessId())
+  let run = runExternalCli(
+    ["debug", FixtureRoot, "--cache-root", cacheRoot, "--frontend", "ic"]
+  )
+  doAssert run.status == 0, run.output
+  doAssert run.output.contains("\"frontend\": \"ic\"")
+  doAssert run.output.contains("\"artifactPaths\"")
 
 block cli_package_layout:
   let root = getTempDir() / ("nimdex-cli-layout-" & $getCurrentProcessId())

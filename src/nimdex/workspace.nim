@@ -10,6 +10,7 @@ export projectlayout
 type CompilerFrontend* = enum
   cfCompile = "compile"
   cfTrack = "track"
+  cfIc = "ic"
 
 type Workspace* = object
   rootUri*: string

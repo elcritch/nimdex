@@ -344,8 +344,10 @@ proc compilerOptionsFromInitialize(
       result.compilerFrontend = cfCompile
     of "track":
       result.compilerFrontend = cfTrack
+    of "ic":
+      result.compilerFrontend = cfIc
     else:
-      raiseLspError(RpcInvalidParams, "compilerFrontend must be compile or track")
+      raiseLspError(RpcInvalidParams, "compilerFrontend must be compile, track, or ic")
   if options.hasKey("compiler"):
     result.configured = true
     let compiler = options["compiler"]

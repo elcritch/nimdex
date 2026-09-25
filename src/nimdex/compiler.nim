@@ -375,11 +375,13 @@ proc requireCompiler*(
         "Nimdex requires a usable Nim compiler"
   if not capabilities.supportsGenBif:
     return "Nimdex requires a Nim compiler that supports --genBif:on"
-  if frontend == cfTrack:
-    if not capabilities.supportsTrack:
+  if frontend in {cfTrack, cfIc}:
+    if frontend == cfTrack and not capabilities.supportsTrack:
       return "the selected Nim compiler does not advertise the track frontend"
     if capabilities.niflerPath.len == 0 or capabilities.nifmakePath.len == 0:
-      return "the track frontend requires nifler and nifmake beside Nim or on PATH"
+      return
+        "the " & $frontend &
+        " frontend requires nifler and nifmake beside Nim or on PATH"
 
 proc diagnosticSeverityValue(
     label: string
@@ -522,10 +524,15 @@ proc compilerArguments(
     request: CompilerRefreshRequest, cachePath, entryPoint: string
 ): seq[string] =
   # This compiler's `check --genBif:on` drops semantic statements in SemPass.
-  # The default retains C generation; track uses the existing IC frontend.
+  # `track` runs IC's frontend only; `ic` also generates C for its backend.
   let incremental =
-    request.workspace.compilerFrontend == cfTrack and request.overlays.len == 0
-  result.add(if incremental: "track" else: "c")
+    request.workspace.compilerFrontend in {cfTrack, cfIc} and request.overlays.len == 0
+  result.add(
+    if incremental:
+      $request.workspace.compilerFrontend
+    else:
+      "c"
+  )
   for argument in request.workspace.nimArguments:
     result.add(argument)
   for importPath in request.workspace.importPaths:
@@ -533,7 +540,7 @@ proc compilerArguments(
   ## These options are appended after user switches so the refresh command is
   ## always an artifact-only, BIF-producing build in its private cache.
   result.add("--genBif:on")
-  if not incremental:
+  if not incremental or request.workspace.compilerFrontend == cfIc:
     result.add("--compileOnly:on")
   result.add("--colors:off")
   result.add("--filenames:abs")
@@ -577,7 +584,7 @@ proc buildHead(
   ensureDirectory(cachePath)
   forgetHead(cachePath)
   let incremental =
-    request.workspace.compilerFrontend == cfTrack and request.overlays.len == 0
+    request.workspace.compilerFrontend in {cfTrack, cfIc} and request.overlays.len == 0
   # The IC driver owns and may reset this directory. Keep manifests and process
   # captures outside it, and retain its outputs for per-module rebuild decisions.
   let compilerCache =

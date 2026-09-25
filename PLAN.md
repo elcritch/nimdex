@@ -459,6 +459,17 @@ sidecars from the actual head and system root. This avoids reproducing the
 compiler's module suffix hashing. Loaded config sources come from the IC
 configuration artifact, since replayed configuration can omit ordinary hints.
 
+The additional opt-in `ic` mode runs `nim ic --compileOnly:on --genBif:on` on
+saved heads. It shares the validated incremental graph and BIF dependency
+loader with `track`, while keeping a separate cache identity. The local compiler
+generates C in this mode even with `--compileOnly:on`; it does not compile native
+objects or link. `track` remains the lower-work choice for LSP analysis. Dirty
+buffers still use the classic compile path. A real fixture verifies declaration
+positions against `track`, actual-head graph ownership, C output without native
+objects, persisted restore, and a shared-module edit. Binny's checked
+`loadStringList` API validates compiler `.s.deps.bif` sidecars before graph
+traversal; malformed shape is a recoverable head error.
+
 Each head keeps compiler files under its own `frontend/` directory, alongside
 Nimdex-owned captures and manifests. Source/configuration/environment validation
 still gates publication. Configuration changes (including newly created config

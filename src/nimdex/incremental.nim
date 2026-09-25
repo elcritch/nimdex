@@ -45,24 +45,14 @@ proc incrementalConfigurationInputs*(cachePath: string): seq[string] =
     child.skip()
 
 proc resolvedImports(path: string): seq[string] =
-  var module: BifModule
-  var failure: BifLoadFailure
-  if not tryLoad(path, module, failure, DependencyLimits):
+  try:
+    for source in loadStringList(path, "semdeps", DependencyLimits):
+      result.add(normalizeDocumentPath(source))
+  except BifError as failure:
     raise newException(
       ValueError,
-      "invalid incremental dependency artifact: " & path & ": " & failure.message,
+      "invalid incremental dependency artifact: " & path & ": " & failure.msg,
     )
-  var cursor = module.buf.beginRead()
-  defer:
-    cursor.endRead()
-  if cursor.kind != TagLit or cursor.tagName() != "semdeps":
-    raise newException(ValueError, "missing semdeps metadata: " & path)
-  var child = cursor.childCursor()
-  while child.hasMore:
-    if child.kind != StrLit:
-      raise newException(ValueError, "invalid semdeps entry: " & path)
-    result.add(normalizeDocumentPath(child.strVal()))
-    child.skip()
 
 proc incrementalArtifacts*(cachePath, head: string): seq[string] =
   ## Return only artifacts reachable from the actual head and implicit system

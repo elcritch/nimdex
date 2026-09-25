@@ -107,7 +107,7 @@ Useful options are:
 
 ```text
 --compiler PATH       Select the Nim compiler
---frontend MODE       compile (default) or track (incremental)
+--frontend MODE       compile (default), track, or ic
 --cache-root PATH     Store generated artifacts in PATH
 --entry-point PATH    Add a Nim entry point (repeatable)
 --import-path PATH    Add a Nim import path (repeatable)
@@ -190,17 +190,25 @@ nimdex check /path/to/project --frontend track
 nimdex daemon --frontend track
 ```
 
-Editors can select it with `"compilerFrontend": "track"` in
-`initializationOptions`. It requires the matching `nifler` and `nifmake`
-companions supplied with `deps/nim-devel/`. Each actual head retains its own
+`--frontend ic` runs `nim ic --compileOnly:on --genBif:on` through the same
+per-head incremental graph loader. It emits C into the compiler cache but skips
+native compilation and linking. Use it when checking compatibility with the
+full incremental compiler; `track` avoids the backend work and generated C.
+Both modes retain compiler state between edits and use separate cache contexts.
+
+Editors can select either mode with `"compilerFrontend": "track"` or
+`"compilerFrontend": "ic"` in `initializationOptions`. Both require the
+matching `nifler` and `nifmake` companions supplied with `deps/nim-devel/`.
+Each actual head retains its own
 compiler cache: unchanged modules are skipped, and dependency metadata decides
 which importers need rechecking. Only the current resolved module closure is
 indexed, so removed imports leave no stale symbols even though their old files
 remain in the compiler cache. Compiler state is separate from Nimdex's
-persistent semantic records. `compile` and `track` use distinct cache contexts.
-Dirty-buffer analysis currently uses `c --compileOnly:on` in a separate cache,
-even when saved-file analysis uses `track`. Dirty semantic records are never
-persisted as saved analyses. The compiler's dirty-file option cannot represent
+persistent semantic records. `compile`, `track`, and `ic` use distinct cache
+contexts. Dirty-buffer analysis currently uses `c --compileOnly:on` in a
+separate cache, even when saved-file analysis uses `track` or `ic`. Dirty
+semantic records are never persisted as saved analyses. The compiler's
+dirty-file option cannot represent
 paths containing commas; these produce an analysis error.
 
 This mode is opt-in while broader compiler compatibility is evaluated.

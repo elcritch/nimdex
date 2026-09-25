@@ -57,10 +57,12 @@ proc compilerRuns(refresh: CompilerRefreshResult): Table[string, Time] =
 suite "incremental compiler frontend":
   test "checks frontend prerequisites separately and rejects unknown LSP modes":
     check capabilities.requireCompiler(cfTrack) == ""
+    check capabilities.requireCompiler(cfIc) == ""
     var missing = capabilities
     missing.nifmakePath = ""
     check missing.requireCompiler(cfCompile) == ""
     check "nifmake" in missing.requireCompiler(cfTrack)
+    check "nifmake" in missing.requireCompiler(cfIc)
     missing = capabilities
     missing.supportsTrack = false
     check "track" in missing.requireCompiler(cfTrack)
@@ -82,6 +84,57 @@ suite "incremental compiler frontend":
       )
     check response.isSome()
     check parseJson(response.get())["error"]["code"].getInt() == -32602
+
+  test "ic reuses the incremental graph and skips native compilation":
+    let root = normalizeDocumentPath(createTempDir("nimdex-ic-", ""))
+    defer:
+      removeDir(root)
+    let head = root / "main.nim"
+    let shared = root / "support.nim"
+    for name in ["main.nim", "support.nim"]:
+      copyFile(RepositoryRoot / "tests/fixtures/binny_phase0" / name, root / name)
+    let sharedContents = readFile(shared)
+    let tracked = runCompilerRefresh(requestFor(root, head))
+    require tracked.ok
+    var request = requestFor(root, head, cfIc)
+    let cold = runCompilerRefresh(request)
+    checkpoint cold.error & "\n" & cold.stderr
+    require cold.ok
+    check cold.locatedDeclarations(head) == tracked.locatedDeclarations(head)
+    check cold.locatedDeclarations(shared) == tracked.locatedDeclarations(shared)
+    check cold.snapshot.graph.headsFor(shared) == @[head]
+    check cold.cachePath != tracked.cachePath
+    var cFiles = 0
+    for path in walkDirRec(cold.heads[0].cachePath):
+      if path.endsWith(".c"):
+        inc cFiles
+      check path.splitFile.ext notin [".o", ".obj", ".exe", ".dylib"]
+    check cFiles > 0
+
+    let restored = runCompilerRefresh(request)
+    require restored.ok
+    check restored.restoredHeads == 1
+    check restored.compiledHeads == 0
+
+    request.previousHeads = restored.heads
+    writeFile(shared, sharedContents & "\nconst icAdded* = 1\n")
+    let changed = runCompilerRefresh(request)
+    checkpoint changed.error & "\n" & changed.stderr
+    require changed.ok
+    check changed.compiledHeads == 1
+    check "icAdded" in changed.declarationNames(shared)
+    check changed.snapshot.graph.headsFor(shared) == @[head]
+
+    writeFile(shared, "proc broken( = discard\n")
+    request.previousHeads = changed.heads
+    let failed = runCompilerRefresh(request)
+    check not failed.ok
+    check failed.diagnostics.len > 0
+    writeFile(shared, sharedContents & "\nproc recovered*(): int = 1\n")
+    let recovered = runCompilerRefresh(request)
+    checkpoint recovered.error & "\n" & recovered.stderr
+    require recovered.ok
+    check "recovered" in recovered.declarationNames(shared)
 
   test "matches ordinary declarations and locations without backend outputs":
     let root = normalizeDocumentPath(createTempDir("nimdex-track-parity-", ""))

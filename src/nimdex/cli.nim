@@ -104,7 +104,7 @@ proc writeUsage(output: File) =
   output.writeLine("Options:")
   output.writeLine("  --project PATH       Project directory")
   output.writeLine("  --compiler PATH      Nim compiler or executable name")
-  output.writeLine("  --frontend MODE      compile (default) or track (incremental)")
+  output.writeLine("  --frontend MODE      compile (default), track, or ic")
   output.writeLine("  --cache-root PATH    Nimdex compiler cache directory")
   output.writeLine("  --entry-point PATH   Nim entry point; may be repeated")
   output.writeLine("  --import-path PATH   Nim import path; may be repeated")
@@ -248,8 +248,8 @@ proc parseCli(args: openArray[string]): CliParseResult =
       if parsed.error.len > 0:
         result.error = parsed.error
         return
-      if parsed.value notin ["compile", "track"]:
-        result.error = "--frontend must be compile or track"
+      if parsed.value notin ["compile", "track", "ic"]:
+        result.error = "--frontend must be compile, track, or ic"
         return
       result.options.compilerFrontend = parsed.value
     of "--entry-point":
@@ -1037,7 +1037,12 @@ proc runNimdexCli*(
         output,
         compilerPath = parsed.options.compilerPath,
         compilerFrontend =
-          if parsed.options.compilerFrontend == "track": cfTrack else: cfCompile,
+          if parsed.options.compilerFrontend == "track":
+            cfTrack
+          elif parsed.options.compilerFrontend == "ic":
+            cfIc
+          else:
+            cfCompile,
       )
   of cliStop:
     runStopCommand(parsed.options, output, errorOutput)
