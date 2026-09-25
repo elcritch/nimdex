@@ -1,6 +1,6 @@
 ## Worker-pool language components used by the Nimdex LSP server.
 
-import std/[atomics, os, sets, sha1, strutils, tables, times]
+import std/[atomics, os, sets, sha1, strutils, tables]
 
 import ./workerlife
 
@@ -151,13 +151,6 @@ proc sourceDocumentFor(
   if location.path.len > 0:
     if not fileExists(location.path):
       return false
-    if location.artifactModifiedUnix > 0:
-      try:
-        if int64(getLastModificationTime(location.path).toUnixFloat() * 1_000_000_000.0) >
-            location.artifactModifiedUnix:
-          return false
-      except CatchableError:
-        return false
 
   if location.path.len == 0:
     return false

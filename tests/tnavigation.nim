@@ -1,4 +1,4 @@
-import std/[os, strutils, tempfiles, unittest]
+import std/[os, strutils, tempfiles, times, unittest]
 import nimdex/[compiler, documents, language, semantic, workspace]
 
 const Compiler = currentSourcePath.parentDir.parentDir / "deps/nim-devel/bin/nim"
@@ -45,6 +45,9 @@ discard included()
       CompilerRefreshRequest(workspace: workspace, capabilities: capabilities)
     )
     require cold.ok
+    setLastModificationTime(
+      support, getLastModificationTime(support) + initDuration(seconds = 2)
+    )
     let runtime = newLanguageRuntime()
     defer:
       runtime.close()

@@ -33,9 +33,10 @@ Chronicles output and forwarded compiler diagnostics in bounded temporary
 paths instead of printing every diagnostic. Each capture keeps at most 8 MiB
 in its current file and 8 MiB in a `.1` rotation. Editor LSP diagnostics are
 still published normally.
-The CLI relays concise compiler progress: a running heartbeat every five
-seconds, each completed head with its completed/total count, and the compile
-log path. Detailed compiler warnings stay in the per-head log.
+The CLI relays concise compiler progress: a start message for each head with
+its project directory and cache run ID, a running heartbeat every five seconds,
+each completed head with its completed/total count, and the compile log path.
+Detailed compiler warnings stay in the per-head log.
 
 When launched from a directory containing a `.nimble` file, Nimdex parses its
 project layout at startup, before the editor sends `initialize`. It rechecks
@@ -80,6 +81,7 @@ Start a listening daemon in one terminal, from this repository root:
 
 The daemon logs `Nimdex CLI listener ready` with
 `address: 127.0.0.1:49152` on stderr when it is ready to accept CLI requests.
+Ctrl-C, SIGTERM, SIGHUP, and SIGQUIT close the listener and child LSP session.
 In another terminal, query the same project without
 starting a new analysis process:
 
@@ -242,9 +244,11 @@ symbol queries and CLI project checks wait for the whole refresh.
 Unchanged heads reuse their analyses and diagnostics. Owned semantic records
 and per-head manifests also persist under the cache root, sharing identical
 module records. Restarts validate compiler identity, compiler arguments,
-environment, resolved source/include and configuration inputs, and the local
-source inventory before restoring records. Valid restores run no compiler and
-load no BIF files. Missing, incompatible, or damaged cache entries rebuild.
+compiler environment, resolved source/include and configuration inputs,
+and the local source inventory before restoring records. New manifests compare
+file content, so an mtime-only change does not force compilation. Older manifests
+are upgraded when their saved inputs still match. Valid restores run no compiler
+and load no BIF files. Missing, incompatible, or damaged cache entries rebuild.
 Cold compilation still runs once per head; sharing compiler frontend work
 across heads remains future work.
 
@@ -253,7 +257,8 @@ diagnostics while healthy heads remain available; queries requiring a failed
 context report analysis unavailable. Superseded or cancelled work cannot
 publish over a newer source generation. Arbitrary compile-time file reads
 are not inferred from BIFs; watched-file events for unknown inputs rebuild all
-heads. Changing environment variables between sessions invalidates reuse.
+heads. Changes to tracked compiler environment variables invalidate reuse;
+other variables read by compile-time code are not tracked automatically.
 
 `nimdex/debug` exposes pending/completed/failed heads, selected contexts, and
 `restoredHeads` alongside compilation and BIF reuse counts. Its optional

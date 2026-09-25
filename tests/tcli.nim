@@ -2,8 +2,12 @@ import std/[assertions, json, net, os, osproc, streams, strutils]
 
 import nimdex/cli
 import nimdex/clicapture
+import nimdex/cliipc
 import nimdex/documents
 import sigils/rpcs/json/jrFraming
+
+when defined(posix):
+  import std/posix
 
 const FixtureRoot = currentSourcePath.parentDir / "fixtures/binny_phase0"
 
@@ -211,6 +215,7 @@ block cli_symbols:
   )
   doAssert run.status == 0, run.output
   doAssert run.output.contains("exportedRoutine")
+  doAssert run.output.contains("Nim compiler starting"), run.output
   doAssert run.output.contains("Nim compiler progress"), run.output
   doAssert run.output.contains("-compile.log"), run.output
   var listedHidden = false
@@ -340,6 +345,9 @@ when defined(posix):
       ["check", root, "--compiler", wrapper, "--cache-root", root / "cache"]
     )
     doAssert run.status == 0, run.output
+    let starting = run.output.find("Nim compiler starting")
+    let heartbeat = run.output.find("Nim compiler still running")
+    doAssert starting >= 0 and starting < heartbeat, run.output
     doAssert run.output.contains("Nim compiler still running"), run.output
     doAssert run.output.contains("elapsedSeconds"), run.output
 
@@ -418,3 +426,86 @@ block persistent_cli_service:
   let restopped = runExternalCli(["stop", "--connect", restartedPort])
   doAssert restopped.status == 0, restopped.output
   doAssert restarted.waitForExit(10000) == 0
+
+when defined(posix):
+  block cli_service_signals:
+    let repositoryRoot = currentSourcePath.parentDir.parentDir
+    let compiler = repositoryRoot / "deps/nim-devel/bin/nim"
+    for signalNumber in [SIGINT, SIGTERM, SIGHUP, SIGQUIT]:
+      block signal_case:
+        let process = startProcess(
+          testDaemon(),
+          args = ["daemon", FixtureRoot, "--listen", "0", "--compiler", compiler],
+          options = {poUsePath},
+        )
+        let port = process.errorStream().readListenerPort()
+        var errorThread: Thread[Stream]
+        createThread(errorThread, drainProtocolErrors, process.errorStream())
+        defer:
+          if process.running():
+            process.kill()
+            discard process.waitForExit()
+          joinThread(errorThread)
+          process.close()
+        if signalNumber == SIGTERM:
+          let partialClient = newSocket()
+          partialClient.connect("127.0.0.1", Port(parseInt(port)))
+          partialClient.send("\x00\x00")
+          defer:
+            partialClient.close()
+          sleep(100)
+        doAssert posix.kill(Pid(process.processID()), signalNumber) == 0
+        doAssert process.waitForExit(10000) == 0
+        let rebound = newSocket()
+        defer:
+          rebound.close()
+        rebound.bindAddr(Port(parseInt(port)), "127.0.0.1")
+
+  block cli_service_signal_during_request:
+    let repositoryRoot = currentSourcePath.parentDir.parentDir
+    let compiler = repositoryRoot / "deps/nim-devel/bin/nim"
+    let root = normalizeDocumentPath(
+      getTempDir() / ("nimdex-cli-signal-request-" & $getCurrentProcessId())
+    )
+    createDir(root)
+    defer:
+      removeDir(root)
+    writeFile(root / "main.nim", "const answer* = 42\n")
+    let wrapper = root / "slow-nim"
+    writeFile(
+      wrapper,
+      "#!/bin/sh\ncase \"$1\" in --version|--fullhelp) ;; *) sleep 6 ;; esac\n" & "exec " &
+        quoteShell(compiler) & " \"$@\"\n",
+    )
+    setFilePermissions(wrapper, {fpUserRead, fpUserWrite, fpUserExec})
+    let process = startProcess(
+      testDaemon(),
+      args = ["daemon", root, "--listen", "0", "--compiler", wrapper],
+      options = {poUsePath},
+    )
+    let port = process.errorStream().readListenerPort()
+    var errorThread: Thread[Stream]
+    createThread(errorThread, drainProtocolErrors, process.errorStream())
+    defer:
+      if process.running():
+        process.kill()
+        discard process.waitForExit()
+      joinThread(errorThread)
+      process.close()
+    let client = newSocket()
+    defer:
+      client.close()
+    client.connect("127.0.0.1", Port(parseInt(port)))
+    client.sendCliMessage($(%*{"command": "cliCheck", "root": root}))
+    sleep(100)
+    doAssert posix.kill(Pid(process.processID()), SIGTERM) == 0
+    doAssert process.waitForExit(5000) == 0
+    let probe = newSocket()
+    defer:
+      probe.close()
+    var refused = false
+    try:
+      probe.connect("127.0.0.1", Port(parseInt(port)))
+    except OSError:
+      refused = true
+    doAssert refused

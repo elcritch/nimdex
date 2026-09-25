@@ -1,6 +1,13 @@
 ## A small LSP/JSON-RPC client and daemon entry point for Nimdex.
 
-import std/[json, net, os, options, osproc, streams, strutils, syncio, typedthreads]
+import
+  std/[
+    atomics, json, nativesockets, net, os, options, osproc, streams, strutils, syncio,
+    typedthreads,
+  ]
+
+when defined(posix):
+  import std/posix
 
 import chronicles
 import sigils/rpcs/json/jrFraming
@@ -14,6 +21,17 @@ import ./projectlayout
 import ./workspace
 
 const NimdexVersion = "0.1.0"
+
+var cliServiceStopRequested: Atomic[bool]
+
+when defined(posix):
+  proc requestCliServiceStop(signalNumber: cint) {.noconv.} =
+    discard signalNumber
+    cliServiceStopRequested.store(true)
+
+else:
+  proc requestCliServiceStop() {.noconv.} =
+    cliServiceStopRequested.store(true)
 
 type
   CliCommand = enum
@@ -46,6 +64,7 @@ type
 
   RpcSession = ref object
     process: Process
+    stopOnSignal: bool
     input: Stream
     output: Stream
     errorOutput: Stream
@@ -58,6 +77,7 @@ type
 
   CompilerLogKind = enum
     clkNone
+    clkStarting
     clkRunning
     clkHead
     clkCapture
@@ -70,6 +90,8 @@ type
     failure: string
     progressKind: CompilerLogKind
     progressHead: string
+    progressWorkingDir: string
+    progressCacheRunId: string
     progressStatus: string
     progressLog: string
     progressElapsed: int
@@ -392,15 +414,41 @@ proc readFrame(session: RpcSession): RpcReadResult =
         result.error = "invalid JSON-RPC response: " & error.msg
         return
 
-    ## The stream's bulk read path may wait for its requested buffer size on
-    ## some process-pipe implementations. Read one byte through the stdio
-    ## character path, just like the LSP framing reader, so short responses
-    ## are visible immediately.
-    let character = session.output.readChar()
-    if character == '\0':
-      result.error = "Nimdex daemon closed its output before responding"
-      return
-    session.parser.add($character)
+    when defined(posix):
+      if session.stopOnSignal and cliServiceStopRequested.load():
+        result.error = "Nimdex CLI service is stopping"
+        return
+      let outputFd = cint(session.process.outputHandle())
+      var readable = @[cast[SocketHandle](outputFd)]
+      let ready = selectRead(readable, 100)
+      if session.stopOnSignal and cliServiceStopRequested.load():
+        result.error = "Nimdex CLI service is stopping"
+        return
+      if ready < 0:
+        if int(osLastError()) == int(EINTR):
+          continue
+        raiseOSError(osLastError())
+      if ready == 0:
+        continue
+      var data = newString(4096)
+      let count = posix.read(outputFd, addr data[0], data.len)
+      if count < 0:
+        if int(osLastError()) == int(EINTR):
+          continue
+        raiseOSError(osLastError())
+      if count == 0:
+        result.error = "Nimdex daemon closed its output before responding"
+        return
+      data.setLen(count)
+      session.parser.add(move(data))
+    else:
+      ## Some process-pipe implementations block until a bulk read fills its
+      ## buffer. Read one character so short responses are visible immediately.
+      let character = session.output.readChar()
+      if character == '\0':
+        result.error = "Nimdex daemon closed its output before responding"
+        return
+      session.parser.add($character)
 
 proc isResponseFor(frame: JsonNode, id: int): bool =
   frame.kind == JObject and frame.hasKey("id") and frame["id"].kind == JInt and
@@ -475,6 +523,11 @@ proc relayCompilerProgress(raw: string, context: pointer) {.nimcall, gcsafe.} =
   let line = withoutAnsi(raw).strip()
   if line.len == 0:
     case state.progressKind
+    of clkStarting:
+      info "Nim compiler starting",
+        workingDir = state.progressWorkingDir,
+        entryPoint = state.progressHead,
+        cacheRunId = state.progressCacheRunId
     of clkRunning:
       info "Nim compiler still running",
         entryPoint = state.progressHead,
@@ -498,7 +551,9 @@ proc relayCompilerProgress(raw: string, context: pointer) {.nimcall, gcsafe.} =
     state.progressKind = clkNone
     return
   if line.startsWith("INF "):
-    if line.contains("Nim compiler still running"):
+    if line.contains("Nim compiler starting"):
+      state.progressKind = clkStarting
+    elif line.contains("Nim compiler still running"):
       state.progressKind = clkRunning
     elif line.contains("Nim compiler progress"):
       state.progressKind = clkHead
@@ -507,6 +562,8 @@ proc relayCompilerProgress(raw: string, context: pointer) {.nimcall, gcsafe.} =
     else:
       state.progressKind = clkNone
     state.progressHead = ""
+    state.progressWorkingDir = ""
+    state.progressCacheRunId = ""
     state.progressStatus = ""
     state.progressLog = ""
     state.progressElapsed = 0
@@ -523,8 +580,12 @@ proc relayCompilerProgress(raw: string, context: pointer) {.nimcall, gcsafe.} =
   let name = line[0 ..< colon]
   let value = line[colon + 2 .. ^1]
   case name
+  of "workingDir":
+    state.progressWorkingDir = value
   of "entryPoint":
     state.progressHead = value
+  of "cacheRunId":
+    state.progressCacheRunId = value
   of "status":
     state.progressStatus = value
   of "compileLog":
@@ -565,10 +626,11 @@ proc drainRpcErrors(state: ptr RpcErrorDrain) {.thread.} =
     state.rotations = capture.rotations
     capture.close()
 
-proc newRpcSession(root, daemonPath: string): RpcSession =
+proc newRpcSession(root, daemonPath: string, stopOnSignal = false): RpcSession =
   debug "Starting Nimdex daemon for CLI request",
     projectRoot = root, daemonPath = daemonPath, workingDirectory = root
   result = RpcSession(
+    stopOnSignal: stopOnSignal,
     process: startProcess(
       if daemonPath.len > 0:
         daemonPath
@@ -886,17 +948,33 @@ proc runCliService(options: CliOptions, errorOutput: File, daemonPath: string): 
     return 2
   let listener = newSocket()
   var session: RpcSession
+  cliServiceStopRequested.store(false)
+  when defined(posix):
+    let previousInterrupt = posix.signal(SIGINT, requestCliServiceStop)
+    let previousTerminate = posix.signal(SIGTERM, requestCliServiceStop)
+    let previousHangup = posix.signal(SIGHUP, requestCliServiceStop)
+    let previousQuit = posix.signal(SIGQUIT, requestCliServiceStop)
+  else:
+    setControlCHook(requestCliServiceStop)
   try:
     listener.bindAddr(Port(options.listenPort), "127.0.0.1")
     listener.listen()
-    session = newRpcSession(project.path, daemonPath)
+    session = newRpcSession(project.path, daemonPath, stopOnSignal = true)
     let initError = session.initializeSession(options, project.path, errorOutput)
     if initError.len > 0:
       errorOutput.writeLine("nimdex: " & initError)
       return 1
     info "Nimdex CLI listener ready",
       address = "127.0.0.1:" & $listener.getLocalAddr()[1], workingDir = project.path
-    while true:
+    while not cliServiceStopRequested.load():
+      var readable = @[listener.getFd()]
+      let ready = selectRead(readable, 100)
+      if cliServiceStopRequested.load():
+        break
+      if ready < 0:
+        raiseOSError(osLastError())
+      if ready == 0:
+        continue
       var client: Socket
       listener.accept(client)
       var stopping = false
@@ -908,7 +986,7 @@ proc runCliService(options: CliOptions, errorOutput: File, daemonPath: string): 
         else:
           if not session.process.running():
             session.stopRpcSession(errorOutput)
-            session = newRpcSession(project.path, daemonPath)
+            session = newRpcSession(project.path, daemonPath, stopOnSignal = true)
             let initError =
               session.initializeSession(options, project.path, errorOutput)
             if initError.len > 0:
@@ -924,6 +1002,8 @@ proc runCliService(options: CliOptions, errorOutput: File, daemonPath: string): 
         client.close()
       if stopping:
         break
+    if cliServiceStopRequested.load():
+      info "Nimdex CLI listener stopping after signal"
   except CatchableError as error:
     errorOutput.writeLine("nimdex: " & error.msg)
     return 1
@@ -931,6 +1011,13 @@ proc runCliService(options: CliOptions, errorOutput: File, daemonPath: string): 
     listener.close()
     session.shutdownSession(errorOutput)
     session.stopRpcSession(errorOutput)
+    when defined(posix):
+      discard posix.signal(SIGINT, previousInterrupt)
+      discard posix.signal(SIGTERM, previousTerminate)
+      discard posix.signal(SIGHUP, previousHangup)
+      discard posix.signal(SIGQUIT, previousQuit)
+    else:
+      unsetControlCHook()
   0
 
 proc runProjectCommand(

@@ -229,8 +229,8 @@ when artifact roots are configured.
 The language actor returns owned, encoding-adjusted ranges across the Sigils
 boundary. `documentSymbol`, `workspace/symbol`, and declaration hover are
 implemented as `SymbolInformation`-style results. Disk and open-buffer content
-must match the indexed source fingerprint, and a source newer than its BIF is
-treated as stale; stale or unverifiable locations are omitted. Definition and
+must match the indexed source fingerprint; a newer mtime alone does not make
+unchanged source stale. Stale or unverifiable locations are omitted. Definition and
 all reference/edit/completion features remain deferred.
 
 Advertise capabilities only after their source mapping is tested. Start with the least ambitious global queries:
@@ -363,7 +363,7 @@ matching suffix nor a matching filename proves configuration compatibility.
 This phase reuses owned analyses; sharing frontend compilation across heads
 through `nim ic` requires separate compatibility work. Arbitrary compile-time
 file reads remain follow-up work; unsaved-buffer overlays are implemented in Phase 5. Phase 4c also
-invalidates persisted analyses when the compiler environment changes.
+invalidates persisted analyses when tracked compiler environment changes.
 Unknown client-reported disk changes conservatively invalidate all heads.
 
 Verification: real compiler fixtures cover distinct src/test configurations,
@@ -418,8 +418,10 @@ Items 1 and 2 are implemented in the current tree:
   without invoking Nim or parsing BIFs. Damaged, missing, or incompatible
   records are cache misses. Live sessions retain their existing memory reuse.
 - Validation includes compiler executable metadata, configuration/arguments,
-  resolved sources/includes, source inventory, and an environment digest (no
-  environment values are persisted). Track missing user/system and per-head
+  resolved source/include content, source inventory, and a digest of tracked
+  compiler environment variables (no values are persisted). Mtime-only changes
+  do not invalidate new manifests; legacy manifests are upgraded after validating
+  their saved inputs. Track missing user/system and per-head
   `.nimcfg`/`.nim.cfg` files too, so creating a config invalidates reuse.
 - `initializationOptions.preferredHeads` maps source paths to actual heads.
   A selected failed context is unavailable; it does not fall back to a different

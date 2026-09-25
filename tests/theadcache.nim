@@ -1,4 +1,4 @@
-import std/[json, os, tables, unittest]
+import std/[json, os, tables, times, unittest]
 
 import nimdex/[compilerinputs, documents, headcache, semantic, workspace]
 
@@ -66,6 +66,43 @@ suite "owned semantic cache":
     check restored.snapshot[].findModule(source).sourceTextHash == module.sourceTextHash
     # The persisted semantic records are sufficient even without original BIFs.
     check not fileExists(module.artifactPath)
+    setLastModificationTime(
+      source, getLastModificationTime(source) + initDuration(seconds = 2)
+    )
+    fingerprints.clear()
+    check reader.restoreHead(
+      workspace, source, analysis.cachePath, analysis.reuseKey, fingerprints, restored
+    )
+
+    var legacyManifest = parseJson(validManifest)
+    legacyManifest.delete("keyVersion")
+    legacyManifest.delete("inputVersion")
+    legacyManifest["reuseKey"] = %0
+    var legacyFingerprints: InputFingerprints
+    legacyManifest["inputFingerprint"] =
+      %fingerprintInputsLegacy(@[source], legacyFingerprints)
+    writeFile(manifestPath, $legacyManifest)
+    writeFile(source, "proc changed*() = discard\n")
+    fingerprints.clear()
+    check not reader.restoreHead(
+      workspace, source, analysis.cachePath, analysis.reuseKey, fingerprints, restored
+    )
+    writeFile(source, "proc saved*() = discard\n")
+    # The legacy format also included the source mtime in its input digest.
+    legacyFingerprints.clear()
+    legacyManifest["inputFingerprint"] =
+      %fingerprintInputsLegacy(@[source], legacyFingerprints)
+    writeFile(manifestPath, $legacyManifest)
+    reader = initHeadCache(root / "cache")
+    fingerprints.clear()
+    check reader.restoreHead(
+      workspace, source, analysis.cachePath, analysis.reuseKey, fingerprints, restored
+    )
+    check parseJson(readFile(manifestPath))["keyVersion"].getInt() == 2
+    check parseJson(readFile(manifestPath))["inputVersion"].getInt() == 2
+    check not reader.restoreHead(
+      workspace, source, analysis.cachePath, 0'u64, fingerprints, restored
+    )
 
     fingerprints.clear()
     writeFile(source, "proc changed*() = discard\n")

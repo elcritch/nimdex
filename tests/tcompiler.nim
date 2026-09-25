@@ -1,4 +1,4 @@
-import std/[assertions, json, options, os, strutils, tables, unittest]
+import std/[assertions, json, options, os, strutils, tables, times, unittest]
 
 import nimdex/compiler
 import nimdex/documents
@@ -184,6 +184,19 @@ suite "Nimdex compiler refresh":
       if module.sourcePath == root / "lib/sample.nim":
         inc mainVariants
     check mainVariants >= 2
+    let unrelatedEnv = "NIMDEX_CACHE_UNRELATED_TEST"
+    let previousEnv = getEnv(unrelatedEnv)
+    let hadPreviousEnv = existsEnv(unrelatedEnv)
+    defer:
+      if hadPreviousEnv:
+        putEnv(unrelatedEnv, previousEnv)
+      else:
+        delEnv(unrelatedEnv)
+    putEnv(unrelatedEnv, "different daemon session")
+    let onlyA = root / "lib/onlya.nim"
+    setLastModificationTime(
+      onlyA, getLastModificationTime(onlyA) + initDuration(seconds = 2)
+    )
     let restarted = runCompilerRefresh(request)
     check restarted.ok
     check restarted.compiledHeads == 0

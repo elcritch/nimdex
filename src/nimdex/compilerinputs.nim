@@ -77,10 +77,7 @@ proc fingerprintInputs*(
     input.add(path & "\0")
     if path notin cache:
       if fileExists(path):
-        let modified = getLastModificationTime(path)
-        cache[path] =
-          $stableTextHash(readFile(path)) & ":" & $modified.toUnix & ":" &
-          $modified.nanosecond
+        cache[path] = $stableTextHash(readFile(path))
       else:
         cache[path] = "missing"
     input.add(cache[path])
@@ -90,6 +87,25 @@ proc fingerprintInputs*(
 proc fingerprintInputs*(paths: openArray[string]): uint64 =
   var cache: InputFingerprints
   fingerprintInputs(paths, cache)
+
+proc fingerprintInputsLegacy*(
+    paths: openArray[string], cache: var InputFingerprints
+): uint64 =
+  ## Validate manifests written before input fingerprints became content-only.
+  var input = ""
+  for path in paths:
+    input.add(path & "\0")
+    if path notin cache:
+      if fileExists(path):
+        let modified = getLastModificationTime(path)
+        cache[path] =
+          $stableTextHash(readFile(path)) & ":" & $modified.toUnix & ":" &
+          $modified.nanosecond
+      else:
+        cache[path] = "missing"
+    input.add(cache[path])
+    input.add('\0')
+  stableTextHash(input)
 
 proc sourceInventory*(workspace: Workspace): uint64 =
   ## Only names, not contents. New/deleted local modules can change import
@@ -116,10 +132,12 @@ proc sourceInventory*(workspace: Workspace): uint64 =
   stableTextHash(paths.join("\0"))
 
 proc compilerEnvironmentFingerprint*(): uint64 =
-  ## Config scripts and compile-time code can read environment variables.
-  ## Keep only the digest, never environment values, in persisted metadata.
-  var values: seq[string]
-  for key, value in envPairs():
-    values.add(key & "=" & value)
-  values.sort()
-  stableTextHash(values.join("\0"))
+  ## Track environment that selects the compiler's configuration and tools.
+  ## Session-specific editor and shell variables must not invalidate every head.
+  var values = ""
+  for key in [
+    "HOME", "XDG_CONFIG_HOME", "NIM_CONFIG_DIR", "NIMBLE_DIR", "NIMBLE_HOME", "NIMPATH",
+    "NIMFLAGS",
+  ]:
+    values.add(key & "=" & getEnv(key) & "\0")
+  stableTextHash(values)

@@ -620,7 +620,7 @@ proc buildHead(
   let arguments = request.compilerArguments(compilerCache, entryPoint)
   result.command = commandLine(request.capabilities.compilerPath, arguments)
   let compileStarted = getTime()
-  info "Compiling Nim head",
+  info "Nim compiler starting",
     workingDir = request.workspace.rootPath,
     entryPoint = entryPoint,
     cacheRunId = cachePath.extractFilename()

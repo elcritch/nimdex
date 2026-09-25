@@ -39,6 +39,8 @@ type
 
   HeadManifest = object
     version: int
+    keyVersion: int
+    inputVersion: int
     headPath: string
     reuseKey: uint64
     inputPaths: seq[string]
@@ -50,10 +52,13 @@ type
     root: string
     modules: Table[string, ModuleSnapshot]
     written: Table[string, string]
+    legacyInputs: InputFingerprints
     loadedModules*: int
 
 const
   HeadCacheVersion* = 2
+  HeadKeyVersion = 2
+  HeadInputVersion = 2
   MaxRecordBytes = 64'i64 * 1024 * 1024
   MaxManifestBytes = 8'i64 * 1024 * 1024
   MaxHeadBytes = 256'i64 * 1024 * 1024
@@ -107,6 +112,8 @@ proc storeHead*(cache: var HeadCache, analysis: HeadAnalysis) =
   ## Publish the manifest last. An interrupted write cannot publish half a head.
   var manifest = HeadManifest(
     version: HeadCacheVersion,
+    keyVersion: HeadKeyVersion,
+    inputVersion: HeadInputVersion,
     headPath: analysis.headPath,
     reuseKey: analysis.reuseKey,
     inputPaths: analysis.inputPaths,
@@ -137,19 +144,40 @@ proc restoreHead*(
 ): bool =
   ## Invalid, old, missing or corrupt caches are ordinary cache misses.
   try:
-    let manifest = parseJson(readBounded(headManifestPath(cachePath), MaxManifestBytes))
-      .jsonTo(HeadManifest)
+    let manifestNode =
+      parseJson(readBounded(headManifestPath(cachePath), MaxManifestBytes))
+    let legacyKey = not manifestNode.hasKey("keyVersion")
+    let legacyInput = not manifestNode.hasKey("inputVersion")
+    # Older keys hashed the entire process environment. The cache directory
+    # still fixes compiler and workspace configuration; validate saved inputs
+    # before replacing that key with the stable one.
+    if legacyKey:
+      manifestNode["keyVersion"] = %1
+    if legacyInput:
+      manifestNode["inputVersion"] = %1
+    var manifest = manifestNode.jsonTo(HeadManifest)
     if manifest.version != HeadCacheVersion or manifest.headPath != head or
-        manifest.reuseKey != reuseKey or head notin manifest.inputPaths or
-        manifest.modules.len == 0 or manifest.modules.len > 10000 or
-        fingerprintInputs(manifest.inputPaths, fingerprints) != manifest.inputFingerprint:
+        (not legacyKey and manifest.keyVersion != HeadKeyVersion) or
+        (not legacyInput and manifest.inputVersion != HeadInputVersion) or
+        (not legacyKey and manifest.reuseKey != reuseKey) or
+        head notin manifest.inputPaths or manifest.modules.len == 0 or
+        manifest.modules.len > 10000:
       return false
+    let inputsMatch =
+      if legacyInput:
+        fingerprintInputsLegacy(manifest.inputPaths, cache.legacyInputs) ==
+          manifest.inputFingerprint
+      else:
+        fingerprintInputs(manifest.inputPaths, fingerprints) == manifest.inputFingerprint
+    if not inputsMatch:
+      return false
+    let currentInputFingerprint = fingerprintInputs(manifest.inputPaths, fingerprints)
     var restored = HeadAnalysis(
       headPath: head,
       cachePath: cachePath,
       reuseKey: reuseKey,
       inputPaths: manifest.inputPaths,
-      inputFingerprint: manifest.inputFingerprint,
+      inputFingerprint: currentInputFingerprint,
       diagnostics: manifest.diagnostics,
     )
     new(restored.snapshot)
@@ -183,6 +211,15 @@ proc restoreHead*(
     restored.snapshot[].recordHead(head)
     restored.snapshot[].compactHead()
     analysis = move(restored)
+    if legacyKey or legacyInput:
+      manifest.keyVersion = HeadKeyVersion
+      manifest.inputVersion = HeadInputVersion
+      manifest.reuseKey = reuseKey
+      manifest.inputFingerprint = currentInputFingerprint
+      try:
+        writeAtomic(headManifestPath(cachePath), $toJson(manifest))
+      except CatchableError:
+        discard
     true
   except CatchableError:
     false
