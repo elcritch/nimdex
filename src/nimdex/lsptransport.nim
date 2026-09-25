@@ -8,6 +8,35 @@ import sigils/rpcs/json/jrFraming
 
 export jrAgents, jrFraming
 
+const DefaultNimdexMessageSize* = 16 * 1024 * 1024
+  ## Project graph reports and symbol responses can exceed Sigils' 1 MiB default.
+
+proc boundedLspResponse*(
+    response: sink JsonRpcResponse, maxMessageSize = DefaultNimdexMessageSize
+): JsonRpcResponse =
+  ## Settle oversized responses before the framed writer can throw. In
+  ## particular, a writer exception must not unwind into joining an idle reader.
+  if response.data.len <= maxMessageSize:
+    return response
+  let message = "Nimdex response exceeds the configured transport size limit"
+  let payload = parseJson(response.data)
+  var replacement: JsonNode
+  if payload.kind == JObject and payload.hasKey("id"):
+    replacement =
+      %*{
+        "jsonrpc": "2.0",
+        "id": payload["id"],
+        "error": {"code": -32603, "message": message},
+      }
+  else:
+    replacement =
+      %*{
+        "jsonrpc": "2.0",
+        "method": "window/logMessage",
+        "params": {"type": 1, "message": message},
+      }
+  JsonRpcResponse(connectionId: response.connectionId, data: $replacement)
+
 type NimdexLspStdioReader* = ref object of JsonRpcIoAgent
   ## A reader-only transport actor. Output is owned by the home thread.
   input: File
@@ -72,7 +101,7 @@ method queueResponse*(
   discard response
 
 proc newNimdexLspStdioReader*(
-    input: File = stdin, maxMessageSize = DefaultJsonRpcMaxMessageSize
+    input: File = stdin, maxMessageSize = DefaultNimdexMessageSize
 ): NimdexLspStdioReader =
   if input.isNil:
     raise newException(ValueError, "JSON-RPC input file must not be nil")

@@ -4,7 +4,7 @@
 ## proves the artifact boundary without allowing Binny cursors, pools, or
 ## buffers to escape into the rest of Nimdex.
 
-import std/tables
+import std/[sets, tables]
 
 import binny/bif_safe
 import chronicles
@@ -36,6 +36,8 @@ type
     status*: BinnyArtifactStatus ## Load and metadata outcome.
     sourcePath*: string ## The `modulesrc` path, when present.
     sourceFiles*: seq[string] ## Source filenames referenced by line metadata.
+    imports*: seq[string] ## Resolved compiler module suffixes.
+    includes*: seq[string] ## Resolved include paths.
     tokenCount*: int ## Number of raw NIF tokens in the BIF.
     tagCount*: int ## Number of interned tag names.
     stringCount*: int ## Number of interned string literals.
@@ -73,14 +75,18 @@ proc collectEffectiveLocations(module: var BifModule): Table[int, BinnyLocation]
   ## BIF stores line information only when it changes. This flat walk is
   ## intentionally an evidence-oriented approximation: later semantic code
   ## must validate parent-relative locations against real compiler fixtures.
+  var positions = initHashSet[int]()
+  for name, visibility, declaration in module.declarations:
+    positions.incl(module.buf.cursorToPosition(declaration))
   var current = NoNifLineInfo
   var cursor = module.buf.beginRead()
   while cursor.hasMore:
     let info = cursor.rawLineInfo()
     if info.isValid:
       current = info
-    if current.isValid:
-      result[module.buf.cursorToPosition(cursor)] = locationFromInfo(module, current)
+    let position = module.buf.cursorToPosition(cursor)
+    if current.isValid and position in positions:
+      result[position] = locationFromInfo(module, current)
     cursor.inc()
   cursor.endRead()
 
@@ -94,13 +100,38 @@ proc extractSourcePath(module: var BifModule): string =
   cursor.endRead()
 
 proc collectTags(module: var BifModule): seq[string] =
+  var seen = initHashSet[string]()
   var cursor = module.buf.beginRead()
   while cursor.hasMore:
     if cursor.kind == TagLit:
       let name = cursor.tagName()
-      if name notin result:
+      if not seen.containsOrIncl(name):
         result.add(name)
     cursor.inc()
+  cursor.endRead()
+
+proc collectDependencies(module: var BifModule, report: var BinnyArtifactReport) =
+  ## Only direct module records describe dependency edges; strings in bodies
+  ## and filename pools are not imports. Includes may contain several paths.
+  var cursor = module.buf.beginRead()
+  if cursor.kind != TagLit:
+    cursor.endRead()
+    return
+  var child = cursor.childCursor()
+  while child.hasMore:
+    if child.kind == TagLit and child.tagName() in ["import", "include"]:
+      let isImport = child.tagName() == "import"
+      var value = child.childCursor()
+      while value.hasMore:
+        if value.kind == StrLit:
+          let path = value.strVal()
+          if isImport:
+            if path notin report.imports:
+              report.imports.add(path)
+          elif path notin report.includes:
+            report.includes.add(path)
+        value.skip()
+    child.skip()
   cursor.endRead()
 
 proc declarationLocation(
@@ -117,6 +148,7 @@ proc declarationLocation(
 proc inspectLoadedArtifact(module: var BifModule, path: string): BinnyArtifactReport =
   result.path = path
   result.sourcePath = module.extractSourcePath()
+  module.collectDependencies(result)
   result.tokenCount = module.buf.len()
   result.tagCount = module.buf.tags.tags.len
   result.stringCount = module.buf.pool.strings.len

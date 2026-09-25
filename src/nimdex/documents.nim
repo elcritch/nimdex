@@ -42,7 +42,8 @@ proc stableTextHash*(text: string): uint64 =
     result = (result xor uint64(ord(value))) * prime
 
 proc normalizeDocumentPath*(path: string): string =
-  ## Make a path absolute and collapse platform-native separators and dots.
+  ## Canonicalize existing ancestors too: compiler BIFs resolve symlinks, and
+  ## new/missing documents must retain the same identity before and after save.
   if path.len == 0:
     return
   result = path
@@ -50,6 +51,20 @@ proc normalizeDocumentPath*(path: string): string =
     result = result.replace('/', '\\')
   result = absolutePath(result)
   result = normalizedPath(result)
+  var ancestor = result
+  var suffix: seq[string]
+  while not fileExists(ancestor) and not dirExists(ancestor):
+    let parent = ancestor.parentDir
+    if parent == ancestor:
+      break
+    suffix.add(ancestor.lastPathPart)
+    ancestor = parent
+  try:
+    result = expandFilename(ancestor)
+    for index in countdown(suffix.high, 0):
+      result = result / suffix[index]
+  except OSError:
+    discard
 
 proc encodeUriPath(path: string): string =
   let segments = path.split('/')

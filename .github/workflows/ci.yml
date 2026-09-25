@@ -37,5 +37,20 @@ jobs:
       - name: Install dependencies
         run: atlas install
 
+      - name: Check out the BIF compiler
+        uses: actions/checkout@v4
+        with:
+          repository: nim-lang/Nim
+          ref: 8f1a8f6342642933c07be49b7250364cb8184ab6
+          path: deps/nim-devel
+
+      - name: Build the BIF compiler
+        working-directory: deps/nim-devel
+        run: |
+          nim c -d:release --skipUserCfg --skipParentCfg koch.nim
+          ./koch boot -d:release --skipUserCfg --skipParentCfg
+
       - name: Run tests
-        run: nim test
+        run: |
+          export PATH="$GITHUB_WORKSPACE/deps/nim-devel/bin:$PATH"
+          atlas-run tests --nim=deps/nim-devel/bin/nim

@@ -12,6 +12,7 @@ nimbledeps/
 # Nim build outputs.
 nimcache/
 .nimcache/
+.nimdex/
 *.out
 *.dSYM/
 tests/output/
@@ -21,4 +22,3 @@ tests/output/
 .tool-versions
 .env
 .env.*
-

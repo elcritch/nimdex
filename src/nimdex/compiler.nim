@@ -1,30 +1,21 @@
 ## Controlled Nim compiler refreshes and owned compiler diagnostics.
 
-import std/[algorithm, atomics, os, osproc, strutils]
+import std/[algorithm, atomics, os, osproc, strutils, times]
 
 import chronicles
 
 import ./bifindex
 import ./documents
+import ./compilerinputs
+import ./headcache
 import ./semantic
 import ./workspace
 
+export
+  headcache.HeadAnalysis, headcache.CompilerDiagnostic,
+  headcache.CompilerDiagnosticSeverity
+
 type
-  CompilerDiagnosticSeverity* = enum
-    cdsError
-    cdsWarning
-    cdsInformation
-    cdsHint
-
-  CompilerDiagnostic* = object ## A copied diagnostic emitted by the compiler.
-    sourcePath*: string
-    sourceUri*: string
-    line*: int32 ## One-based compiler line number.
-    column*: int32 ## Zero-based compiler byte column.
-    hasLocation*: bool
-    severity*: CompilerDiagnosticSeverity
-    message*: string
-
   CompilerCapabilities* = object ## Capability evidence for one compiler binary.
     compilerPath*: string
     version*: string
@@ -37,6 +28,7 @@ type
 
   CompilerCancellationState* = object
     cancelled: Atomic[bool]
+    priorityHead: Atomic[int] ## Index in the refresh's fixed list of heads.
 
   CompilerCancellation* = ptr CompilerCancellationState
 
@@ -44,7 +36,23 @@ type
     workspace*: Workspace
     capabilities*: CompilerCapabilities
     documentGeneration*: uint64
+    sourceGeneration*: uint64
     cancellation*: CompilerCancellation
+    previousHeads*: seq[HeadAnalysis]
+    forceRebuild*: bool
+    priorityHead*: string
+
+  CompilerHeadProgress* = object ## One independently validated head completion.
+    stamp*: AnalysisStamp
+    headPath*: string
+    analysis*: HeadAnalysis
+    ok*: bool
+    restored*: bool
+    reused*: bool
+    error*: string
+    diagnostics*: seq[CompilerDiagnostic]
+
+  CompilerProgressCallback* = proc(progress: CompilerHeadProgress) {.closure.}
 
   CompilerRefreshResult* = object ## Owned output of a compiler refresh.
     ok*: bool
@@ -60,15 +68,18 @@ type
     diagnostics*: seq[CompilerDiagnostic]
     snapshot*: SemanticSnapshot
     error*: string
+    heads*: seq[HeadAnalysis]
+    compiledHeads*: int
+    reusedHeads*: int
+    loadedArtifacts*: int
+    reusedArtifacts*: int
+    restoredHeads*: int
+    failedHeads*: seq[string]
 
   CompilerProcessOutput = object
     stdout: string
     stderr: string
     exitCode: int
-
-  CompilerSourceFingerprint = object
-    fingerprint: uint64
-    paths: seq[string]
 
 proc symbolCount(snapshot: SemanticSnapshot): int =
   for module in snapshot.modules:
@@ -77,6 +88,12 @@ proc symbolCount(snapshot: SemanticSnapshot): int =
 proc newCompilerCancellation*(): CompilerCancellation =
   result = cast[CompilerCancellation](allocShared0(sizeof(CompilerCancellationState)))
   result[].cancelled.store(false, moRelaxed)
+  result[].priorityHead.store(-1, moRelaxed)
+
+proc prioritizeCompilerHead*(cancellation: CompilerCancellation, index: int) =
+  ## Reorder pending work without cancelling the head already being checked.
+  if not cancellation.isNil:
+    cancellation[].priorityHead.store(index, moRelease)
 
 proc cancelCompiler*(cancellation: CompilerCancellation) =
   if not cancellation.isNil:
@@ -225,6 +242,11 @@ proc probeCompiler*(path = ""): CompilerCapabilities =
   var fingerprintInput =
     result.compilerPath & "\0" & result.version & "\0" & result.revision & "\0" &
     $result.supportsGenBif
+  if fileExists(result.compilerPath):
+    fingerprintInput.add(
+      "\0" & $getFileSize(result.compilerPath) & "\0" &
+        $getLastModificationTime(result.compilerPath)
+    )
   result.fingerprint = stableTextHash(fingerprintInput)
 
 proc requireCompiler*(capabilities: CompilerCapabilities): string =
@@ -350,77 +372,14 @@ proc collectCompilerDiagnostics(
       if diagnostic.message.len > 0:
         result.add(diagnostic)
 
-proc appendFingerprintPart(target: var string, label, value: string) =
-  target.add(label)
-  target.add(':')
-  target.add($value.len)
-  target.add(':')
-  target.add(value)
-  target.add('\0')
-
-proc sourcePathsForFingerprint(
-    workspace: Workspace, entryPoints: openArray[string]
-): seq[string] =
-  var candidates: seq[string]
-  candidates.add(entryPoints)
-  if workspace.rootPath.len > 0 and dirExists(workspace.rootPath):
-    for path in walkDirRec(workspace.rootPath):
-      if path.endsWith(".nim") or path.endsWith(".nims"):
-        candidates.add(path)
-  for root in workspace.importPaths:
-    if not dirExists(root):
-      continue
-    for path in walkDirRec(root):
-      if path.endsWith(".nim") or path.endsWith(".nims"):
-        candidates.add(path)
-
-  for path in candidates:
-    let normalized = normalizeDocumentPath(path)
-    if normalized.len == 0 or normalized in result:
-      continue
-    if workspace.cacheRoot.len > 0 and
-        normalized.startsWith(workspace.cacheRoot & DirSep):
-      continue
-    if fileExists(normalized):
-      result.add(normalized)
-  result.sort()
-
-proc sourceFingerprint(
-    workspace: Workspace, entryPoints: openArray[string]
-): CompilerSourceFingerprint =
-  result.paths = sourcePathsForFingerprint(workspace, entryPoints)
-  var input = ""
-  for path in result.paths:
-    appendFingerprintPart(input, "path", path)
-    try:
-      appendFingerprintPart(input, "text", $stableTextHash(readFile(path)))
-    except CatchableError:
-      appendFingerprintPart(input, "text", "unreadable")
-  result.fingerprint = stableTextHash(input)
-
 proc discoverCompilerEntryPoints*(workspace: Workspace): seq[string] =
-  ## Select a conservative default entry point when the client omitted one.
+  ## Explicit heads override convention-based package and test discovery.
   if workspace.entryPoints.len > 0:
     for path in workspace.entryPoints:
       if path.endsWith(".nim") and path notin result:
         result.add(path)
-    return
-
-  if workspace.rootPath.len == 0:
-    return
-  if workspace.rootPath.endsWith(".nim") and fileExists(workspace.rootPath):
-    result.add(workspace.rootPath)
-    return
-
-  let mainPath = workspace.rootPath / "main.nim"
-  if fileExists(mainPath):
-    result.add(normalizeDocumentPath(mainPath))
-    return
-
-  let projectName = workspace.rootPath.lastPathPart
-  let namedPath = workspace.rootPath / (projectName & ".nim")
-  if fileExists(namedPath):
-    result.add(normalizeDocumentPath(namedPath))
+  else:
+    result = discoverProjectLayout(workspace.rootPath).heads
 
 proc forbiddenCompilerArgument(argument: string): bool =
   let normalized = argument.toLowerAscii()
@@ -433,6 +392,8 @@ proc forbiddenCompilerArgument(argument: string): bool =
 proc compilerArguments(
     request: CompilerRefreshRequest, cachePath, entryPoint: string
 ): seq[string] =
+  # This compiler's `check --genBif:on` drops semantic statements in SemPass.
+  # Keep C generation until check emits complete declarations/includes.
   result.add("c")
   for argument in request.workspace.nimArguments:
     result.add(argument)
@@ -442,7 +403,6 @@ proc compilerArguments(
   ## always an artifact-only, BIF-producing build in its private cache.
   result.add("--genBif:on")
   result.add("--compileOnly:on")
-  result.add("--forceBuild:on")
   result.add("--colors:off")
   result.add("--filenames:abs")
   result.add("--nimcache:" & cachePath)
@@ -460,8 +420,101 @@ proc addBuildFailure(result: var CompilerRefreshResult, message, fallbackPath: s
     )
   )
 
-proc runCompilerRefresh*(request: CompilerRefreshRequest): CompilerRefreshResult =
-  ## Run and index one complete compiler generation.
+type HeadBuild = object
+  analysis: HeadAnalysis
+  diagnostics: seq[CompilerDiagnostic]
+  error, command, stdout, stderr: string
+  exitCode: int
+
+proc buildHead(
+    request: CompilerRefreshRequest,
+    entryPoint, cachePath: string,
+    reuseKey: uint64,
+    artifactCache: var BifReuseCache,
+): HeadBuild =
+  result.analysis =
+    HeadAnalysis(headPath: entryPoint, cachePath: cachePath, reuseKey: reuseKey)
+  ensureDirectory(cachePath)
+  forgetHead(cachePath)
+  # Removed imports must not leave orphan BIFs in the new analysis.
+  for path in discoverBifArtifacts(@[cachePath]):
+    removeFile(path)
+  let beforePaths = configurationInputs(request.workspace, entryPoint) & @[entryPoint]
+  let beforeFingerprint = fingerprintInputs(beforePaths)
+  let arguments = request.compilerArguments(cachePath, entryPoint)
+  result.command = commandLine(request.capabilities.compilerPath, arguments)
+  let compileStarted = getTime()
+  info "Compiling Nim head", entryPoint = entryPoint, cachePath = cachePath
+  let process = runExternalCommand(
+    request.capabilities.compilerPath, arguments, request.workspace.rootPath, cachePath
+  )
+  result.exitCode = process.exitCode
+  result.stdout = process.stdout
+  result.stderr = process.stderr
+  result.diagnostics = collectCompilerDiagnostics(
+    process.stdout, process.stderr, request.workspace.rootPath, entryPoint
+  )
+  if process.exitCode != 0:
+    result.error = "Nim compiler exited with status " & $process.exitCode
+    return
+  if request.cancellation.isCompilerCancelled():
+    return
+  result.analysis.artifactPaths = discoverBifArtifacts(@[cachePath])
+  if result.analysis.artifactPaths.len == 0:
+    result.error = "Nim compiler produced no semantic BIF artifacts"
+    return
+  var snapshot =
+    buildBifIndexCached(request.workspace, artifactCache, result.analysis.artifactPaths)
+  if snapshot.failureCount() > 0:
+    result.error = "one or more generated BIF artifacts could not be indexed"
+    return
+  snapshot.recordHead(entryPoint)
+  result.analysis.inputPaths = resolvedInputs(
+    request.workspace, entryPoint, snapshot, process.stdout & process.stderr
+  )
+  result.analysis.inputFingerprint = fingerprintInputs(result.analysis.inputPaths)
+  for path in result.analysis.inputPaths:
+    if fileExists(path) and getLastModificationTime(path) > compileStarted:
+      result.error = "compiler inputs changed during analysis; retry refresh"
+      return
+  if fingerprintInputs(beforePaths) != beforeFingerprint:
+    result.error = "compiler inputs changed during analysis; retry refresh"
+    return
+  new(result.analysis.snapshot)
+  result.analysis.snapshot[] = move(snapshot)
+  result.analysis.diagnostics = result.diagnostics
+
+proc headSourceFingerprint*(heads: openArray[HeadAnalysis]): uint64 =
+  var fingerprints: seq[string]
+  for head in heads:
+    fingerprints.add(head.headPath & "\0" & $head.inputFingerprint)
+  fingerprints.sort()
+  stableTextHash(fingerprints.join("\0"))
+
+proc combinedHeadSnapshot*(
+    workspace: Workspace,
+    heads: openArray[HeadAnalysis],
+    stamp: AnalysisStamp,
+    actualHeads: seq[string],
+): SemanticSnapshot =
+  ## Combine only independently validated heads; unsuccessful contexts stay absent.
+  result = initSemanticSnapshot(
+    workspace.projectId, workspace.configurationGeneration,
+    workspace.configurationFingerprint,
+  )
+  for head in heads:
+    result.mergeHead(head.snapshot[])
+  result.sourceFingerprint = headSourceFingerprint(heads)
+  result.compilerFingerprint = stamp.compilerFingerprint
+  result.analysisStamp = stamp
+  result.analysisStamp.sourceFingerprint = result.sourceFingerprint
+  # Discovery defines heads even when a context has not been analyzed yet.
+  result.graph.heads = actualHeads
+
+proc runCompilerRefresh*(
+    request: CompilerRefreshRequest, onHead: CompilerProgressCallback = nil
+): CompilerRefreshResult =
+  ## Report validated heads progressively and isolate failures to their contexts.
   result.compiler = request.capabilities
   if result.compiler.compilerPath.len == 0:
     result.compiler = probeCompiler(request.workspace.compilerPath)
@@ -469,6 +522,7 @@ proc runCompilerRefresh*(request: CompilerRefreshRequest): CompilerRefreshResult
     valid: true,
     projectId: request.workspace.projectId,
     documentGeneration: request.documentGeneration,
+    sourceGeneration: request.sourceGeneration,
     configurationGeneration: request.workspace.configurationGeneration,
     configurationFingerprint: request.workspace.configurationFingerprint,
     compilerFingerprint: result.compiler.fingerprint,
@@ -509,98 +563,159 @@ proc runCompilerRefresh*(request: CompilerRefreshRequest): CompilerRefreshResult
     result.error = "compiler refresh was cancelled"
     return
 
-  let sources = sourceFingerprint(request.workspace, entryPoints)
-  result.stamp.sourceFingerprint = sources.fingerprint
+  var effectiveRequest = request
+  effectiveRequest.capabilities = result.compiler
+  effectiveRequest.workspace.compilerPath = result.compiler.compilerPath
+  if request.workspace.automaticImportPaths:
+    effectiveRequest.workspace.importPaths =
+      discoverProjectLayout(request.workspace.rootPath).sourceDirs
   let cacheBase =
     if request.workspace.cacheRoot.len > 0:
       request.workspace.cacheRoot
     else:
       getTempDir() / "nimdex" / "nimcache"
   result.cachePath =
-    cacheBase / (
-      $result.compiler.fingerprint & "-" & $request.workspace.configurationFingerprint &
-      "-" & $sources.fingerprint
-    )
-  info "Using Nimdex compiler cache", cachePath = result.cachePath
+    cacheBase /
+    ($result.compiler.fingerprint & "-" & $request.workspace.configurationFingerprint)
   ensureDirectory(result.cachePath)
+  let inventory = sourceInventory(request.workspace)
+  let reuseKey = stableTextHash(
+    $result.compiler.fingerprint & "\0" & $request.workspace.configurationFingerprint &
+      "\0" & $inventory & "\0" & $compilerEnvironmentFingerprint() &
+      "\0c-compileOnly-bif-v" & $HeadCacheVersion
+  )
+  var artifactCache: BifReuseCache
+  var inputCache: InputFingerprints
+  var diskCache = initHeadCache(result.cachePath)
+  for previous in request.previousHeads:
+    if not previous.snapshot.isNil:
+      artifactCache.rememberModules(previous.snapshot[])
+  var pending: seq[int]
+  for index in 0 ..< entryPoints.len:
+    pending.add(index)
+  if request.priorityHead in entryPoints:
+    request.cancellation.prioritizeCompilerHead(entryPoints.find(request.priorityHead))
 
-  var buildFailed = false
-  for entryPoint in entryPoints:
+  while pending.len > 0:
     if request.cancellation.isCompilerCancelled():
       result.cancelled = true
       result.error = "compiler refresh was cancelled"
       return
-    let arguments = request.compilerArguments(result.cachePath, entryPoint)
-    result.commandLines.add(commandLine(result.compiler.compilerPath, arguments))
-    info "Compiling Nim entry point",
-      compilerPath = result.compiler.compilerPath,
-      entryPoint = entryPoint,
-      workspaceRoot = request.workspace.rootPath
-    let process = runExternalCommand(
-      result.compiler.compilerPath, arguments, request.workspace.rootPath,
-      result.cachePath,
-    )
-    result.exitCode = process.exitCode
-    result.stdout.add(process.stdout)
-    result.stderr.add(process.stderr)
-    if process.exitCode != 0:
-      buildFailed = true
-      warn "Nim compiler failed",
-        compilerPath = result.compiler.compilerPath,
-        entryPoint = entryPoint,
-        exitCode = process.exitCode,
-        stderr = process.stderr
-      break
+    var selected = 0
+    let priority =
+      if not request.cancellation.isNil:
+        request.cancellation[].priorityHead.load(moAcquire)
+      else:
+        entryPoints.find(request.priorityHead)
+    if priority in pending:
+      selected = pending.find(priority)
+    let entryPoint = entryPoints[pending[selected]]
+    pending.delete(selected)
+    let cachePath = result.cachePath / $stableTextHash(entryPoint)
+    var progress = CompilerHeadProgress(stamp: result.stamp, headPath: entryPoint)
+    try:
+      for previous in request.previousHeads:
+        if not request.forceRebuild and previous.headPath == entryPoint and
+            not previous.snapshot.isNil and previous.reuseKey == reuseKey and
+            fingerprintInputs(previous.inputPaths, inputCache) ==
+            previous.inputFingerprint:
+          progress.analysis = previous
+          progress.reused = true
+          break
+      if not progress.reused and not request.forceRebuild:
+        progress.restored = diskCache.restoreHead(
+          effectiveRequest.workspace, entryPoint, cachePath, reuseKey, inputCache,
+          progress.analysis,
+        )
+      if progress.reused or progress.restored:
+        inc result.reusedHeads
+        if progress.restored:
+          inc result.restoredHeads
+          artifactCache.rememberModules(progress.analysis.snapshot[])
+        progress.diagnostics = progress.analysis.diagnostics
+      else:
+        inc result.compiledHeads
+        let built =
+          buildHead(effectiveRequest, entryPoint, cachePath, reuseKey, artifactCache)
+        if built.command.len > 0:
+          result.commandLines.add(built.command)
+        result.stdout.add(built.stdout)
+        result.stderr.add(built.stderr)
+        if built.exitCode != 0:
+          result.exitCode = built.exitCode
+        progress.analysis = built.analysis
+        progress.error = built.error
+        progress.diagnostics = built.diagnostics
+      if request.cancellation.isCompilerCancelled():
+        result.cancelled = true
+        result.error = "compiler refresh was cancelled"
+        return
+      progress.ok = progress.error.len == 0 and not progress.analysis.snapshot.isNil
+      if progress.ok and
+          fingerprintInputs(progress.analysis.inputPaths) !=
+          progress.analysis.inputFingerprint:
+        progress.ok = false
+        progress.error = "compiler inputs changed during analysis; retry refresh"
+    except CatchableError as error:
+      progress.ok = false
+      progress.error = error.msg
+    if progress.ok:
+      result.heads.add(progress.analysis)
+      result.artifactPaths.add(progress.analysis.artifactPaths)
+    else:
+      if progress.error.len == 0:
+        progress.error = "head analysis is unavailable"
+      result.failedHeads.add(entryPoint)
+      result.error = progress.error
+      progress.diagnostics.add(
+        CompilerDiagnostic(
+          sourcePath: entryPoint,
+          sourceUri: documentUriFromPath(entryPoint),
+          severity: cdsError,
+          message: progress.error,
+        )
+      )
+    result.diagnostics.add(progress.diagnostics)
+    if not onHead.isNil:
+      onHead(progress)
+    if progress.ok and not progress.reused and not progress.restored:
+      try:
+        diskCache.storeHead(progress.analysis)
+      except CatchableError as error:
+        warn "Unable to save semantic cache", head = entryPoint, failure = error.msg
 
-  result.diagnostics = collectCompilerDiagnostics(
-    result.stdout, result.stderr, request.workspace.rootPath, entryPoints[0]
-  )
+  # Revalidate before the final snapshot: another head may have read changing inputs.
+  var validated: seq[HeadAnalysis]
+  var verificationCache: InputFingerprints
+  let inventoryCurrent = sourceInventory(request.workspace) == inventory
+  for analysis in result.heads:
+    if inventoryCurrent and
+        fingerprintInputs(analysis.inputPaths, verificationCache) ==
+        analysis.inputFingerprint:
+      validated.add(analysis)
+    else:
+      result.failedHeads.add(analysis.headPath)
+      result.addBuildFailure(
+        "compiler inputs changed during analysis; retry refresh", analysis.headPath
+      )
+  result.heads = move(validated)
   if request.cancellation.isCompilerCancelled():
     result.cancelled = true
     result.error = "compiler refresh was cancelled"
     return
-  if buildFailed:
-    result.addBuildFailure(
-      "Nim compiler exited with status " & $result.exitCode, entryPoints[0]
-    )
-    return
-
-  result.artifactPaths = discoverBifArtifacts(@[result.cachePath])
-  info "Discovered compiler-generated BIF artifacts",
-    cachePath = result.cachePath,
-    artifactCount = result.artifactPaths.len,
-    artifactPaths = result.artifactPaths
-  if result.artifactPaths.len == 0:
-    warn "Nim compiler produced no semantic BIF artifacts",
-      compilerPath = result.compiler.compilerPath,
-      entryPoints = entryPoints,
-      cachePath = result.cachePath
-    result.addBuildFailure(
-      "Nim compiler produced no semantic BIF artifacts", entryPoints[0]
-    )
-    return
-  result.snapshot = buildBifIndex(request.workspace, @[result.cachePath])
-  if result.snapshot.failureCount() > 0:
-    for failure in result.snapshot.failures:
-      result.diagnostics.add(
-        CompilerDiagnostic(
-          sourcePath: failure.sourcePath,
-          sourceUri: documentUriFromPath(failure.sourcePath),
-          severity: cdsError,
-          message: failure.message,
-        )
-      )
-    result.error = "one or more generated BIF artifacts could not be indexed"
-    return
-
-  result.snapshot.configurationFingerprint = request.workspace.configurationFingerprint
-  result.snapshot.compilerFingerprint = result.compiler.fingerprint
-  result.snapshot.sourceFingerprint = sources.fingerprint
-  result.snapshot.analysisStamp = result.stamp
-  result.ok = true
+  result.loadedArtifacts = artifactCache.loadedArtifacts
+  result.reusedArtifacts = artifactCache.reusedArtifacts
+  result.snapshot =
+    combinedHeadSnapshot(request.workspace, result.heads, result.stamp, entryPoints)
+  result.stamp = result.snapshot.analysisStamp
+  result.ok = result.failedHeads.len == 0
   info "Compiler-backed analysis completed",
     projectId = request.workspace.projectId,
     moduleCount = result.snapshot.moduleCount(),
     symbolCount = result.snapshot.symbolCount(),
-    tokenCount = result.snapshot.tokenCount(),
-    artifactCount = result.artifactPaths.len
+    compiledHeads = result.compiledHeads,
+    reusedHeads = result.reusedHeads,
+    restoredHeads = result.restoredHeads,
+    failedHeads = result.failedHeads,
+    loadedArtifacts = result.loadedArtifacts,
+    reusedArtifacts = result.reusedArtifacts

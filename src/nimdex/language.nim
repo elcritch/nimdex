@@ -1,6 +1,6 @@
 ## Worker-pool language components used by the Nimdex LSP server.
 
-import std/[atomics, os, strutils, tables, times]
+import std/[atomics, os, sets, strutils, tables, times]
 
 import ./documents
 import ./semantic
@@ -162,6 +162,11 @@ proc sourceDocumentFor(
     false
 
 proc moduleIsCurrent(self: LanguageService, module: ModuleSnapshot): bool =
+  let head = self.semantic.preferredHeads.getOrDefault(
+    module.sourcePath, self.semantic.graph.preferredHead(module.sourcePath)
+  )
+  if head.len > 0 and head notin module.headFiles:
+    return false
   if module.sourceTextHash == 0:
     return false
   let location = SourceLocation(
@@ -240,6 +245,7 @@ proc addDocumentSymbols(
       "analysis unavailable: compiler-backed semantic snapshot is not installed"
     return
   var sourceDocuments = initTable[string, DocumentSnapshot]()
+  var seen = initHashSet[string]()
   for module in self.semantic.modules:
     if cancellation.isCancelled():
       response.ok = false
@@ -254,14 +260,15 @@ proc addDocumentSymbols(
         response.cancelled = true
         response.error = "language request was cancelled"
         return
-      if symbol.location.uri != uri or not symbol.location.valid:
+      if symbol.location.uri != uri or not symbol.location.valid or symbol.key in seen:
         continue
       var document: DocumentSnapshot
       var startOffset, finishOffset: int
       if self.symbolSpan(
         symbol, positionEncoding, sourceDocuments, document, startOffset, finishOffset
       ):
-        discard response.addLanguageSymbol(symbol, document, startOffset, finishOffset)
+        if response.addLanguageSymbol(symbol, document, startOffset, finishOffset):
+          seen.incl(symbol.key)
   response.found = response.symbols.len > 0
 
 proc addWorkspaceSymbols(
@@ -277,6 +284,7 @@ proc addWorkspaceSymbols(
       "analysis unavailable: compiler-backed semantic snapshot is not installed"
     return
   var sourceDocuments = initTable[string, DocumentSnapshot]()
+  var seen = initHashSet[string]()
   for module in self.semantic.modules:
     if cancellation.isCancelled():
       response.ok = false
@@ -291,14 +299,16 @@ proc addWorkspaceSymbols(
         response.cancelled = true
         response.error = "language request was cancelled"
         return
-      if not symbol.location.valid or not symbol.symbolMatchesQuery(query):
+      if not symbol.location.valid or not symbol.symbolMatchesQuery(query) or
+          symbol.key in seen:
         continue
       var document: DocumentSnapshot
       var startOffset, finishOffset: int
       if self.symbolSpan(
         symbol, positionEncoding, sourceDocuments, document, startOffset, finishOffset
       ):
-        discard response.addLanguageSymbol(symbol, document, startOffset, finishOffset)
+        if response.addLanguageSymbol(symbol, document, startOffset, finishOffset):
+          seen.incl(symbol.key)
   response.found = response.symbols.len > 0
 
 proc findHoverSymbol(
@@ -448,6 +458,7 @@ proc processLanguageWork(self: LanguageService, work: LanguageWork) {.slot.} =
       valid: work.request.stamp.valid,
       projectId: self.semantic.projectId,
       documentGeneration: self.documentGeneration,
+      sourceGeneration: work.request.stamp.sourceGeneration,
       configurationGeneration: self.configurationGeneration,
       configurationFingerprint: self.configurationFingerprint,
       compilerFingerprint: self.compilerFingerprint,

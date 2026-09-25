@@ -1,6 +1,6 @@
 ## Minimal LSP 3.18 session handling for Nimdex.
 
-import std/[json, os, strutils, syncio, tables]
+import std/[algorithm, json, os, sequtils, strutils, syncio, tables]
 
 import chronicles
 import sigils
@@ -13,6 +13,8 @@ import ./documents
 import ./language
 import ./lsptransport
 import ./workspace
+
+export DefaultNimdexMessageSize
 
 const
   LspServerNotInitialized* = -32002'i32 ## LSP error for pre-initialization requests.
@@ -66,6 +68,7 @@ type
   LspServer* = ref object of DynamicAgent ## A Nimdex LSP session and its worker bridge.
     adapter: JsonRpcAdapter
     dispatcher: JsonRpcDispatcher
+    writer: JsonRpcIoAgent
     language: LanguageRuntime
     home: SigilThreadPtr
     workspace: Workspace
@@ -82,6 +85,7 @@ type
     deferredShutdownResponse: string
     positionEncoding: PositionEncoding
     documentGeneration: uint64
+    compilerSourceGeneration: uint64
     state: LspSessionState
     exitRequested: bool
     exitStatus: int
@@ -97,6 +101,23 @@ type
     compilerRefreshPending: bool
     publishedDiagnosticUris: Table[string, bool]
     activeSnapshot: SemanticSnapshot
+    compilerHeads: seq[HeadAnalysis]
+    refreshEntryPoints: seq[string]
+    progressHeads: seq[HeadAnalysis]
+    progressSnapshot: SemanticSnapshot
+    progressSnapshotStarted: bool
+    progressUsesPrevious: bool
+    completedHeads: seq[string]
+    failedHeads: seq[string]
+    headDiagnostics: Table[string, seq[CompilerDiagnostic]]
+    preferredHeads: Table[string, string]
+    activeDocument: string
+    forceCompilerRefresh: bool
+    lastCompiledHeads: int
+    lastReusedHeads: int
+    lastLoadedArtifacts: int
+    lastReusedArtifacts: int
+    lastRestoredHeads: int
     lastCompilerCachePath: string
     lastCompilerCommands: seq[string]
     lastCompilerArtifacts: seq[string]
@@ -114,6 +135,9 @@ let
   didOpenSelector = selector[JsonNode, JsonNode]("textDocument/didOpen")
   didChangeSelector = selector[JsonNode, JsonNode]("textDocument/didChange")
   didCloseSelector = selector[JsonNode, JsonNode]("textDocument/didClose")
+  didSaveSelector = selector[JsonNode, JsonNode]("textDocument/didSave")
+  didChangeWatchedFilesSelector =
+    selector[JsonNode, JsonNode]("workspace/didChangeWatchedFiles")
   documentSymbolSelector = selector[JsonNode, JsonNode]("textDocument/documentSymbol")
   workspaceSymbolSelector = selector[JsonNode, JsonNode]("workspace/symbol")
   hoverSelector = selector[JsonNode, JsonNode]("textDocument/hover")
@@ -124,6 +148,10 @@ proc indexCompleted(source: BifIndexJob, completion: sink BifIndexCompletion) {.
 proc compilerRefreshRequested(source: CompilerRefreshTrigger) {.signal.}
 proc compilerRefreshCompleted(
   source: CompilerRefreshJob, completion: sink CompilerRefreshCompletion
+) {.signal.}
+
+proc compilerHeadCompleted(
+  source: CompilerRefreshJob, progress: CompilerHeadProgress
 ) {.signal.}
 
 proc symbolCount(snapshot: SemanticSnapshot): int
@@ -161,6 +189,7 @@ proc compilerFailure(
     valid: true,
     projectId: request.workspace.projectId,
     documentGeneration: request.documentGeneration,
+    sourceGeneration: request.sourceGeneration,
     configurationGeneration: request.workspace.configurationGeneration,
     configurationFingerprint: request.workspace.configurationFingerprint,
     compilerFingerprint: request.capabilities.fingerprint,
@@ -184,7 +213,12 @@ proc compilerFailure(
 proc runCompilerRefresh(job: CompilerRefreshJob) {.slot.} =
   var completion = CompilerRefreshCompletion()
   try:
-    completion.result = runCompilerRefresh(job.request)
+    completion.result = runCompilerRefresh(
+      job.request,
+      proc(progress: CompilerHeadProgress) =
+        emit job.compilerHeadCompleted(progress)
+      ,
+    )
   except CatchableError as error:
     completion.result = compilerFailure(job.request, error.msg)
   except Defect as error:
@@ -264,6 +298,7 @@ type CompilerInitializeOptions = object
   entryPoints: seq[string]
   importPaths: seq[string]
   nimArguments: seq[string]
+  preferredHeads: Table[string, string]
 
 proc initializationOptions(params: JsonNode): JsonNode =
   if params.kind == JObject and params.hasKey("initializationOptions"):
@@ -329,6 +364,12 @@ proc compilerOptionsFromInitialize(
     result.configured = true
     result.nimArguments =
       stringArray(options, "nimArguments", "initialize initializationOptions")
+  if options.hasKey("preferredHeads"):
+    let choices = requireObject(options["preferredHeads"], "initialize preferredHeads")
+    for source, head in choices:
+      if head.kind != JString:
+        raiseLspError(RpcInvalidParams, "preferredHeads values must be head paths")
+      result.preferredHeads[source] = head.getStr()
   if options.hasKey("autoCompile"):
     if options["autoCompile"].kind != JBool:
       raiseLspError(
@@ -599,7 +640,13 @@ proc debugLsp(server: LspServer, params: JsonNode): JsonNode =
   workspace["cacheRoot"] = %server.workspace.cacheRoot
   workspace["configurationGeneration"] = %server.workspace.configurationGeneration
   workspace["configurationFingerprint"] = %($server.workspace.configurationFingerprint)
-  addJsonStrings(workspace, "entryPoints", server.workspace.entryPoints)
+  addJsonStrings(
+    workspace, "entryPoints", server.workspace.discoverCompilerEntryPoints()
+  )
+  let layout = discoverProjectLayout(server.workspace.rootPath)
+  addJsonStrings(workspace, "packageFiles", layout.packageFiles)
+  addJsonStrings(workspace, "sourceDirs", layout.sourceDirs)
+  addJsonStrings(workspace, "discoveryWarnings", layout.warnings)
   addJsonStrings(workspace, "importPaths", server.workspace.importPaths)
   addJsonStrings(workspace, "nimArguments", server.workspace.nimArguments)
   addJsonStrings(workspace, "artifactRoots", server.workspace.artifactRoots)
@@ -628,6 +675,18 @@ proc debugLsp(server: LspServer, params: JsonNode): JsonNode =
   refresh["stderrBytes"] = %server.lastCompilerStderrBytes
   refresh["error"] = %server.lastCompilerError
   refresh["cancelled"] = %server.lastCompilerCancelled
+  refresh["compiledHeads"] = %server.lastCompiledHeads
+  refresh["reusedHeads"] = %server.lastReusedHeads
+  refresh["restoredHeads"] = %server.lastRestoredHeads
+  addJsonStrings(refresh, "completedHeads", server.completedHeads)
+  addJsonStrings(
+    refresh,
+    "pendingHeads",
+    server.refreshEntryPoints.filterIt(it notin server.completedHeads),
+  )
+  addJsonStrings(refresh, "failedHeads", server.failedHeads)
+  refresh["loadedArtifacts"] = %server.lastLoadedArtifacts
+  refresh["reusedArtifacts"] = %server.lastReusedArtifacts
   addJsonStrings(refresh, "commandLines", server.lastCompilerCommands)
   addJsonStrings(refresh, "artifactPaths", server.lastCompilerArtifacts)
   result["refresh"] = refresh
@@ -641,10 +700,21 @@ proc debugLsp(server: LspServer, params: JsonNode): JsonNode =
   semanticNode["tokenCount"] = %server.activeSnapshot.tokenCount()
   semanticNode["failureCount"] = %server.activeSnapshot.failureCount()
   semanticNode["sourceFingerprint"] = %($server.activeSnapshot.sourceFingerprint)
+  result["semantic"] = semanticNode
+  if params.kind == JObject and params.hasKey("summaryOnly"):
+    if params["summaryOnly"].kind != JBool:
+      raiseLspError(RpcInvalidParams, "debug summaryOnly must be a boolean")
+    if params["summaryOnly"].getBool():
+      return
   var modules = newJArray()
   for module in server.activeSnapshot.modules:
     let value = newJObject()
     value["artifactPath"] = %module.artifactPath
+    value["moduleId"] = %module.moduleId
+    value["artifactHash"] = %module.artifactHash
+    addJsonStrings(value, "headFiles", module.headFiles)
+    addJsonStrings(value, "imports", module.imports)
+    addJsonStrings(value, "includes", module.includes)
     value["sourcePath"] = %module.sourcePath
     value["sourceUri"] = %module.sourceUri
     value["tokenCount"] = %module.tokenCount
@@ -658,6 +728,31 @@ proc debugLsp(server: LspServer, params: JsonNode): JsonNode =
     modules.add(value)
   semanticNode["modules"] = modules
   result["semantic"] = semanticNode
+  let graph = newJObject()
+  addJsonStrings(graph, "actualHeads", server.activeSnapshot.graph.heads)
+  var sources: seq[string]
+  for path in server.activeSnapshot.graph.sourceHeads.keys:
+    sources.add(path)
+  sources.sort()
+  var nodes = newJArray()
+  for path in sources:
+    let node = newJObject()
+    node["sourcePath"] = %path
+    addJsonStrings(node, "headFiles", server.activeSnapshot.graph.headsFor(path))
+    node["preferredHead"] =
+      %server.preferredHeads.getOrDefault(
+        path, server.activeSnapshot.graph.preferredHead(path)
+      )
+    let dependencies = server.activeSnapshot.graph.modules.getOrDefault(path)
+    addJsonStrings(node, "imports", dependencies.imports)
+    addJsonStrings(node, "includes", dependencies.includes)
+    addJsonStrings(node, "unresolvedImports", dependencies.unresolvedImports)
+    addJsonStrings(
+      node, "importers", server.activeSnapshot.graph.importers.getOrDefault(path)
+    )
+    nodes.add(node)
+  graph["modules"] = nodes
+  result["moduleGraph"] = graph
 
 proc installSemanticIndex(server: LspServer) =
   if not server.semanticCapabilities:
@@ -796,7 +891,8 @@ proc publishCompilerDiagnostics(
       else:
         server.workspace.rootUri
     if uri.len > 0:
-      grouped.mgetOrPut(uri, @[]).add(diagnostic)
+      if diagnostic notin grouped.mgetOrPut(uri, @[]):
+        grouped[uri].add(diagnostic)
 
   var uris = initTable[string, bool]()
   for uri in server.publishedDiagnosticUris.keys:
@@ -822,13 +918,71 @@ proc receiveCompilerRefreshCompletion(
   server: LspServer, completion: CompilerRefreshCompletion
 ) {.slot.}
 
+proc receiveCompilerHeadProgress(
+  server: LspServer, progress: CompilerHeadProgress
+) {.slot.}
+
 proc runCompilerRefreshSynchronously(server: LspServer)
+
+proc headForDocument(server: LspServer, path: string): string =
+  if path.len == 0:
+    return
+  if path in server.preferredHeads:
+    return server.preferredHeads[path]
+  let known = server.activeSnapshot.graph.preferredHead(path)
+  if known.len > 0 and known in server.refreshEntryPoints:
+    return known
+  var best = -1
+  for head in server.refreshEntryPoints:
+    if head == path:
+      return head
+    let score = if path.startsWith(head.parentDir & DirSep): head.parentDir.len else: 0
+    if score > best:
+      best = score
+      result = head
+
+proc prioritizeDocument(server: LspServer, uri: string) =
+  server.activeDocument = pathFromDocumentUri(uri)
+  let head = server.headForDocument(server.activeDocument)
+  server.compilerCancellation.prioritizeCompilerHead(
+    server.refreshEntryPoints.find(head)
+  )
+
+proc documentHasAnalysis(server: LspServer, uri: string): bool =
+  let path = pathFromDocumentUri(uri)
+  let owners = server.activeSnapshot.graph.headsFor(path)
+  let chosen = server.preferredHeads.getOrDefault(
+    path, server.activeSnapshot.graph.preferredHead(path)
+  )
+  owners.len > 0 and (
+    chosen.len == 0 or (
+      chosen in owners and chosen notin server.failedHeads and
+      (not server.compilerLoading or chosen in server.completedHeads)
+    )
+  )
+
+proc prepareCompilerRefresh(server: LspServer) =
+  server.refreshEntryPoints = server.workspace.discoverCompilerEntryPoints()
+  server.progressUsesPrevious =
+    server.semanticReady and
+    server.activeSnapshot.graph.heads == server.refreshEntryPoints
+  server.progressSnapshotStarted = false
+  server.semanticReady = false
+  server.semanticFailed = false
+  server.progressHeads.setLen(0)
+  server.completedHeads.setLen(0)
+  server.failedHeads.setLen(0)
+  server.headDiagnostics.clear()
+  for head in server.compilerHeads:
+    if head.headPath in server.refreshEntryPoints:
+      server.headDiagnostics[head.headPath] = head.diagnostics
 
 proc startCompilerRefresh(server: LspServer) =
   if not server.compilerEnabled or server.compilerLoading:
     return
   server.compilerLoading = true
   server.semanticLoading = true
+  server.prepareCompilerRefresh()
   info "Starting compiler refresh",
     projectId = server.workspace.projectId,
     workspaceRoot = server.workspace.rootPath,
@@ -846,8 +1000,13 @@ proc startCompilerRefresh(server: LspServer) =
     workspace: server.workspace,
     capabilities: server.compiler,
     documentGeneration: server.documentGeneration,
+    sourceGeneration: server.compilerSourceGeneration,
     cancellation: cancellation,
+    previousHeads: server.compilerHeads,
+    forceRebuild: server.forceCompilerRefresh,
+    priorityHead: server.headForDocument(server.activeDocument),
   )
+  server.forceCompilerRefresh = false
   var job = CompilerRefreshJob(request: request)
   let proxy = job.moveToThread(thread)
   server.compilerThread = thread
@@ -856,6 +1015,9 @@ proc startCompilerRefresh(server: LspServer) =
   connectThreaded(trigger, compilerRefreshRequested, proxy, runCompilerRefresh)
   connectThreaded(
     proxy, compilerRefreshCompleted, server, receiveCompilerRefreshCompletion(LspServer)
+  )
+  connectThreaded(
+    proxy, compilerHeadCompleted, server, receiveCompilerHeadProgress(LspServer)
   )
   thread.start()
   emit trigger.compilerRefreshRequested()
@@ -874,6 +1036,9 @@ proc requestCompilerRefresh(server: LspServer) =
 proc runCompilerRefreshSynchronously(server: LspServer) =
   if not server.compilerEnabled:
     return
+  server.prepareCompilerRefresh()
+  server.compilerLoading = true
+  server.semanticLoading = true
   let cancellation = newCompilerCancellation()
   server.compilerCancellation = cancellation
   let completion = CompilerRefreshCompletion(
@@ -882,10 +1047,17 @@ proc runCompilerRefreshSynchronously(server: LspServer) =
         workspace: server.workspace,
         capabilities: server.compiler,
         documentGeneration: server.documentGeneration,
+        sourceGeneration: server.compilerSourceGeneration,
         cancellation: cancellation,
-      )
+        previousHeads: server.compilerHeads,
+        forceRebuild: server.forceCompilerRefresh,
+        priorityHead: server.headForDocument(server.activeDocument),
+      ),
+      proc(progress: CompilerHeadProgress) =
+        server.receiveCompilerHeadProgress(progress),
     )
   )
+  server.forceCompilerRefresh = false
   server.receiveCompilerRefreshCompletion(completion)
 
 proc currentLanguageStamp(server: LspServer): LanguageStamp =
@@ -893,6 +1065,7 @@ proc currentLanguageStamp(server: LspServer): LanguageStamp =
     valid: true,
     projectId: server.workspace.projectId,
     documentGeneration: server.documentGeneration,
+    sourceGeneration: server.compilerSourceGeneration,
     configurationGeneration: server.workspace.configurationGeneration,
     configurationFingerprint: server.workspace.configurationFingerprint,
     compilerFingerprint: if server.compilerEnabled: server.compiler.fingerprint else: 0,
@@ -903,6 +1076,7 @@ proc stampMatches(a, b: LanguageStamp): bool =
     not a.valid or (
       (a.projectId.len == 0 or b.projectId.len == 0 or a.projectId == b.projectId) and
       a.documentGeneration == b.documentGeneration and
+      a.sourceGeneration == b.sourceGeneration and
       a.configurationGeneration == b.configurationGeneration and
       a.configurationFingerprint == b.configurationFingerprint and
       a.compilerFingerprint == b.compilerFingerprint
@@ -1067,9 +1241,29 @@ proc submitLanguageRequest(
   request.stamp = stamp
   let hasResponse = not id.isNil
 
+  var awaitingHead = false
+  var missingHead = false
+  if hasResponse and server.compilerEnabled and kind in {lrkDocumentSymbols, lrkHover}:
+    let path = pathFromDocumentUri(request.uri)
+    let chosen = server.preferredHeads.getOrDefault(
+      path, server.activeSnapshot.graph.preferredHead(path)
+    )
+    missingHead = not server.documentHasAnalysis(request.uri)
+    if missingHead:
+      awaitingHead =
+        server.compilerLoading and
+        (chosen.len == 0 or chosen notin server.completedHeads)
+      if not awaitingHead:
+        server.sendError(
+          id, LspAnalysisUnavailable, "analysis unavailable for this document's head"
+        )
+        return false
+
   if hasResponse and kind in {lrkDocumentSymbols, lrkWorkspaceSymbols, lrkHover} and
-      server.semanticCapabilities and not server.semanticReady and
-      not server.semanticFailed:
+      server.semanticCapabilities and (
+    awaitingHead or (kind == lrkWorkspaceSymbols and server.compilerLoading) or
+    (not server.semanticReady and not server.semanticFailed)
+  ):
     if server.queued.len >= MaxQueuedLspRequests:
       server.sendError(id, LspServerBusy, "language request queue is full")
       return false
@@ -1183,8 +1377,8 @@ proc submitAsyncLspRequest(
     let accepted = server.submitLanguageRequest(request, id, request.kind, stamp)
     if accepted and request.kind in {lrkOpen, lrkChange, lrkClose}:
       server.documentGeneration = stamp.documentGeneration
-      if request.kind == lrkChange:
-        server.requestCompilerRefresh()
+    if accepted and request.kind in {lrkOpen, lrkChange, lrkDocumentSymbols, lrkHover}:
+      server.prioritizeDocument(request.uri)
   except RpcRouteError as error:
     if hasResponse:
       server.sendError(id, error.code, error.msg)
@@ -1285,7 +1479,7 @@ proc receiveJsonRpcStopped(server: LspServer) {.slot.} =
 proc compilerStampMatches(server: LspServer, stamp: AnalysisStamp): bool =
   let current = server.currentLanguageStamp()
   stamp.valid and stamp.projectId == current.projectId and
-    stamp.documentGeneration == current.documentGeneration and
+    stamp.sourceGeneration == server.compilerSourceGeneration and
     stamp.configurationGeneration == current.configurationGeneration and
     stamp.configurationFingerprint == current.configurationFingerprint and
     stamp.compilerFingerprint == current.compilerFingerprint
@@ -1336,6 +1530,54 @@ proc receiveBifIndexCompletion(
     completion.ok, if completion.ok: "" else: completion.error
   )
 
+proc receiveCompilerHeadProgress(
+    server: LspServer, progress: CompilerHeadProgress
+) {.slot.} =
+  if server.isNil or server.state != lssRunning or
+      not server.compilerStampMatches(progress.stamp) or
+      server.compilerCancellation.isCompilerCancelled():
+    return
+  server.completedHeads.add(progress.headPath)
+  server.headDiagnostics[progress.headPath] = progress.diagnostics
+  if progress.ok:
+    server.progressHeads.add(progress.analysis)
+    var replaced = false
+    for head in server.compilerHeads.mitems:
+      if head.headPath == progress.headPath:
+        head = progress.analysis
+        replaced = true
+        break
+    if not replaced:
+      server.compilerHeads.add(progress.analysis)
+    if not progress.reused:
+      server.progressUsesPrevious = false
+    if not server.progressUsesPrevious:
+      if not server.progressSnapshotStarted:
+        server.progressSnapshot = combinedHeadSnapshot(
+          server.workspace, server.progressHeads, progress.stamp,
+          server.refreshEntryPoints,
+        )
+        server.progressSnapshotStarted = true
+      else:
+        server.progressSnapshot.mergeHead(progress.analysis.snapshot[])
+        server.progressSnapshot.sourceFingerprint =
+          headSourceFingerprint(server.progressHeads)
+        server.progressSnapshot.analysisStamp.sourceFingerprint =
+          server.progressSnapshot.sourceFingerprint
+      server.progressSnapshot.preferredHeads = server.preferredHeads
+      server.activeSnapshot = server.progressSnapshot
+      server.language.installIndex(server.activeSnapshot)
+    server.semanticReady = true
+    server.semanticFailed = false
+  else:
+    server.failedHeads.add(progress.headPath)
+    server.progressUsesPrevious = false
+  var diagnostics: seq[CompilerDiagnostic]
+  for head in server.refreshEntryPoints:
+    diagnostics.add(server.headDiagnostics.getOrDefault(head))
+  server.publishCompilerDiagnostics(diagnostics)
+  server.drainQueuedLanguageRequests(true, "")
+
 proc receiveCompilerRefreshCompletion(
     server: LspServer, completion: CompilerRefreshCompletion
 ) {.slot.} =
@@ -1354,6 +1596,11 @@ proc receiveCompilerRefreshCompletion(
     server.lastCompilerStderrBytes = refresh.stderr.len
     server.lastCompilerError = refresh.error
     server.lastCompilerCancelled = refresh.cancelled
+    server.lastCompiledHeads = refresh.compiledHeads
+    server.lastReusedHeads = refresh.reusedHeads
+    server.lastLoadedArtifacts = refresh.loadedArtifacts
+    server.lastReusedArtifacts = refresh.reusedArtifacts
+    server.lastRestoredHeads = refresh.restoredHeads
   server.compilerRefreshPending = false
   server.semanticLoading = false
   server.stopCompilerRefresh()
@@ -1373,31 +1620,36 @@ proc receiveCompilerRefreshCompletion(
     return
 
   server.publishCompilerDiagnostics(refresh.diagnostics)
-  if refresh.ok:
+  server.failedHeads = refresh.failedHeads
+  server.completedHeads = server.refreshEntryPoints
+  if refresh.stamp.valid:
     info "Installing compiler-backed semantic index",
       projectId = server.workspace.projectId,
       moduleCount = refresh.snapshot.moduleCount(),
       symbolCount = refresh.snapshot.symbolCount(),
       tokenCount = refresh.snapshot.tokenCount(),
       artifactCount = refresh.artifactPaths.len
-    ## The language actor receives the complete snapshot as one owned message;
-    ## the old snapshot remains visible until this message is delivered.
-    server.activeSnapshot = refresh.snapshot
-    server.language.installIndex(refresh.snapshot)
-    server.semanticReady = true
-    server.semanticFailed = false
-    server.drainQueuedLanguageRequests(true, "")
-  else:
+    let unchanged =
+      refresh.ok and server.progressUsesPrevious and
+      server.activeSnapshot.sourceFingerprint == refresh.snapshot.sourceFingerprint
+    if unchanged:
+      server.activeSnapshot.analysisStamp = refresh.stamp
+    else:
+      server.activeSnapshot = refresh.snapshot
+      server.activeSnapshot.preferredHeads = server.preferredHeads
+      server.language.installIndex(server.activeSnapshot)
+    server.compilerHeads = refresh.heads
+    server.progressSnapshot = SemanticSnapshot()
+    server.semanticReady = refresh.heads.len > 0
+    server.semanticFailed = not server.semanticReady
+  if not refresh.ok:
     warn "Compiler refresh failed",
       projectId = server.workspace.projectId,
       compilerPath = refresh.compiler.compilerPath,
       exitCode = refresh.exitCode,
       cachePath = refresh.cachePath,
       failure = refresh.error
-    ## A failed build never replaces a previously installed semantic snapshot.
-    ## Only an initial failure leaves queued requests unavailable.
-    server.semanticFailed = not server.semanticReady
-    server.drainQueuedLanguageRequests(false, refresh.error)
+  server.drainQueuedLanguageRequests(server.semanticReady, refresh.error)
 
   if restart and server.state == lssRunning:
     server.startCompilerRefresh()
@@ -1439,6 +1691,16 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
     cacheRoot = resolvedCacheRoot,
   )
   server.artifactRoots = server.workspace.artifactRoots
+  server.refreshEntryPoints = server.workspace.discoverCompilerEntryPoints()
+  for source, head in compilerOptions.preferredHeads:
+    let sourcePath = resolveWorkspacePaths(rootUri, @[source])[0]
+    let headPath = resolveWorkspacePaths(rootUri, @[head])[0]
+    if headPath notin server.refreshEntryPoints:
+      raiseLspError(
+        RpcInvalidParams,
+        "preferredHeads must refer to a discovered or configured head: " & head,
+      )
+    server.preferredHeads[sourcePath] = headPath
   info "Initialized Nimdex workspace",
     rootUri = server.workspace.rootUri,
     workspaceRoot = server.workspace.rootPath,
@@ -1475,6 +1737,7 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
   let textDocumentSync = newJObject()
   textDocumentSync["openClose"] = %true
   textDocumentSync["change"] = %1
+  textDocumentSync["save"] = %true
   capabilities["textDocumentSync"] = textDocumentSync
   capabilities["positionEncoding"] = %server.positionEncoding.positionEncodingName()
   if server.semanticCapabilities:
@@ -1529,6 +1792,9 @@ proc didOpenLsp(server: LspServer, params: JsonNode): JsonNode =
     server.language.request(parseOpenRequest(params, server.positionEncoding))
   requireLanguageSuccess(response)
   inc server.documentGeneration
+  server.prioritizeDocument(
+    requireString(params["textDocument"], "uri", "didOpen textDocument")
+  )
   newJNull()
 
 proc didChangeLsp(server: LspServer, params: JsonNode): JsonNode =
@@ -1537,7 +1803,52 @@ proc didChangeLsp(server: LspServer, params: JsonNode): JsonNode =
     server.language.request(parseChangeRequest(params, server.positionEncoding))
   requireLanguageSuccess(response)
   inc server.documentGeneration
+  newJNull()
+
+proc noticeDiskChange(server: LspServer, uri: string) =
+  let path = pathFromDocumentUri(uri)
+  var known = false
+  for head in server.compilerHeads:
+    if path in head.inputPaths:
+      known = true
+      break
+  if not known:
+    # New import targets and external compile-time inputs have no old graph
+    # edge. A client-reported change to one conservatively rebuilds all heads.
+    server.forceCompilerRefresh = true
+
+proc didSaveLsp(server: LspServer, params: JsonNode): JsonNode =
+  server.requireRunning()
+  let document = requireObject(
+    requireMember(
+      requireObject(params, "didSave params"), "textDocument", "didSave params"
+    ),
+    "didSave textDocument",
+  )
+  server.noticeDiskChange(requireString(document, "uri", "didSave textDocument"))
+  inc server.compilerSourceGeneration
   server.requestCompilerRefresh()
+  newJNull()
+
+proc didChangeWatchedFilesLsp(server: LspServer, params: JsonNode): JsonNode =
+  server.requireRunning()
+  let changes = requireMember(
+    requireObject(params, "didChangeWatchedFiles params"),
+    "changes",
+    "didChangeWatchedFiles params",
+  )
+  if changes.kind != JArray:
+    raiseLspError(RpcInvalidParams, "didChangeWatchedFiles changes must be an array")
+  for change in changes:
+    let item = requireObject(change, "file change")
+    let uri = requireString(item, "uri", "file change")
+    let kind = requireInt(item, "type", "file change")
+    if kind notin 1 .. 3:
+      raiseLspError(RpcInvalidParams, "file change type must be 1, 2, or 3")
+    server.noticeDiskChange(uri)
+  if changes.len > 0:
+    inc server.compilerSourceGeneration
+    server.requestCompilerRefresh()
   newJNull()
 
 proc didCloseLsp(server: LspServer, params: JsonNode): JsonNode =
@@ -1549,9 +1860,13 @@ proc didCloseLsp(server: LspServer, params: JsonNode): JsonNode =
 
 proc documentSymbolsLsp(server: LspServer, params: JsonNode): JsonNode =
   server.requireRunning()
-  let response = server.language.request(
-    parseDocumentSymbolsRequest(params, server.positionEncoding)
-  )
+  let request = parseDocumentSymbolsRequest(params, server.positionEncoding)
+  if server.compilerEnabled and not server.documentHasAnalysis(request.uri):
+    raiseLspError(
+      LspAnalysisUnavailable, "analysis unavailable for this document's head"
+    )
+  server.prioritizeDocument(request.uri)
+  let response = server.language.request(request)
   requireLanguageSuccess(response)
   result = newJArray()
   for symbol in response.symbols:
@@ -1559,6 +1874,8 @@ proc documentSymbolsLsp(server: LspServer, params: JsonNode): JsonNode =
 
 proc workspaceSymbolsLsp(server: LspServer, params: JsonNode): JsonNode =
   server.requireRunning()
+  if server.compilerEnabled and not server.semanticReady:
+    raiseLspError(LspAnalysisUnavailable, "analysis unavailable: no healthy heads")
   let response = server.language.request(
     parseWorkspaceSymbolsRequest(params, server.positionEncoding)
   )
@@ -1569,8 +1886,13 @@ proc workspaceSymbolsLsp(server: LspServer, params: JsonNode): JsonNode =
 
 proc hoverLsp(server: LspServer, params: JsonNode): JsonNode =
   server.requireRunning()
-  let response =
-    server.language.request(parseHoverRequest(params, server.positionEncoding))
+  let request = parseHoverRequest(params, server.positionEncoding)
+  if server.compilerEnabled and not server.documentHasAnalysis(request.uri):
+    raiseLspError(
+      LspAnalysisUnavailable, "analysis unavailable for this document's head"
+    )
+  server.prioritizeDocument(request.uri)
+  let response = server.language.request(request)
   requireLanguageSuccess(response)
   if not response.found:
     return newJNull()
@@ -1590,6 +1912,10 @@ proc registerLspRoutes(server: LspServer) =
   discard server.addMethod(didOpenSelector, toDynamicMethod(didOpenLsp))
   discard server.addMethod(didChangeSelector, toDynamicMethod(didChangeLsp))
   discard server.addMethod(didCloseSelector, toDynamicMethod(didCloseLsp))
+  discard server.addMethod(didSaveSelector, toDynamicMethod(didSaveLsp))
+  discard server.addMethod(
+    didChangeWatchedFilesSelector, toDynamicMethod(didChangeWatchedFilesLsp)
+  )
   discard server.addMethod(documentSymbolSelector, toDynamicMethod(documentSymbolsLsp))
   discard
     server.addMethod(workspaceSymbolSelector, toDynamicMethod(workspaceSymbolsLsp))
@@ -1606,6 +1932,10 @@ proc registerLspRoutes(server: LspServer) =
   )
   server.adapter.registerSelectorMethod(
     "textDocument/didClose", server, didCloseSelector
+  )
+  server.adapter.registerSelectorMethod("textDocument/didSave", server, didSaveSelector)
+  server.adapter.registerSelectorMethod(
+    "workspace/didChangeWatchedFiles", server, didChangeWatchedFilesSelector
   )
   server.adapter.registerSelectorMethod(
     "textDocument/documentSymbol", server, documentSymbolSelector
@@ -1659,6 +1989,9 @@ proc close*(server: LspServer) =
     server.stopCompilerRefresh()
     server.language.close()
 
+proc writeLspResponse(server: LspServer, response: JsonRpcResponse) {.slot.} =
+  server.writer.queueResponse(boundedLspResponse(response))
+
 proc runNimdexLspStdio*(
     input: File = stdin,
     output: File = stdout,
@@ -1677,14 +2010,13 @@ proc runNimdexLspStdio*(
   server.asynchronousSession = true
   let dispatcher = newJsonRpcDispatcher(server.adapter)
   server.dispatcher = dispatcher
-  let writer = jrStdio.newJsonRpcStdioIo(input, output)
+  let writer = jrStdio.newJsonRpcStdioIo(input, output, DefaultNimdexMessageSize)
+  server.writer = writer
   let readerThread = newSigilThread()
   var reader = newNimdexLspStdioReader(input)
   let readerProxy = reader.moveToThread(readerThread)
 
-  connect(
-    dispatcher, jsonRpcResponseReady, writer, JsonRpcIoAgent.sendJsonRpcResponse()
-  )
+  connect(dispatcher, jsonRpcResponseReady, server, writeLspResponse(LspServer))
   connectThreaded(
     readerProxy, jsonRpcRequestReceived, server, receiveJsonRpcRequest(LspServer)
   )

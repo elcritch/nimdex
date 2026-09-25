@@ -1,6 +1,6 @@
 ## Safe, offline discovery and indexing of compiler-produced semantic BIFs.
 
-import std/[algorithm, cpuinfo, os, strutils, tables, times]
+import std/[algorithm, cpuinfo, os, sha1, strutils, tables, times]
 
 import binny/bif_safe
 import chronicles
@@ -22,6 +22,11 @@ type
     workerCount*: int
 
   BifIndex* = SemanticSnapshot
+
+  BifReuseCache* = object
+    modules: Table[string, ModuleSnapshot]
+    loadedArtifacts*: int
+    reusedArtifacts*: int
 
   BifIndexResult = object
     artifactPath: string
@@ -202,23 +207,20 @@ proc modificationTimeForPath(path: string): int64 =
     0
 
 proc sourceHashForPath(hashes: var Table[string, uint64], path: string): uint64 =
-  let normalized = normalizeDocumentPath(path)
-  if normalized.len == 0:
+  if path.len == 0:
     return 0
-  if normalized notin hashes:
-    hashes[normalized] = sourceTextHashForPath(normalized)
-  hashes[normalized]
+  if path notin hashes:
+    hashes[path] = sourceTextHashForPath(path)
+  hashes[path]
 
 proc sourceLocation(
-    sourcePath: string,
+    sourcePath, sourceUri: string,
     location: BinnyLocation,
     sourceTextHash: uint64,
     artifactModifiedUnix: int64,
 ): SourceLocation =
-  result.path =
-    normalizeDocumentPath(if location.file.len > 0: location.file else: sourcePath)
-  if result.path.len > 0:
-    result.uri = documentUriFromPath(result.path)
+  result.path = sourcePath
+  result.uri = sourceUri
   result.sourceTextHash = sourceTextHash
   result.artifactModifiedUnix = artifactModifiedUnix
   result.valid = location.valid
@@ -227,6 +229,11 @@ proc sourceLocation(
 
 proc moduleFromReport(report: BinnyArtifactReport, projectId: string): ModuleSnapshot =
   result.artifactPath = report.path
+  let filename = report.path.extractFilename()
+  result.moduleId = filename[0 ..< filename.len - ".s.bif".len]
+  result.imports = report.imports
+  for path in report.includes:
+    result.includes.add(normalizeDocumentPath(path))
   result.sourcePath = normalizeDocumentPath(report.sourcePath)
   result.sourceUri = documentUriFromPath(result.sourcePath)
   result.artifactModifiedUnix = modificationTimeForPath(report.path)
@@ -235,18 +242,29 @@ proc moduleFromReport(report: BinnyArtifactReport, projectId: string): ModuleSna
   result.stringCount = report.stringCount
   result.symbolPoolCount = report.symbolCount
   result.filenameCount = report.filenameCount
-  result.sourceFiles = report.sourceFiles
+  var canonicalPaths = initTable[string, string]()
+  var sourceUris = initTable[string, string]()
+  for path in report.sourceFiles:
+    canonicalPaths[path] = normalizeDocumentPath(path)
+    result.sourceFiles.add(canonicalPaths[path])
+  canonicalPaths[report.sourcePath] = result.sourcePath
   var sourceHashes = initTable[string, uint64]()
   result.sourceTextHash = sourceHashForPath(sourceHashes, result.sourcePath)
   result.tags = report.tags
+  var symbols: seq[SymbolInfo]
   for declaration in report.declarations:
     let modulePath = if result.sourcePath.len > 0: result.sourcePath else: report.path
-    let locationPath =
+    let rawPath =
       if declaration.location.file.len > 0:
         declaration.location.file
       else:
         report.sourcePath
-    result.symbols.add(
+    if rawPath notin canonicalPaths:
+      canonicalPaths[rawPath] = normalizeDocumentPath(rawPath)
+    let locationPath = canonicalPaths[rawPath]
+    if locationPath notin sourceUris:
+      sourceUris[locationPath] = documentUriFromPath(locationPath)
+    symbols.add(
       SymbolInfo(
         key: projectId & "\0" & modulePath & "\0" & declaration.name,
         name: symbolBaseName(declaration.name),
@@ -255,16 +273,19 @@ proc moduleFromReport(report: BinnyArtifactReport, projectId: string): ModuleSna
         kind: declaration.tag,
         visibility: if declaration.visibility == bvisExported: svExported else: svHidden,
         location: sourceLocation(
-          report.sourcePath,
+          locationPath,
+          sourceUris[locationPath],
           declaration.location,
           sourceHashForPath(sourceHashes, locationPath),
           result.artifactModifiedUnix,
         ),
       )
     )
+  result.setSymbols(move(symbols))
 
-proc buildBifIndex*(
+proc buildBifIndexCached*(
     workspace: Workspace,
+    cache: var BifReuseCache,
     artifactRoots: seq[string] = @[],
     options = DefaultBifIndexOptions,
 ): BifIndex =
@@ -297,17 +318,55 @@ proc buildBifIndex*(
   var selectedArtifacts: seq[string]
   for index in 0 ..< count:
     selectedArtifacts.add(artifacts[index])
-  var indexed = indexArtifactsInPool(selectedArtifacts, workspace.projectId, options)
+  var pending: seq[string]
+  var hashes = initTable[string, string]()
+  var indexed: seq[BifIndexResult]
+  for path in selectedArtifacts:
+    # Respect loader limits before reading bytes for the content cache.
+    if getFileSize(path) <= options.loadLimits.maxFileBytes:
+      hashes[path] = $secureHashFile(path)
+    let hash = hashes.getOrDefault(path)
+    if hash.len > 0 and hash in cache.modules:
+      var module = cache.modules[hash]
+      module.artifactPath = path
+      module.artifactModifiedUnix = modificationTimeForPath(path)
+      module.headFiles = @[]
+      var sourceHashes = initTable[string, uint64]()
+      module.sourceTextHash = sourceHashForPath(sourceHashes, module.sourcePath)
+      var sourceTimes = initTable[string, int64]()
+      var changed = false
+      for symbol in module.symbols:
+        let source = symbol.location.path
+        if source notin sourceTimes:
+          sourceTimes[source] = modificationTimeForPath(source)
+        if sourceHashForPath(sourceHashes, source) != symbol.location.sourceTextHash or
+            sourceTimes[source] > symbol.location.artifactModifiedUnix:
+          changed = true
+      if changed:
+        var symbols = module.symbols
+        for symbol in symbols.mitems:
+          symbol.location.sourceTextHash = sourceHashes[symbol.location.path]
+          symbol.location.artifactModifiedUnix = module.artifactModifiedUnix
+        module.setSymbols(move(symbols))
+      indexed.add(BifIndexResult(artifactPath: path, ready: true, module: module))
+      inc cache.reusedArtifacts
+    else:
+      pending.add(path)
+  indexed.add(indexArtifactsInPool(pending, workspace.projectId, options))
+  cache.loadedArtifacts += pending.len
   indexed.sort(
     proc(a, b: BifIndexResult): int =
       cmp(a.artifactPath, b.artifactPath)
   )
   var indexedSymbolCount = 0
-  for item in indexed:
+  for item in indexed.mitems:
     if not item.ready:
       result.addFailure(item.failure)
       continue
     indexedSymbolCount += item.module.symbols.len
+    item.module.artifactHash = hashes.getOrDefault(item.artifactPath)
+    if item.module.artifactHash.len > 0:
+      cache.modules[item.module.artifactHash] = item.module
     result.addModule(item.module)
   info "Completed BIF indexing",
     projectId = workspace.projectId,
@@ -317,3 +376,16 @@ proc buildBifIndex*(
     symbolCount = indexedSymbolCount,
     tokenCount = result.tokenCount(),
     failureCount = result.failureCount()
+
+proc buildBifIndex*(
+    workspace: Workspace,
+    artifactRoots: seq[string] = @[],
+    options = DefaultBifIndexOptions,
+): BifIndex =
+  var cache: BifReuseCache
+  buildBifIndexCached(workspace, cache, artifactRoots, options)
+
+proc rememberModules*(cache: var BifReuseCache, snapshot: SemanticSnapshot) =
+  for module in snapshot.modules:
+    if module.artifactHash.len > 0:
+      cache.modules[module.artifactHash] = module

@@ -1,7 +1,30 @@
 # Binny-backed LSP plan
 
-Status: Phase 4 implemented. This document describes the remaining
-implementation stages and the compatibility gates for each one.
+Status: Phases 0–4b implemented. Phase 4c now includes progressive head loading,
+failure isolation, context selection, and persistent semantic records.
+The local `nim track` frontend has been probed; Nimdex integration and compiler
+artifact sharing across heads remain unimplemented. This document describes
+the remaining implementation stages and the compatibility gates for each one.
+
+## Next work in order
+
+1. Integrate the existing incremental frontend used by `nim track`, retaining
+   a dedicated compiler cache for each actual head. This first implementation
+   can live entirely in Nimdex with the current `deps/nim-devel/` toolchain.
+2. Validate reuse of compiler artifacts across compatible heads, starting with
+   prefilling separate head caches. Incrementality within one head does not
+   establish safe reuse between different heads.
+3. Add compiler process cancellation and unsaved-buffer analysis, preserving
+   source/configuration identity and rejecting superseded results.
+4. Index symbol occurrences and implement definition lookup, then references,
+   with verified source ranges and the selected actual-head context.
+5. Load lightweight ownership metadata before full semantic records and add
+   persistent-cache eviction. Track arbitrary compile-time inputs separately.
+
+Keep the `nim check --genBif:on` compiler fix as an alternative frontend path
+and synthetic import batches as an optional background experiment. Neither is
+a prerequisite for integrating the existing `nim track` frontend. Validate the
+pinned toolchain, including companion executables, in hosted CI.
 
 ## Goal
 
@@ -53,10 +76,13 @@ Do not call Binny's `findSemanticBifPath` directly from the server. Its implemen
 
 Nimdex requires a Nim devel/compiler build that advertises `--genBif:on`.
 This checkout provides that baseline at `deps/nim-devel/bin/nim` (Nim 2.3.1)
-along with `deps/nim-devel/bin/nifler`. The compiler capability probe must
+along with `deps/nim-devel/bin/nifler` and `deps/nim-devel/bin/nifmake`.
+The compiler capability probe must
 record the exact compiler, revision, command line, Nim cache layout, and
-artifact names. `nifler` is a companion inspection/discovery tool; the
-server's semantic boundary remains direct, safe Binny loading.
+artifact names. The incremental frontend requires both companion executables:
+`nifler` parses sources and dependencies, and `nifmake` schedules module work.
+Probe this frontend separately from `--genBif` support; the server's semantic
+boundary remains direct, safe Binny loading.
 
 If no configured compiler can produce the required artifacts, setup or server
 initialization must fail with a clear prerequisite error. Do not fall back to
@@ -73,9 +99,16 @@ LSP positions also require a conversion layer for negotiated character encodings
 
 ### Runtime responsiveness
 
-The current `LanguageRuntime` has one response slot and blocks each caller while pumping the local Sigils scheduler. It cannot safely represent multiple outstanding requests, and an uncaught worker exception can leave the caller waiting forever.
+The original `LanguageRuntime` had one response slot and blocked each caller
+while pumping the local Sigils scheduler. Phase 3 replaced it with correlated
+work, cancellation, and bounded queues.
 
-Sigils' `jrStdio.pollJsonRpcStdio` blocks while waiting for the next complete frame. That is sufficient for the current synchronous document-state bridge, but it cannot reliably publish diagnostics or other unsolicited notifications while stdin is idle. Sigils JSON-RPC already owns framing and outbound notification primitives; any asynchronous stdio support should be a generic Sigils/runtime improvement. Chronos may be used only through the Sigils Chronos thread, never as a separate language backend scheduler.
+Sigils' `jrStdio.pollJsonRpcStdio` blocks while waiting for the next complete
+frame. Phase 3 places input reading on a dedicated transport actor so the home
+scheduler can publish responses and diagnostics while stdin is idle. Sigils
+JSON-RPC retains framing and outbound notification ownership. Chronos may be
+used only through the Sigils Chronos thread, never as a separate language
+backend scheduler.
 
 ## Target architecture
 
@@ -245,7 +278,7 @@ exclusively framed JSON-RPC bytes.
 
 Implemented in the current tree. `src/nimdex/compiler.nim` probes and records
 the configured Nim compiler, requires `--genBif:on`, and runs a controlled
-artifact-only command in a project/configuration/source-specific cache. The
+artifact-only command in a compiler/configuration/head-specific cache. The
 compiler worker runs on a dedicated Sigils thread so blocking process I/O does
 not occupy a language-pool worker; the generated BIFs are then loaded and
 indexed through the existing parallel Sigils worker-pool path.
@@ -262,26 +295,372 @@ The refresh result owns:
 
 The LSP server discovers explicit `initializationOptions` values for
 `compilerPath`/`compiler`, `entryPoints`, `importPaths`, `nimArguments`, and
-`cacheRoot`, and conservatively discovers `main.nim` or a project-named entry
-point when a normal workspace omitted them. A configured compiler that is
+`cacheRoot`. Phase 4b extends discovery to Nimble source directories, declared
+binaries, package modules, and default test heads. A configured compiler that is
 missing or lacks `--genBif:on` fails initialization with a prerequisite error;
 Nimdex does not silently fall back to `nimsuggest`, `deps/langserver/`, or the
 old language shim.
 
-Refreshes carry document/configuration/compiler stamps. A cancelled,
-superseded, failed, or partially indexed build never replaces the last valid
-snapshot. Matching compiler output is published with LSP
+Refreshes carry document/configuration/compiler stamps. Phase 4c publishes
+independently validated head snapshots and isolates failed contexts. Cancelled
+or superseded work cannot publish over newer source generations. Matching compiler output is published with LSP
 `textDocument/publishDiagnostics` notifications, and a matching successful
 refresh replaces the diagnostic set (including clearing old diagnostics).
 Full synchronization remains an overlay only: compiler refreshes read
 workspace files, so changed unsaved buffers continue to suppress stale
 position-sensitive results until Phase 5's overlay strategy exists.
 
+### Phase 4b: project discovery, actual heads, and incremental indexing
+
+Starting point (2026-09-24): discovery only recognized root
+`main.nim`/directory-named modules, refresh hashed every source in `deps/`, all
+heads wrote into one cache (overwriting context-dependent BIFs), and the
+indexer built a location table for every token. This phase addressed those
+issues.
+
+Implemented and verified with `deps/nim-devel/bin/nim`:
+
+- Discover literal Nimble `srcDir` and `bin` metadata without executing package
+  tasks. Find package/main modules under that source directory and default
+  `tests/t*.nim` heads. Explicit entry points remain authoritative. Report
+  unsupported dynamic metadata so clients can configure it explicitly.
+- Read resolved `import` suffixes and `include` paths from BIF metadata. Build
+  forward/reverse module graphs and map each source/include to all actual
+  compiler heads that reach it. A head remains a head even when another head
+  imports it; graph indegree alone cannot identify compilation contexts.
+- Keep compiler caches separate by compiler/configuration/head. Share extracted
+  records only for identical BIF content; the same path/suffix can have different
+  semantics under test config, defines, or `isMainModule`.
+- Keep successful per-head analyses in the LSP session. Validate source/include
+  and configuration fingerprints before reuse; rebuild affected heads, preserve
+  diagnostics for reused heads. Phase 4c extends publication to individual
+  complete head analyses as they become ready.
+- Avoid recursively hashing unrelated dependency trees. Reduce BIF location
+  storage to declaration positions. Expose heads, graph edges, and refresh reuse
+  counts in `nimdex/debug`.
+- Share immutable Nim-owned declaration payloads across heads and actors using
+  atomic ARC. Binny cursors/pools still stay inside one extraction worker.
+- Canonicalize symlinked ancestors so compiler source paths and client URIs
+  identify the same graph nodes, including files created after opening.
+- Refresh on saves and watched-file events. Separate disk-generation stamps
+  from document-buffer stamps so opening/typing during initial compilation
+  cannot discard otherwise valid disk analysis.
+- Test custom `srcDir`, package/directory name differences, test discovery,
+  shared imports, includes, conditional imports, head variants, warm reuse,
+  configuration/source invalidation, and failed refresh preservation.
+
+The local compiler revision `8f1a8f6` hashes absolute module paths for suffixes
+(`compiler/icmodnames.nim`), emits resolved import suffixes and include paths
+(`compiler/ast2nif.nim`), and preserves byte-identical BIF mtimes. Neither a
+matching suffix nor a matching filename proves configuration compatibility.
+This phase reuses owned analyses; sharing frontend compilation across heads
+through `nim ic` requires separate compatibility work. Arbitrary compile-time
+file reads and unsaved-buffer overlays remain follow-up work. Phase 4c also
+invalidates persisted analyses when the compiler environment changes.
+Unknown client-reported disk changes conservatively invalidate all heads.
+
+Verification: real compiler fixtures cover distinct src/test configurations,
+`isMainModule` variants, resolved conditional imports, includes, and source
+changes. A four-head fixture reuses all four heads on a warm refresh (zero
+compiler commands and zero BIF loads), rebuilds one head for a private
+dependency edit, and rebuilds three for a shared include edit. LSP tests cover
+save notifications, new/deleted test heads, graph introspection, deduplicated
+document symbols, and preservation of the last valid snapshot after failure.
+The final end-to-end stdio run on this repository (13 heads)
+parsed 608 BIF artifacts and reused 1,215: approximately 48.3 seconds cold and
+0.49 seconds on an unchanged save, with zero warm compiler commands/BIF loads.
+These are local observations, not timing assertions. The same run verifies
+opening a document while initial compilation is still running.
+All 12 test files pass with `atlas-run tests --nim=deps/nim-devel/bin/nim`,
+and the release CLI builds with the same compiler.
+
+Large graph reports exceeded Sigils' generic 1 MiB frame limit. Nimdex now
+uses 16 MiB consistently in the server and CLI, and converts oversized outbound
+responses into correlated errors before framing. CI now provisions the pinned
+BIF-capable compiler and uses `atlas-run tests` with that compiler; its hosted
+bootstrap still needs validation by GitHub Actions.
+
+### Phase 4c: faster startup and shared frontend work
+
+Priorities after project graph tracking:
+
+1. Schedule the active document's actual head first, load other heads on
+   demand/background, and publish successful head analyses progressively.
+   Preserve healthy head results when a different head fails.
+2. Persist validated graph and semantic records across server restarts. Keep
+   compiler/configuration/source fingerprints and select a preferred actual
+   head for each document, with an explicit override for ambiguous contexts.
+3. Integrate per-head incremental compilation through the existing `nim track`
+   frontend, then validate sharing its artifacts across compatible heads.
+   Evaluate synthetic import batches separately; they change head semantics.
+
+Items 1 and 2 are implemented in the current tree:
+
+- Compiler refreshes emit complete per-head results. Failed heads no longer
+  abort unrelated work. Only independently validated contexts are exposed;
+  stale failed contexts are unavailable instead of being merged with healthy
+  results. Source/configuration/compiler stamps still reject obsolete work.
+- Document opens and symbol/hover requests prioritize pending heads through an
+  atomic index into the refresh's fixed head list. A running head finishes
+  normally. Known graph ownership selects the context; before discovery,
+  the nearest head directory is only a scheduling hint. Other heads load in
+  the background. Workspace queries and CLI checks wait for all heads.
+- Versioned per-head manifests persist input fingerprints, diagnostics, and
+  references to content-addressed owned module records. Atomic writes publish
+  manifests after all records. Restoring rebuilds lookup tables and graph edges
+  without invoking Nim or parsing BIFs. Damaged, missing, or incompatible
+  records are cache misses. Live sessions retain their existing memory reuse.
+- Validation includes compiler executable metadata, configuration/arguments,
+  resolved sources/includes, source inventory, and an environment digest (no
+  environment values are persisted). Track missing user/system and per-head
+  `.nimcfg`/`.nim.cfg` files too, so creating a config invalidates reuse.
+- `initializationOptions.preferredHeads` maps source paths to actual heads.
+  A selected failed context is unavailable; it does not fall back to a different
+  configuration. Default selection is the file's own head or its first resolved
+  owner in path order. Debug output exposes choices, progress, and disk restores.
+
+Verification covers persistent graph/symbol round trips, absent BIF files,
+source invalidation, corrupt records/manifests, schema mismatches, dynamically
+reprioritized heads, failure isolation, and explicitly selected test contexts.
+Cache eviction and tracking arbitrary compile-time file reads remain open.
+
+Real stdio measurements on this repository with 14 heads and the local release
+daemon (2026-09-25):
+
+| Run | First document symbols | All heads ready | Compiler calls | BIF loads |
+| --- | ---: | ---: | ---: | ---: |
+| Empty cache | 5.35 s | 53.15 s | 14 | 633 |
+| New daemon, persisted cache | 0.78 s | 4.36 s | 0 | 0 |
+| Unchanged save in that daemon | — | 0.54 s | 0 | 0 |
+
+These are local observations, not timing assertions. The 14-head run adds the
+cache test to the earlier 13-head baseline. A separate stdio probe deliberately
+held a background compiler head waiting: the selected head returned symbols
+before that head was released, and remained available after the released head
+failed. An interactive CLI/stdio regression also checks healthy queries and
+failed-head diagnostics without disconnecting the client early.
+All 13 test files pass with `atlas-run tests --nim=deps/nim-devel/bin/nim`,
+and the release daemon builds with that compiler.
+
+#### Incremental frontend: first implement per-head reuse
+
+The existing local compiler provides a frontend-only entry through `nim track`:
+
+```sh
+deps/nim-devel/bin/nim track --nimcache:/path/to/head-cache tests/tfoo.nim
+```
+
+Without a definition/usages query, it still builds semantic artifacts and then
+returns. `compiler/main.nim` invokes `commandIc(conf, frontendOnly = true)`;
+`compiler/deps.nim` runs `nifler` and per-module `nim m` jobs through `nifmake`.
+The backend is skipped, so this produces no C, native compilation, or linking.
+`compiler/idetools.nim` returns without scanning for an IDE query when none was
+requested. Nimdex can continue loading the resulting `.s.bif` files through
+its existing safe Binny adapter and publishing owned semantic snapshots.
+
+Manual probe with the local compiler revision `8f1a8f6` (2026-09-25): a head
+imported one shared module containing an ordinary procedure. The head called
+it inside `when isMainModule`. All three invocations succeeded without an IDE
+query and produced zero C files:
+
+| Operation | Elapsed | Semantic BIFs rewritten |
+| --- | ---: | ---: |
+| Empty compiler cache | 2.073 s | 28, including system modules |
+| Unchanged invocation | 0.032 s | 0 |
+| Shared procedure body edit | 0.091 s | 1, the shared module |
+
+These are small-fixture observations, not whole-project benchmarks or proof of
+semantic compatibility. BIF modification times established which artifacts
+were rewritten; the full semantic compatibility suite is still required.
+
+Implementation checklist (Nimdex scope):
+
+- [ ] Add an explicit frontend selection and capability probe for `track` plus
+  compatible `nifler`/`nifmake`. Keep the current
+  `c --compileOnly:on --genBif:on` path available; record the selected mode in
+  cache identity and debug output. Missing tools, missing artifacts, and
+  unsupported configurations need distinct errors from source compile errors.
+- [ ] Keep compiler state in a dedicated directory per compiler, configuration,
+  mode, and actual head. The IC driver can delete its entire cache directory
+  when `ic.version` changes, so persistent Nimdex manifests and semantic records
+  must live outside that directory.
+- [ ] Preserve compiler artifacts across refreshes in incremental mode.
+  `buildHead` currently removes old BIFs before compiling; that behavior must
+  change for this mode. Preserve the existing validated whole-head memory/disk
+  reuse so an unchanged save can still avoid invoking the compiler entirely.
+- [ ] Obtain the current resolved dependency closure after a successful build.
+  Load only its semantic artifacts and reconcile graph ownership when imports
+  change. A directory scan alone would retain orphan BIFs from earlier builds.
+  Include implicit/system dependencies, includes, and discovered macro imports.
+- [ ] Preserve active-head priority, progressive publication, diagnostics,
+  failure isolation, preferred contexts, and source/configuration stamps.
+  Verify required artifacts even after exit status zero: the driver can emit
+  build instructions without executing them when `nifmake` is unavailable.
+- [ ] Compare semantic output against the current frontend for declarations,
+  locations, includes, overloads, generics, macros, conditional imports, cycles,
+  duplicate module names, test configurations, and `isMainModule`. Treat mode
+  differences such as `nimcheck` and the current `nim m` vtable behavior as
+  compatibility gates; do not reuse records across modes by source path alone.
+- [ ] Add deterministic regressions for unchanged builds, body/interface edits,
+  compile-time body dependencies, changed/removed imports, configuration changes,
+  and recovery after failure. Assert semantic results and rebuild behavior;
+  keep elapsed timings observational.
+- [ ] Benchmark the repository's cold load, persisted restart, private edit,
+  shared body edit, and shared interface edit. Report first-document latency,
+  all-head completion, compiler/module work, BIF loads, and cache size separately.
+- [ ] Provision and verify the matching compiler companions in CI before
+  enabling this mode by default.
+
+Completion criterion: the existing language and compiler fixtures pass using
+the incremental frontend; edits rebuild the expected module closure, removed
+imports leave no stale symbols, and no C/backend work occurs. The first useful
+integration requires no compiler embedding or replacement LSP query engine.
+Compiler fixes should address demonstrated compatibility failures. A dedicated
+frontend-only CLI switch would be an optional upstream improvement; bare
+`nim track` already provides the tested entry point.
+
+#### Then validate compiler artifact sharing across actual heads
+
+Per-head incremental caches speed subsequent edits but can still check a shared
+dependency once for each test on a cold load. Artifact sharing between heads
+is a separate optimization from the identical-content semantic record sharing
+already implemented in Nimdex.
+
+`compiler/deps.nim:configSignatureFile` explicitly supports prefilling caches:
+its signature excludes per-build project/config-artifact paths and hashes the
+precompiled configuration without the cache-directory entry. This is useful
+supporting machinery, not proof that arbitrary heads can exchange artifacts.
+
+- [ ] Begin with separate writable head caches seeded from a validated pool of
+  compatible module artifacts. Preserve actual-head identity and keep modules
+  compiled as entry points distinct from the same modules compiled as imports.
+- [ ] Define compatibility over compiler/artifact versions, frontend mode,
+  effective configuration, defines, search paths, source/include inputs,
+  dependency identities, and relevant environment/compile-time inputs. A shared
+  path or module suffix alone is insufficient.
+- [ ] Determine the complete reusable artifact bundle: parsed and semantic
+  files, dependency metadata, interface/implementation cookies, and grouped
+  cycle outputs. Preserve the build system's validity information and prevent
+  one head's build from mutating artifacts owned by another active build.
+- [ ] Test two heads with common imports, a head imported by another head,
+  configuration differences, macros/static evaluation, and interface versus
+  implementation changes. Prove equivalence against isolated compilation and
+  measure whether the second head actually skips shared module work.
+- [ ] Rebuild in isolation when compatibility cannot be established. If the
+  current compiler lacks a required validity signal or produces incompatible
+  identities, record a focused compiler change with a reproducing fixture
+  before expanding reuse.
+
+Completion criterion: compatible tests reuse frontend work while retaining
+their own main-module semantics and diagnostics; incompatible tests remain
+isolated. Do not replace this gate with a shared writable cache for all heads.
+
+#### Alternative frontend: repair `nim check` BIF output
+
+Semantic-only analysis experiment (2026-09-25): the pinned local compiler emits
+`.s.bif` files with `nim check --genBif:on`, but the artifacts omit ordinary
+declarations and include metadata. Existing indexing/LSP tests and a new
+macro/generic fixture caught the omissions. In `compiler/pipelines.nim`,
+`processPipeline` returns `graph.emptyNode` for `SemPass` unless the command is
+`cmdM`; `--genBif` does not preserve the checked statement tree there.
+
+Keep `nim c --compileOnly:on --genBif:on` as the default until a replacement
+passes our semantic compatibility tests. This already skips native
+compilation/linking, while still generating C. The preferred next experiment
+is the existing incremental `track` frontend described above.
+
+For a future `check` mode, fix the compiler to preserve `semNode` when semantic
+serialization is requested, rebuild/pin the toolchain, and run declaration,
+include, macro/generic, and location tests. This requires compiler work; it is
+independent of the initial Nimdex-only `track` integration. `check` also defines
+`nimcheck`, which must be treated as a distinct analysis context in persistent
+cache identity. Compile-time macros and static evaluation still execute.
+
+#### Optional experiment: synthetic import batches
+
+Synthetic import experiment with the same compiler:
+
+```nim
+from tests/tfoo import nil
+from tests/tbar import nil
+```
+
+`import tests/tfoo as nil` is rejected because aliases must be identifiers.
+The valid form avoids bringing each module's members into unqualified scope;
+aliases can disambiguate duplicate module names. A shared dependency was
+checked once in the aggregate invocation. However, both imported heads saw
+`isMainModule == false`. A root aggregate also omitted `tests/config.nims`;
+placing the aggregate under `tests/` picked up that directory's configuration,
+but cannot reproduce distinct per-head configuration files.
+
+Use any future synthetic batches only for provisional background indexing,
+grouped by effective configuration and guided by the resolved import graph.
+Track batch provenance separately from actual heads and obtain a separate
+analysis for the active real head. Do not discard actual heads just because
+another head imports them. Account for import order and shared compile-time
+state, and split/fall back to individual heads on errors. Verify macros,
+generics, configuration differences, `isMainModule`, and diagnostic ownership
+before claiming equivalence or measuring a startup improvement.
+
+#### Remaining cache and project-loading work
+
+- [ ] Persist a small ownership manifest that maps source/include paths to
+  actual heads without loading every symbol record. Validate it before treating
+  ownership as authoritative; stale metadata may only suggest scheduling order.
+- [ ] Use that metadata to restore the active context first on daemon restart,
+  then load other semantic records in the background while preserving complete
+  workspace-query behavior.
+- [ ] Add a size/age policy for compiler caches and unreferenced semantic
+  records. Eviction must respect active refreshes, published manifests, and
+  shared records, with interrupted cleanup handled as a recoverable cache miss.
+- [ ] Investigate compiler-reported dependencies for arbitrary compile-time
+  file reads and import-resolution changes outside the workspace. The current
+  source/configuration/environment fingerprints do not cover every external
+  file read by macros, `staticRead`, or static evaluation.
+
 ### Phase 5: unsaved-buffer analysis and richer features
 
-Define a compiler overlay strategy that preserves source paths, imports, configuration, and generated-artifact mapping without writing client text over workspace files. Full synchronization alone is not an overlay.
+#### Compiler cancellation and unsaved buffers
 
-Until the overlay exists, suppress position-sensitive semantic results for changed buffers or mark them explicitly as stale/unavailable. After overlay analysis is reliable, expand to references, document highlights, completion, richer hover signatures, and other features based on verified semantic records.
+- [ ] Replace the blocking compiler wait with cancellable process supervision.
+  Terminate and reap the driver and its `nifmake`/`nim m` children when work is
+  superseded or the server shuts down. Keep stdout/stderr draining and settle
+  each admitted request once; interrupted builds must not publish valid-cache
+  manifests. Test cancellation during a real child process and shutdown races.
+- [ ] Define a compiler overlay strategy that preserves original source paths,
+  import resolution, configuration discovery, includes, and artifact mapping
+  without writing client text over workspace files. Evaluate existing compiler
+  support before deciding whether a compiler extension is needed.
+- [ ] Key overlay analysis by document revisions/content and the selected
+  actual head. Keep overlay artifacts separate from disk-only cache entries;
+  preserve generation checks across edits, saves, closes, and out-of-order
+  completion. Debounce/coalesce edits to bound compiler work.
+- [ ] Verify imports and includes with multiple dirty buffers, diagnostics and
+  Unicode/CRLF positions, and save/revert behavior before serving semantic
+  results for unsaved text.
+
+Full document synchronization alone is not compiler overlay support. Until
+overlay analysis exists, keep changed-buffer semantic positions unavailable.
+
+#### Occurrences, definitions, and references
+
+- [ ] Extend safe BIF extraction with owned symbol occurrence records and
+  matching declaration identities, retaining source locations and actual-head
+  context. The compiler's `idetools` traversal can provide compatibility
+  evidence; Nimdex queries continue through its safe Binny boundary.
+- [ ] Implement `textDocument/definition` first, including imports, overloads,
+  locals, generics, includes, and generated-code locations where mapping is
+  proven. Verify source token ranges and negotiated position encoding.
+- [ ] Add `textDocument/references` after use-to-declaration identity is proven.
+  Deduplicate shared-module occurrences within the selected context and define
+  workspace completeness while heads are pending or failed. Do not merge
+  incompatible head variants into one symbol identity.
+- [ ] Advertise each capability only after real compiler fixtures and LSP
+  integration tests pass. Initial disk-backed occurrence work can proceed
+  before overlays, with the existing stale-buffer checks retained.
+
+Document highlights, completion, richer hover signatures, rename, and other
+features remain follow-ups requiring their own verified scope/range semantics.
 
 ## API and ownership rules
 
@@ -296,7 +675,9 @@ Use named Nimdex value objects such as `DocumentSnapshot`, `AnalysisStamp`, `Sym
 
 Use `sink` only where ownership is intentionally transferred, and verify that Sigils message construction does not retain aliases into worker-owned data. Expose copied strings and sequences at the language boundary. Keep LSP JSON conversion at the outer layer.
 
-Document changes must be version-ordered. The current parser ignores the `range` field and treats the last change text as a complete replacement; until ranged edits are implemented, reject ranged changes instead of silently corrupting the document state.
+Document changes must be version-ordered. The current implementation accepts
+full document synchronization and rejects ranged changes. Preserve that
+validation until incremental text synchronization is explicitly implemented.
 
 ## Test and verification plan
 
@@ -330,8 +711,10 @@ The Binny integration is ready for the first production-facing LSP feature when:
 
 - Which supported Nim compiler/devel revision is the minimum beyond the
   project-local `deps/nim-devel` baseline for reproducible BIF generation?
-- Should safe BIF source-path discovery be a Nimdex implementation or an upstream Binny helper?
-- Which BIF tags and compiler metadata are stable enough to form the first semantic schema?
-- What is the exact responsive stdio design in Sigils, and where should the Sigils Chronos thread participate?
+- Can the compiler's incremental frontend safely share compilation across
+  heads while preserving configuration and main-module semantics?
+- How should persistent analysis caching validate arbitrary compile-time file
+  reads and changed import resolution outside the workspace beyond the current
+  source/configuration fingerprints and environment digest?
 - How will compiler overlays preserve import/configuration semantics for unsaved buffers?
 - Which LSP capabilities can be backed by declaration positions before exact ranges and reference resolution are available?

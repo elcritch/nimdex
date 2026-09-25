@@ -4,6 +4,7 @@ import binny/bif
 import nimdex/lsp
 import nimdex/documents
 import sigils/rpcs/json/jrFraming
+import sigils/rpcs/jsonrpc
 
 proc framed(messages: openArray[string]): string =
   for message in messages:
@@ -19,8 +20,20 @@ proc readResponses(path: string): seq[JsonNode] =
     result.add(parseJson(frame.get()))
 
 proc runServer(
-    messages: openArray[string], artifactRoots: seq[string] = @[]
+    messages: openArray[string], artifactRoots: seq[string] = @[], sequential = false
 ): tuple[status: int, responses: seq[JsonNode]] =
+  if sequential:
+    # These query assertions model a client waiting for each response before
+    # editing. A prefilled stdio stream can legitimately supersede old queries.
+    let server = newNimdexLspServer(artifactRoots = artifactRoots)
+    defer:
+      server.close()
+    for message in messages:
+      let response = server.jsonRpcAdapter().handleJsonRpc(message)
+      if response.isSome():
+        result.responses.add(parseJson(response.get()))
+    result.status = server.exitStatus()
+    return
   let suffix = $getCurrentProcessId()
   let
     inputPath = getTempDir() / ("nimdex-lsp-input-" & suffix & ".json")
@@ -187,7 +200,7 @@ suite "nimdex LSP server":
     messages.add(rpcRequest(7, "shutdown", newJObject()))
     messages.add(rpcNotification("exit", newJObject()))
 
-    let run = runServer(messages, @[root])
+    let run = runServer(messages, @[root], sequential = true)
     check run.status == LspExitSuccess
     check run.responses.len == 7
     check run.responses[0]["result"]["capabilities"]["documentSymbolProvider"].getBool()
@@ -234,10 +247,15 @@ suite "nimdex LSP server":
 
     check run.status == LspExitSuccess
     check run.responses.len == 4
-    check run.responses[1]["id"].getInt() == 2
-    check run.responses[1]["error"]["code"].getInt() == LspAnalysisUnavailable
-    check run.responses[2]["id"].getInt() == 3
-    check run.responses[2]["error"]["code"].getInt() == -32602
+    # Independent requests can finish out of order on the language worker.
+    for response in run.responses:
+      case response["id"].getInt()
+      of 2:
+        check response["error"]["code"].getInt() == LspAnalysisUnavailable
+      of 3:
+        check response["error"]["code"].getInt() == -32602
+      else:
+        discard
     check run.responses[3]["id"].getInt() == 4
 
   test "rejects language requests before initialization":

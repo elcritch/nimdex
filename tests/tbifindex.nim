@@ -36,7 +36,8 @@ proc writeSampleBif(path, sourcePath: string, includeSourcePath = true) =
   buffer.store(path)
 
 proc makeArtifactRoot(): string =
-  result = getTempDir() / ("nimdex-bifindex-" & $getCurrentProcessId())
+  result =
+    normalizeDocumentPath(getTempDir() / ("nimdex-bifindex-" & $getCurrentProcessId()))
   if dirExists(result):
     removeDir(result)
   createDir(result)

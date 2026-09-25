@@ -7,6 +7,7 @@ import sigils/rpcs/json/jrFraming
 
 import ./documents
 import ./lsp
+import ./projectlayout
 
 const NimdexVersion = "0.1.0"
 
@@ -388,7 +389,7 @@ proc newRpcSession(root, daemonPath: string): RpcSession =
       args = ["daemon"],
       options = {poUsePath, poInteractive},
     ),
-    parser: initJsonRpcFrameParser(),
+    parser: initJsonRpcFrameParser(DefaultNimdexMessageSize),
   )
   result.input = result.process.inputStream()
   result.output = result.process.outputStream()
@@ -449,6 +450,26 @@ proc runDaemonRequest(
       return
 
     session.send(rpcNotification("initialized", newJObject()))
+    if options.command in {cliCheck, cliDebug}:
+      # Project-wide commands need the final outcome of every discovered head.
+      # Document queries in an editor can already use completed heads.
+      while true:
+        session.send(rpcRequest(requestId, LspDebugMethod, %*{"summaryOnly": true}))
+        let status = session.readResponse(requestId, diagnosticOutput)
+        if status.error.len > 0:
+          result.error = status.error
+          return
+        let statusError = responseError(status.response)
+        if statusError.len > 0:
+          result.error = statusError
+          return
+        let report = status.response["result"]
+        if not report["semantic"]["loading"].getBool():
+          if report["refresh"]["error"].getStr().len > 0:
+            result.error = report["refresh"]["error"].getStr()
+            return
+          break
+        sleep(50)
     session.send(rpcRequest(requestId, methodName, params))
     let requested = session.readResponse(requestId, diagnosticOutput)
     if requested.error.len > 0:
@@ -537,13 +558,9 @@ proc projectEntryPoint(options: CliOptions, root: string): string =
     if fileExists(candidate):
       return normalizeDocumentPath(candidate)
 
-  let mainPath = root / "main.nim"
-  if fileExists(mainPath):
-    return normalizeDocumentPath(mainPath)
-
-  let namedPath = root / (root.lastPathPart & ".nim")
-  if fileExists(namedPath):
-    return normalizeDocumentPath(namedPath)
+  let layout = discoverProjectLayout(root)
+  if layout.heads.len > 0:
+    return layout.heads[0]
 
 proc runProjectCommand(
     options: CliOptions, output, errorOutput: File, daemonPath: string

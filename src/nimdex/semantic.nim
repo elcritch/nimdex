@@ -1,14 +1,18 @@
 ## Owned semantic records and lookup tables independent of Binny and LSP JSON.
 
-import std/[strutils, tables]
+import std/[sets, strutils, tables]
 
 import chronicles
+import ./modulegraph
+
+export modulegraph
 
 type
   AnalysisStamp* = object ## Identity of the source/configuration used by analysis.
     valid*: bool
     projectId*: string
     documentGeneration*: uint64
+    sourceGeneration*: uint64
     configurationGeneration*: uint64
     configurationFingerprint*: uint64
     compilerFingerprint*: uint64
@@ -36,7 +40,16 @@ type
     visibility*: SemanticVisibility
     location*: SourceLocation
 
+  ModuleSymbols = ref object
+    ## Immutable after extraction; Nim's atomic ARC owns sharing across actors.
+    values: seq[SymbolInfo]
+
   ModuleSnapshot* = object
+    moduleId*: string
+    artifactHash*: string
+    imports*: seq[string]
+    includes*: seq[string]
+    headFiles*: seq[string]
     artifactPath*: string
     sourcePath*: string
     sourceUri*: string
@@ -49,7 +62,7 @@ type
     filenameCount*: int
     sourceFiles*: seq[string]
     tags*: seq[string]
-    symbols*: seq[SymbolInfo]
+    symbolData: ModuleSymbols
 
   AnalysisFailureKind* = enum
     afIo
@@ -82,8 +95,19 @@ type
     analysisStamp*: AnalysisStamp
     modules*: seq[ModuleSnapshot]
     failures*: seq[AnalysisFailure]
+    graph*: ModuleGraph
+    preferredHeads*: Table[string, string] ## Explicit source-to-head context choices.
     nameIndex: Table[string, seq[SymbolRef]]
     locationIndex: Table[string, seq[SymbolRef]]
+    contentIndex: Table[string, int]
+
+proc symbols*(module: ModuleSnapshot): lent seq[SymbolInfo] =
+  ## Read the immutable declaration records shared by identical BIF modules.
+  module.symbolData.values
+
+proc setSymbols*(module: var ModuleSnapshot, symbols: sink seq[SymbolInfo]) =
+  ## Replace the payload without changing records held by earlier snapshots.
+  module.symbolData = ModuleSymbols(values: symbols)
 
 proc initSemanticSnapshot*(
     projectId: string,
@@ -118,12 +142,21 @@ proc addLocationRef(
   snapshot.locationIndex.mgetOrPut(locationKey(location), @[]).add(reference)
 
 proc addModule*(snapshot: var SemanticSnapshot, module: sink ModuleSnapshot) =
+  let contentKey = module.artifactHash & "\0" & $module.sourceTextHash
+  if module.artifactHash.len > 0 and contentKey in snapshot.contentIndex:
+    let index = snapshot.contentIndex[contentKey]
+    for head in module.headFiles:
+      if head notin snapshot.modules[index].headFiles:
+        snapshot.modules[index].headFiles.add(head)
+    return
   debug "Adding module to semantic index",
     artifactPath = module.artifactPath,
     sourcePath = module.sourcePath,
     symbolCount = module.symbols.len,
     tokenCount = module.tokenCount
   let moduleIndex = snapshot.modules.len
+  if module.artifactHash.len > 0:
+    snapshot.contentIndex[contentKey] = moduleIndex
   snapshot.modules.add(module)
   for symbolIndex, symbol in snapshot.modules[moduleIndex].symbols:
     let reference = SymbolRef(moduleIndex: moduleIndex, symbolIndex: symbolIndex)
@@ -157,21 +190,52 @@ proc findSymbols*(snapshot: SemanticSnapshot, name: string): seq[SymbolInfo] =
 
 proc symbolsInDocument*(snapshot: SemanticSnapshot, uri: string): seq[SymbolInfo] =
   ## Return all owned symbols whose verified location belongs to one document.
+  var seen = initHashSet[string]()
   for module in snapshot.modules:
     if module.sourceUri != uri:
       continue
     for symbol in module.symbols:
-      if symbol.location.valid and symbol.location.uri == uri:
+      if symbol.location.valid and symbol.location.uri == uri and
+          not seen.containsOrIncl(symbol.key):
         result.add(symbol)
 
 proc symbolsMatching*(snapshot: SemanticSnapshot, query: string): seq[SymbolInfo] =
   ## Return symbols whose display or qualified name contains `query`.
   let needle = query.toLowerAscii()
+  var seen = initHashSet[string]()
   for module in snapshot.modules:
     for symbol in module.symbols:
       if needle.len == 0 or symbol.name.toLowerAscii().contains(needle) or
           symbol.qualifiedName.toLowerAscii().contains(needle):
-        result.add(symbol)
+        if not seen.containsOrIncl(symbol.key):
+          result.add(symbol)
+
+proc recordHead*(snapshot: var SemanticSnapshot, head: string) =
+  ## Resolve suffixes within this compiler context before combining snapshots.
+  var paths = initTable[string, string]()
+  for module in snapshot.modules:
+    paths[module.moduleId] = module.sourcePath
+  var dependencies: seq[ModuleDependencies]
+  for module in snapshot.modules.mitems:
+    module.headFiles = @[head]
+    var entry =
+      ModuleDependencies(sourcePath: module.sourcePath, includes: module.includes)
+    for suffix in module.imports:
+      if suffix in paths:
+        entry.imports.add(paths[suffix])
+      else:
+        entry.unresolvedImports.add(suffix)
+    dependencies.add(entry)
+  snapshot.graph.addHead(head, dependencies, compiledClosure = true)
+
+proc mergeHead*(snapshot: var SemanticSnapshot, headSnapshot: SemanticSnapshot) =
+  for head in headSnapshot.graph.heads:
+    var dependencies: seq[ModuleDependencies]
+    for entry in headSnapshot.graph.modules.values:
+      dependencies.add(entry)
+    snapshot.graph.addHead(head, dependencies, compiledClosure = true)
+  for module in headSnapshot.modules:
+    snapshot.addModule(module)
 
 proc symbolsAt*(
     snapshot: SemanticSnapshot, uri: string, line, column: int32

@@ -4,6 +4,19 @@ import nimdex/documents
 import nimdex/workspace
 
 suite "Nimdex document and workspace values":
+  test "keeps compiler and client paths identical through symlinked ancestors":
+    when not defined(windows):
+      let root =
+        normalizeDocumentPath(getTempDir() / ("nimdex-paths-" & $getCurrentProcessId()))
+      createDir(root / "real")
+      defer:
+        removeDir(root)
+      createSymlink(root / "real", root / "alias")
+      let absent = normalizeDocumentPath(root / "alias/new.nim")
+      check absent == root / "real/new.nim"
+      writeFile(root / "real/new.nim", "discard\n")
+      check normalizeDocumentPath(root / "alias/new.nim") == absent
+      check documentUriFromPath(root / "alias/new.nim") == documentUriFromPath(absent)
   test "normalizes file URIs and paths":
     let path =
       normalizeDocumentPath(getTempDir() / "nimdex phase 1" / "source file.nim")

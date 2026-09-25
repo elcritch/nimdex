@@ -3,6 +3,9 @@
 import std/[os, strutils]
 
 import ./documents
+import ./projectlayout
+
+export projectlayout
 
 type Workspace* = object
   rootUri*: string
@@ -10,6 +13,7 @@ type Workspace* = object
   projectId*: string
   entryPoints*: seq[string]
   importPaths*: seq[string]
+  automaticImportPaths*: bool
   nimArguments*: seq[string]
   artifactRoots*: seq[string]
   compilerPath*: string
@@ -48,6 +52,9 @@ proc initWorkspace*(
   result.projectId = if result.rootPath.len > 0: result.rootPath else: result.rootUri
   result.entryPoints = normalizedPaths(entryPoints)
   result.importPaths = normalizedPaths(importPaths)
+  if importPaths.len == 0:
+    result.automaticImportPaths = true
+    result.importPaths = discoverProjectLayout(result.rootPath).sourceDirs
   result.nimArguments = nimArguments
   result.artifactRoots = normalizedPaths(artifactRoots)
   result.compilerPath = compilerPath
