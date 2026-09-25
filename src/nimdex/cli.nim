@@ -7,6 +7,7 @@ import sigils/rpcs/json/jrFraming
 
 import ./cliipc
 import ./documents
+import ./logsummary
 import ./lsp
 import ./projectlayout
 import ./workspace
@@ -810,13 +811,16 @@ proc runProjectCommand(
 
   info "Running Nimdex CLI command",
     command = $options.command,
-    projectRoot = root.path,
+    workingDir = root.path,
     compilerPath = options.compilerPath,
     cacheRoot = options.cacheRoot,
-    entryPoints = options.entryPoints,
-    importPaths = options.importPaths,
-    artifactRoots = options.artifactRoots,
-    query = options.query
+    configuredHeads = samplePaths(options.entryPoints),
+    configuredHeadCount = options.entryPoints.len,
+    importPaths = samplePaths(options.importPaths),
+    importPathCount = options.importPaths.len,
+    bifs = samplePaths(options.artifactRoots),
+    bifRootCount = options.artifactRoots.len,
+    query = logText(options.query, 80)
 
   let projectQuery = options.projectRequest(root.path)
   let reply =

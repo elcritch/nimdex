@@ -12,6 +12,7 @@ import ./documents
 import ./compilerinputs
 import ./headcache
 import ./incremental
+import ./logsummary
 import ./semantic
 import ./workspace
 
@@ -191,7 +192,8 @@ proc runExternalCommand(
   debug "Running Nim command",
     compilerPath = executable,
     workingDirectory = workingDir,
-    command = command,
+    command = logText(command, 300),
+    commandBytes = command.len,
     stdoutPath = stdoutPath,
     stderrPath = stderrPath
 
@@ -301,7 +303,7 @@ proc probeCompiler*(path = ""): CompilerCapabilities =
     if result.available and result.supportsGenBif:
       info "Nim compiler is ready",
         compilerPath = result.compilerPath,
-        version = result.version,
+        version = logFirstLine(result.version, 80),
         revision = result.revision,
         supportsGenBif = result.supportsGenBif
     else:
@@ -569,7 +571,10 @@ proc buildHead(
   let arguments = request.compilerArguments(compilerCache, entryPoint)
   result.command = commandLine(request.capabilities.compilerPath, arguments)
   let compileStarted = getTime()
-  info "Compiling Nim head", entryPoint = entryPoint, cachePath = cachePath
+  info "Compiling Nim head",
+    workingDir = request.workspace.rootPath,
+    entryPoint = entryPoint,
+    cacheRunId = cachePath.extractFilename()
   let process = runExternalCommand(
     request.capabilities.compilerPath, arguments, request.workspace.rootPath, cachePath,
     request.cancellation,
@@ -719,11 +724,12 @@ proc runCompilerRefresh*(
 
   let entryPoints = request.workspace.discoverCompilerEntryPoints()
   info "Preparing compiler-backed analysis",
-    projectId = request.workspace.projectId,
-    workspaceRoot = request.workspace.rootPath,
+    workingDir = request.workspace.rootPath,
     compilerPath = result.compiler.compilerPath,
-    entryPoints = entryPoints,
-    importPaths = request.workspace.importPaths,
+    heads = samplePaths(entryPoints),
+    headCount = entryPoints.len,
+    importPaths = samplePaths(request.workspace.importPaths),
+    importPathCount = request.workspace.importPaths.len,
     cacheRoot = request.workspace.cacheRoot,
     nimArgumentCount = request.workspace.nimArguments.len
   if entryPoints.len == 0:
@@ -916,11 +922,13 @@ proc runCompilerRefresh*(
   result.ok = result.failedHeads.len == 0
   info "Compiler-backed analysis completed",
     projectId = request.workspace.projectId,
+    cacheContextId = result.cachePath.extractFilename(),
     moduleCount = result.snapshot.moduleCount(),
     symbolCount = result.snapshot.symbolCount(),
     compiledHeads = result.compiledHeads,
     reusedHeads = result.reusedHeads,
     restoredHeads = result.restoredHeads,
-    failedHeads = result.failedHeads,
+    failedHeads = samplePaths(result.failedHeads),
+    failedHeadCount = result.failedHeads.len,
     loadedArtifacts = result.loadedArtifacts,
     reusedArtifacts = result.reusedArtifacts

@@ -10,6 +10,7 @@ import ./workerlife
 
 import ./binnycompat
 import ./documents
+import ./logsummary
 import ./semantic
 import ./workspace
 
@@ -60,14 +61,14 @@ proc indexCompleted(worker: BifLoadWorker, item: BifIndexResult) {.signal.}
 
 proc indexArtifact(worker: BifLoadWorker) {.slot.} =
   var indexed: BifIndexResult
-  debug "Indexing BIF artifact", artifactPath = worker.artifactPath
+  trace "Indexing BIF artifact", artifactPath = worker.artifactPath
   try:
     let report = inspectBinnyArtifact(worker.artifactPath, worker.limits)
     indexed.artifactPath = report.path
     if report.isReady():
       indexed.ready = true
       indexed.module = moduleFromReport(report, worker.projectId)
-      debug "Indexed BIF module",
+      trace "Indexed BIF module",
         artifactPath = indexed.module.artifactPath,
         sourcePath = indexed.module.sourcePath,
         symbolCount = indexed.module.symbols.len,
@@ -306,12 +307,17 @@ proc buildBifIndexCached*(
   )
   let roots = if artifactRoots.len > 0: artifactRoots else: workspace.artifactRoots
   info "Discovering BIF artifacts",
-    projectId = workspace.projectId,
-    artifactRoots = roots,
+    workingDir = workspace.rootPath,
+    cacheRunId = cacheRunId(workspace.cacheRoot, roots),
+    bifs = samplePaths(roots),
+    total = roots.len,
     maxArtifacts = options.maxArtifacts
   let artifacts = discoverBifArtifacts(roots)
   debug "Discovered BIF artifacts",
-    artifactCount = artifacts.len, artifactPaths = artifacts
+    workingDir = workspace.rootPath,
+    cacheRunId = cacheRunId(workspace.cacheRoot, artifacts),
+    bifs = samplePaths(artifacts),
+    total = artifacts.len
   if options.maxArtifacts >= 0 and artifacts.len > options.maxArtifacts:
     warn "BIF artifact limit exceeded",
       artifactCount = artifacts.len, maxArtifacts = options.maxArtifacts
@@ -381,6 +387,7 @@ proc buildBifIndexCached*(
     result.addModule(item.module)
   info "Completed BIF indexing",
     projectId = workspace.projectId,
+    cacheRunId = cacheRunId(workspace.cacheRoot, roots),
     discoveredArtifacts = artifacts.len,
     indexedArtifacts = selectedArtifacts.len,
     moduleCount = result.moduleCount(),

@@ -288,7 +288,7 @@ proc inspectBinnyArtifact*(
     path: string, limits = DefaultBinnyLoadLimits
 ): BinnyArtifactReport =
   ## Safely load and summarize one BIF without exposing Binny-owned storage.
-  debug "Opening BIF artifact",
+  trace "Opening BIF artifact",
     artifactPath = path,
     maxFileBytes = limits.maxFileBytes,
     maxTokens = limits.maxTokens,
@@ -307,7 +307,7 @@ proc inspectBinnyArtifact*(
 
   result = inspectLoadedArtifact(module, path)
   if result.status == basReady:
-    debug "Opened BIF artifact",
+    trace "Opened BIF artifact",
       artifactPath = result.path,
       sourcePath = result.sourcePath,
       tokenCount = result.tokenCount,

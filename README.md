@@ -19,8 +19,10 @@ atlas install
 
 Nimdex writes structured Chronicles logs to `stderr` so LSP/JSON-RPC output on
 `stdout` remains clean. Debug builds include debug-level details; release builds
-default to info-level summaries. Compile with
-`-d:chronicles_log_level=TRACE` to include per-symbol indexing traces.
+default to info-level summaries. BIF lists show a few filenames and a total;
+`cacheRunId` identifies their per-head cache subtree. The `debug` CLI command
+retains full paths. Compile with `-d:chronicles_log_level=TRACE` to include
+per-artifact and per-symbol indexing traces.
 
 ## Command line
 

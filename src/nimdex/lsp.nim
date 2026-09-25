@@ -13,6 +13,7 @@ import ./bifindex
 import ./compiler
 import ./documents
 import ./language
+import ./logsummary
 import ./lsptransport
 import ./workspace
 
@@ -168,9 +169,9 @@ proc symbolCount(snapshot: SemanticSnapshot): int
 proc runBifIndex(job: BifIndexJob) {.slot.} =
   var completion = BifIndexCompletion()
   info "Starting configured BIF index job",
-    projectId = job.workspace.projectId,
-    workspaceRoot = job.workspace.rootPath,
-    artifactRoots = job.artifactRoots
+    workingDir = job.workspace.rootPath,
+    bifs = samplePaths(job.artifactRoots),
+    total = job.artifactRoots.len
   try:
     completion.snapshot = buildBifIndex(job.workspace, job.artifactRoots)
     completion.ok = true
@@ -838,9 +839,9 @@ proc startSemanticIndex(server: LspServer) =
   server.semanticLoading = true
   server.semanticFailed = false
   info "Starting semantic index",
-    projectId = server.workspace.projectId,
-    workspaceRoot = server.workspace.rootPath,
-    artifactRoots = server.artifactRoots
+    workingDir = server.workspace.rootPath,
+    bifs = samplePaths(server.artifactRoots),
+    total = server.artifactRoots.len
   let thread = newSigilThread()
   var job =
     BifIndexJob(workspace: server.workspace, artifactRoots: server.artifactRoots)
@@ -1042,11 +1043,12 @@ proc startCompilerRefresh(server: LspServer) =
   server.semanticLoading = true
   server.prepareCompilerRefresh()
   info "Starting compiler refresh",
-    projectId = server.workspace.projectId,
-    workspaceRoot = server.workspace.rootPath,
+    workingDir = server.workspace.rootPath,
     compilerPath = server.compiler.compilerPath,
-    entryPoints = server.workspace.entryPoints,
-    importPaths = server.workspace.importPaths,
+    heads = samplePaths(server.refreshEntryPoints),
+    headCount = server.refreshEntryPoints.len,
+    importPaths = samplePaths(server.workspace.importPaths),
+    importPathCount = server.workspace.importPaths.len,
     cacheRoot = server.workspace.cacheRoot
   if not server.semanticReady:
     server.semanticFailed = false
@@ -1494,7 +1496,7 @@ proc submitAsyncLspRequest(
       uri = request.uri,
       version = request.version,
       textBytes = request.text.len,
-      query = request.query
+      query = logText(request.query, 80)
 
     if not server.validBufferUpdate(request):
       debug "Ignoring stale or unordered buffer notification",
@@ -1842,15 +1844,16 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
       )
     server.preferredHeads[sourcePath] = headPath
   info "Initialized Nimdex workspace",
-    rootUri = server.workspace.rootUri,
-    workspaceRoot = server.workspace.rootPath,
-    projectId = server.workspace.projectId,
+    workingDir = server.workspace.rootPath,
     compilerRequested = compilerRequested,
     compilerPath = server.workspace.compilerPath,
     cacheRoot = server.workspace.cacheRoot,
-    entryPoints = server.workspace.entryPoints,
-    importPaths = server.workspace.importPaths,
-    artifactRoots = server.workspace.artifactRoots,
+    heads = samplePaths(server.refreshEntryPoints),
+    headCount = server.refreshEntryPoints.len,
+    importPaths = samplePaths(server.workspace.importPaths),
+    importPathCount = server.workspace.importPaths.len,
+    bifs = samplePaths(server.workspace.artifactRoots),
+    bifRootCount = server.workspace.artifactRoots.len,
     nimArgumentCount = server.workspace.nimArguments.len
   if compilerRequested:
     server.compiler = probeCompiler(server.workspace.compilerPath)
@@ -1863,13 +1866,15 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
     server.compilerEnabled = true
     info "Compiler-backed analysis enabled",
       compilerPath = server.compiler.compilerPath,
-      compilerVersion = server.compiler.version,
+      compilerVersion = logFirstLine(server.compiler.version, 80),
       compilerRevision = server.compiler.revision,
       supportsGenBif = server.compiler.supportsGenBif
   else:
     server.compiler = CompilerCapabilities()
     server.compilerEnabled = false
-  debug "Resolved Nim library paths", libraryPaths = server.compilerLibraryPaths()
+  let libraryPaths = server.compilerLibraryPaths()
+  debug "Resolved Nim library paths",
+    libraryPaths = samplePaths(libraryPaths), total = libraryPaths.len
   server.semanticCapabilities = server.compilerEnabled or server.artifactRoots.len > 0
 
   server.state = lssInitializing
@@ -2206,7 +2211,10 @@ proc runNimdexLspStdio*(
   ## block in File.readChar while the home thread continues to dispatch worker
   ## completions and flush framed responses.
   info "Starting Nimdex LSP server",
-    compilerPath = compilerPath, artifactRoots = artifactRoots, workers = workers
+    compilerPath = compilerPath,
+    bifs = samplePaths(artifactRoots),
+    total = artifactRoots.len,
+    workers = workers
   let server =
     newNimdexLspServer(workers, artifactRoots, compilerPath, compilerFrontend)
   server.asynchronousSession = true

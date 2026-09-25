@@ -165,7 +165,7 @@ proc addModule*(snapshot: var SemanticSnapshot, module: sink ModuleSnapshot) =
       if head notin snapshot.modules[index].headFiles:
         snapshot.modules[index].headFiles.add(head)
     return
-  debug "Adding module to semantic index",
+  trace "Adding module to semantic index",
     artifactPath = module.artifactPath,
     sourcePath = module.sourcePath,
     symbolCount = module.symbols.len,
