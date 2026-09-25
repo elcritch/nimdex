@@ -56,12 +56,27 @@ type
     diagnosticCount: int
     diagnosticCaptureFailed: bool
 
+  CompilerLogKind = enum
+    clkNone
+    clkRunning
+    clkHead
+    clkCapture
+
   RpcErrorDrain = object
     stream: Stream
     logPath: string
     totalBytes: int
     rotations: int
     failure: string
+    progressKind: CompilerLogKind
+    progressHead: string
+    progressStatus: string
+    progressLog: string
+    progressElapsed: int
+    progressCompleted: int
+    progressTotal: int
+    progressStdoutBytes: int
+    progressStderrBytes: int
 
   RpcReadResult = object
     found: bool
@@ -440,20 +455,110 @@ proc readResponse(session: RpcSession, id: int, diagnosticOutput: File): RpcCall
       result.response = read.frame
       return
 
+proc withoutAnsi(value: string): string =
+  var index = 0
+  while index < value.len:
+    if value[index] == '\e' and index + 1 < value.len and value[index + 1] == '[':
+      index += 2
+      while index < value.len and value[index] notin {'@' .. '~'}:
+        inc index
+      if index < value.len:
+        inc index
+    else:
+      result.add(value[index])
+      inc index
+
+proc relayCompilerProgress(raw: string, context: pointer) {.nimcall, gcsafe.} =
+  ## The child uses this checkout's textblocks sink. Mirror only bounded
+  ## progress records; retain every original line in its daemon log file.
+  let state = cast[ptr RpcErrorDrain](context)
+  let line = withoutAnsi(raw).strip()
+  if line.len == 0:
+    case state.progressKind
+    of clkRunning:
+      info "Nim compiler still running",
+        entryPoint = state.progressHead,
+        elapsedSeconds = state.progressElapsed,
+        stdoutBytes = state.progressStdoutBytes,
+        stderrBytes = state.progressStderrBytes
+    of clkHead:
+      info "Nim compiler progress",
+        entryPoint = state.progressHead,
+        completedHeads = state.progressCompleted,
+        totalHeads = state.progressTotal,
+        status = state.progressStatus
+    of clkCapture:
+      info "Nim compiler output captured",
+        entryPoint = state.progressHead,
+        compileLog = state.progressLog,
+        stdoutBytes = state.progressStdoutBytes,
+        stderrBytes = state.progressStderrBytes
+    of clkNone:
+      discard
+    state.progressKind = clkNone
+    return
+  if line.startsWith("INF "):
+    if line.contains("Nim compiler still running"):
+      state.progressKind = clkRunning
+    elif line.contains("Nim compiler progress"):
+      state.progressKind = clkHead
+    elif line.contains("Nim compiler output captured"):
+      state.progressKind = clkCapture
+    else:
+      state.progressKind = clkNone
+    state.progressHead = ""
+    state.progressStatus = ""
+    state.progressLog = ""
+    state.progressElapsed = 0
+    state.progressCompleted = 0
+    state.progressTotal = 0
+    state.progressStdoutBytes = 0
+    state.progressStderrBytes = 0
+    return
+  if state.progressKind == clkNone:
+    return
+  let colon = line.find(": ")
+  if colon < 0:
+    return
+  let name = line[0 ..< colon]
+  let value = line[colon + 2 .. ^1]
+  case name
+  of "entryPoint":
+    state.progressHead = value
+  of "status":
+    state.progressStatus = value
+  of "compileLog":
+    state.progressLog = value
+  of "elapsedSeconds", "completedHeads", "totalHeads", "stdoutBytes", "stderrBytes":
+    try:
+      let number = parseInt(value)
+      case name
+      of "elapsedSeconds":
+        state.progressElapsed = number
+      of "completedHeads":
+        state.progressCompleted = number
+      of "totalHeads":
+        state.progressTotal = number
+      of "stdoutBytes":
+        state.progressStdoutBytes = number
+      of "stderrBytes":
+        state.progressStderrBytes = number
+      else:
+        discard
+    except ValueError:
+      discard
+  else:
+    discard
+
 proc drainRpcErrors(state: ptr RpcErrorDrain) {.thread.} =
-  var buffer = newString(4096)
   var capture: RollingLog
   try:
     capture = initRollingLog(state.logPath)
-    while true:
-      let bytesRead = state.stream.readData(addr buffer[0], buffer.len)
-      if bytesRead <= 0:
-        break
-      capture.write(buffer[0 ..< bytesRead])
+    state.stream.captureStream(capture, relayCompilerProgress, state)
   except CatchableError as error:
     state.failure = error.msg
     # Keep draining if capture fails so the child cannot block on a full pipe.
-    while state.stream.readData(addr buffer[0], buffer.len) > 0:
+    while state.stream.readChar() != '\0':
       discard
   finally:
     state.totalBytes = capture.totalBytes

@@ -1,6 +1,6 @@
 ## Bounded temporary logs for CLI daemon and compiler diagnostics.
 
-import std/[os, syncio]
+import std/[os, streams, syncio]
 
 const DefaultCliLogBytes* = 8 * 1024 * 1024
 
@@ -45,6 +45,32 @@ proc write*(log: var RollingLog, text: string) =
   log.file.write(retained)
   log.file.flushFile()
   log.currentBytes += retained.len
+
+type CaptureLineHandler* = proc(line: string, context: pointer) {.nimcall, gcsafe.}
+
+proc captureStream*(
+    source: Stream,
+    log: var RollingLog,
+    onLine: CaptureLineHandler = nil,
+    context: pointer = nil,
+) =
+  ## Process pipes are buffered FileStreams: a bulk read may wait until its
+  ## entire requested size arrives. Publish each complete log line promptly.
+  var pending = newStringOfCap(4096)
+  while true:
+    let character = source.readChar()
+    if character == '\0':
+      break
+    pending.add(character)
+    if character == '\n' or pending.len >= 4096:
+      log.write(pending)
+      if not onLine.isNil:
+        onLine(pending, context)
+      pending.setLen(0)
+  if pending.len > 0:
+    log.write(pending)
+    if not onLine.isNil:
+      onLine(pending, context)
 
 proc close*(log: var RollingLog) =
   if not log.file.isNil:

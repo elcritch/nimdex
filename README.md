@@ -26,13 +26,20 @@ retains full paths. Compile with `-d:chronicles_log_level=TRACE` to include
 per-artifact and per-symbol indexing traces.
 
 Compiler stdout and stderr are captured in each head's cache directory as
-`.nimdex-compiler.stdout` and `.nimdex-compiler.stderr`; an info log gives both
-paths and byte counts after a compile. The CLI captures its child daemon's
+`<head>.nim-compile.log`; an info log gives the path, byte counts, and exit
+code after a compile. The CLI captures its child daemon's
 Chronicles output and forwarded compiler diagnostics in bounded temporary
 `nimdex-cli-*.daemon.log` and `nimdex-cli-*.diagnostics.log` files. It logs the
 paths instead of printing every diagnostic. Each capture keeps at most 8 MiB
 in its current file and 8 MiB in a `.1` rotation. Editor LSP diagnostics are
 still published normally.
+The CLI relays concise compiler progress: a running heartbeat every five
+seconds, each completed head with its completed/total count, and the compile
+log path. Detailed compiler warnings stay in the per-head log.
+
+When launched from a directory containing a `.nimble` file, Nimdex parses its
+project layout at startup, before the editor sends `initialize`. It rechecks
+the layout if the package or head directories change before initialization.
 
 ## Command line
 

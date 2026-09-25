@@ -387,6 +387,11 @@ suite "Nimdex compiler refresh":
     doAssert refresh.snapshot.compilerFingerprint == capabilities.fingerprint
     doAssert refresh.snapshot.sourceFingerprint != 0
     doAssert refresh.stamp.sourceFingerprint == refresh.snapshot.sourceFingerprint
+    let compileLog =
+      refresh.cachePath / $stableTextHash(FixtureMain) / "main.nim-compile.log"
+    check fileExists(compileLog)
+    check readFile(compileLog).contains("Command:")
+    check not fileExists(compileLog.parentDir / ".nimdex-compiler.stderr")
 
   test "returns compiler diagnostics without a partial snapshot":
     let root = getTempDir() / ("nimdex-compiler-error-" & $getCurrentProcessId())
@@ -401,6 +406,11 @@ suite "Nimdex compiler refresh":
     doAssert refresh.diagnostics.len > 0
     doAssert refresh.diagnostics[0].severity == cdsError
     doAssert refresh.diagnostics[0].sourceUri.len > 0
+    let compileLog =
+      refresh.cachePath / $stableTextHash(normalizeDocumentPath(sourcePath)) /
+      "broken.nim-compile.log"
+    check fileExists(compileLog)
+    check readFile(compileLog).contains("Error:")
 
   test "retains semantic declarations without compiling or linking native code":
     let root = normalizeDocumentPath(

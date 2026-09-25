@@ -1,6 +1,6 @@
 ## Workspace identity and compiler/artifact configuration values.
 
-import std/[os, strutils]
+import std/[options, os, strutils]
 
 import ./documents
 import ./projectlayout
@@ -50,6 +50,7 @@ proc initWorkspace*(
     cacheRoot: string = "",
     configurationGeneration: uint64 = 0,
     compilerFrontend = cfCompile,
+    discoveredLayout: Option[ProjectLayout] = none(ProjectLayout),
 ): Workspace =
   result.rootUri = normalizeDocumentUri(rootUri)
   if result.rootUri.len == 0:
@@ -60,7 +61,11 @@ proc initWorkspace*(
   result.importPaths = normalizedPaths(importPaths)
   if importPaths.len == 0:
     result.automaticImportPaths = true
-    result.importPaths = discoverProjectLayout(result.rootPath).sourceDirs
+    result.importPaths =
+      if discoveredLayout.isSome:
+        discoveredLayout.get().sourceDirs
+      else:
+        discoverProjectLayout(result.rootPath).sourceDirs
   result.nimArguments = nimArguments
   result.artifactRoots = normalizedPaths(artifactRoots)
   result.compilerPath = compilerPath

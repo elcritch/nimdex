@@ -1,6 +1,6 @@
 ## Controlled Nim compiler refreshes and owned compiler diagnostics.
 
-import std/[algorithm, atomics, os, osproc, strutils, tables, times, monotimes]
+import std/[algorithm, atomics, os, osproc, strutils, syncio, tables, times, monotimes]
 
 when defined(posix):
   import std/posix
@@ -181,6 +181,7 @@ proc runExternalCommand(
     arguments: openArray[string],
     workingDir, captureDir: string,
     cancellation: CompilerCancellation = nil,
+    progressHead = "",
 ): CompilerProcessOutput =
   ## Use a shell only as a redirection wrapper. Every executable, argument, and
   ## capture path is quoted independently, so user configuration is not parsed
@@ -230,9 +231,20 @@ proc runExternalCommand(
       discard process.waitForExit()
     process.close()
   let started = getMonoTime()
+  var nextProgressSecond = 5'i64
   var stopped = false
   while process.peekExitCode() == -1:
-    if cancellation.isCompilerCancelled() or (getMonoTime() - started).inSeconds >= 300 or
+    let elapsedSeconds = (getMonoTime() - started).inSeconds
+    if progressHead.len > 0 and elapsedSeconds >= nextProgressSecond:
+      info "Nim compiler still running",
+        entryPoint = progressHead,
+        elapsedSeconds = elapsedSeconds,
+        stdoutBytes = (if fileExists(stdoutPath): getFileSize(stdoutPath)
+        else: 0'i64),
+        stderrBytes = (if fileExists(stderrPath): getFileSize(stderrPath)
+        else: 0'i64)
+      nextProgressSecond = elapsedSeconds + 5
+    if cancellation.isCompilerCancelled() or elapsedSeconds >= 300 or
         (fileExists(stdoutPath) and getFileSize(stdoutPath) > MaxCompilerCaptureBytes) or
         (fileExists(stderrPath) and getFileSize(stderrPath) > MaxCompilerCaptureBytes):
       stopped = true
@@ -250,6 +262,29 @@ proc runExternalCommand(
     exitCode = result.exitCode,
     stdoutBytes = result.stdout.len,
     stderrBytes = result.stderr.len
+
+proc saveHeadCompilerLog(
+    cachePath, entryPoint, command: string, output: CompilerProcessOutput
+): string =
+  result = cachePath / (entryPoint.extractFilename() & "-compile.log")
+  var log: File
+  if not open(log, result, fmWrite):
+    raise newException(IOError, "could not open compiler log: " & result)
+  try:
+    log.writeLine("Command: " & command)
+    log.writeLine("Exit code: " & $output.exitCode)
+    if output.stdout.len > 0:
+      log.writeLine("\n--- stdout ---")
+      log.write(output.stdout)
+    if output.stderr.len > 0:
+      log.writeLine("\n--- stderr ---")
+      log.write(output.stderr)
+  finally:
+    log.close()
+  for name in [".nimdex-compiler.stdout", ".nimdex-compiler.stderr"]:
+    let capture = cachePath / name
+    if fileExists(capture):
+      removeFile(capture)
 
 proc compilerRevision(version: string): string =
   for line in version.splitLines:
@@ -458,14 +493,21 @@ proc collectCompilerDiagnostics(
       if diagnostic.message.len > 0:
         result.add(diagnostic)
 
-proc discoverCompilerEntryPoints*(workspace: Workspace): seq[string] =
+proc discoverCompilerEntryPoints*(
+    workspace: Workspace, layout: ProjectLayout
+): seq[string] =
   ## Explicit heads override convention-based package and test discovery.
   if workspace.entryPoints.len > 0:
     for path in workspace.entryPoints:
       if path.endsWith(".nim") and path notin result:
         result.add(path)
   else:
-    result = discoverProjectLayout(workspace.rootPath).heads
+    result = layout.heads
+
+proc discoverCompilerEntryPoints*(workspace: Workspace): seq[string] =
+  if workspace.entryPoints.len > 0:
+    return workspace.discoverCompilerEntryPoints(ProjectLayout())
+  workspace.discoverCompilerEntryPoints(discoverProjectLayout(workspace.rootPath))
 
 proc forbiddenCompilerArgument(argument: string): bool =
   let normalized = argument.toLowerAscii()
@@ -577,16 +619,23 @@ proc buildHead(
     cacheRunId = cachePath.extractFilename()
   let process = runExternalCommand(
     request.capabilities.compilerPath, arguments, request.workspace.rootPath, cachePath,
-    request.cancellation,
+    request.cancellation, entryPoint,
   )
-  info "Nim compiler output captured",
-    entryPoint = entryPoint,
-    cacheRunId = cachePath.extractFilename(),
-    stdoutPath = cachePath / ".nimdex-compiler.stdout",
-    stdoutBytes = process.stdout.len,
-    stderrPath = cachePath / ".nimdex-compiler.stderr",
-    stderrBytes = process.stderr.len,
-    exitCode = process.exitCode
+  try:
+    let compileLog = saveHeadCompilerLog(cachePath, entryPoint, result.command, process)
+    info "Nim compiler output captured",
+      entryPoint = entryPoint,
+      cacheRunId = cachePath.extractFilename(),
+      compileLog = compileLog,
+      stdoutBytes = process.stdout.len,
+      stderrBytes = process.stderr.len,
+      exitCode = process.exitCode
+  except CatchableError as error:
+    warn "Unable to save Nim compiler log",
+      entryPoint = entryPoint,
+      stdoutPath = cachePath / ".nimdex-compiler.stdout",
+      stderrPath = cachePath / ".nimdex-compiler.stderr",
+      failure = error.msg
   result.exitCode = process.exitCode
   result.stdout = process.stdout
   result.stderr = process.stderr
@@ -894,6 +943,20 @@ proc runCompilerRefresh*(
         )
       )
     result.diagnostics.add(progress.diagnostics)
+    info "Nim compiler progress",
+      entryPoint = entryPoint,
+      completedHeads = entryPoints.len - pending.len,
+      totalHeads = entryPoints.len,
+      status = (
+        if not progress.ok:
+          "failed"
+        elif progress.restored:
+          "restored"
+        elif progress.reused:
+          "reused"
+        else:
+          "compiled"
+      )
     if not onHead.isNil:
       onHead(progress)
     if progress.ok and not progress.reused and not progress.restored and

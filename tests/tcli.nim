@@ -1,12 +1,24 @@
 import std/[assertions, json, net, os, osproc, streams, strutils]
 
 import nimdex/cli
+import nimdex/clicapture
 import nimdex/documents
 import sigils/rpcs/json/jrFraming
 
 const FixtureRoot = currentSourcePath.parentDir / "fixtures/binny_phase0"
 
 var testDaemonPath: string
+
+type CapturedErrors = object
+  stream: Stream
+  path: string
+
+proc captureProtocolErrors(state: ptr CapturedErrors) {.thread.} =
+  var log = initRollingLog(state.path)
+  try:
+    state.stream.captureStream(log)
+  finally:
+    log.close()
 
 proc drainProtocolErrors(stream: Stream) {.thread.} =
   while not stream.atEnd():
@@ -196,6 +208,8 @@ block cli_symbols:
   )
   doAssert run.status == 0, run.output
   doAssert run.output.contains("exportedRoutine")
+  doAssert run.output.contains("Nim compiler progress"), run.output
+  doAssert run.output.contains("-compile.log"), run.output
   var listedHidden = false
   for line in run.output.splitLines:
     if line.endsWith(" hiddenRoutine"):
@@ -227,6 +241,60 @@ block cli_package_layout:
   doAssert run.output.contains("\"actualHeads\"")
   doAssert run.output.contains("tpackage.nim")
 
+block eager_nimble_loading:
+  let root = getTempDir() / ("nimdex-cli-eager-" & $getCurrentProcessId())
+  createDir(root / "src")
+  defer:
+    removeDir(root)
+  writeFile(root / "sample.nimble", "srcDir = \"src\"\n")
+  writeFile(root / "src/sample.nim", "proc sample*() = discard\n")
+  let path = getTempDir() / ("nimdex-cli-eager-log-" & $getCurrentProcessId())
+  let process = startProcess(
+    testDaemon(),
+    workingDir = root,
+    args = ["daemon"],
+    options = {poUsePath, poInteractive},
+  )
+  var state = CapturedErrors(stream: process.errorStream(), path: path)
+  var thread: Thread[ptr CapturedErrors]
+  createThread(thread, captureProtocolErrors, addr state)
+  defer:
+    if process.running():
+      process.kill()
+    discard process.waitForExit()
+    joinThread(thread)
+    process.close()
+    if fileExists(path):
+      removeFile(path)
+  var discovered = false
+  for attempt in 0 ..< 200:
+    if fileExists(path) and
+        readFile(path).contains("Discovered Nimble project at startup"):
+      discovered = true
+      break
+    sleep(10)
+  doAssert discovered
+  doAssert process.running()
+  createDir(root / "other")
+  writeFile(root / "other/sample.nim", "proc other*() = discard\n")
+  writeFile(root / "sample.nimble", "srcDir = \"other\"\n")
+  var notifications: seq[JsonNode]
+  process.sendProtocol(
+    "initialize",
+    %*{
+      "rootUri": documentUriFromPath(root),
+      "capabilities": {},
+      "initializationOptions": {"autoCompile": false},
+    },
+    1,
+  )
+  doAssert process.receiveProtocol(1, notifications).hasKey("result")
+  process.sendProtocol("initialized", %*{})
+  process.sendProtocol("nimdex/debug", %*{}, 2)
+  let debug = process.receiveProtocol(2, notifications)
+  doAssert debug["result"]["workspace"]["importPaths"][0].getStr() ==
+    normalizeDocumentPath(root / "other")
+
 block cli_diagnostic_capture:
   let root = getTempDir() / ("nimdex-cli-diagnostics-" & $getCurrentProcessId())
   createDir(root)
@@ -239,6 +307,29 @@ block cli_diagnostic_capture:
   doAssert run.output.contains("Compiler diagnostics captured"), run.output
   doAssert run.output.contains(".diagnostics.log"), run.output
   doAssert not run.output.contains("nimdex: file://"), run.output
+
+when defined(posix):
+  block cli_compiler_heartbeat:
+    let root = getTempDir() / ("nimdex-cli-slow-" & $getCurrentProcessId())
+    createDir(root)
+    defer:
+      removeDir(root)
+    let source = root / "main.nim"
+    let wrapper = root / "slow-nim"
+    let compiler = currentSourcePath.parentDir.parentDir / "deps/nim-devel/bin/nim"
+    writeFile(source, "const answer* = 42\n")
+    writeFile(
+      wrapper,
+      "#!/bin/sh\ncase \"$1\" in --version|--fullhelp) ;; *) sleep 6 ;; esac\n" & "exec " &
+        quoteShell(compiler) & " \"$@\"\n",
+    )
+    setFilePermissions(wrapper, {fpUserRead, fpUserWrite, fpUserExec})
+    let run = runExternalCli(
+      ["check", root, "--compiler", wrapper, "--cache-root", root / "cache"]
+    )
+    doAssert run.status == 0, run.output
+    doAssert run.output.contains("Nim compiler still running"), run.output
+    doAssert run.output.contains("elapsedSeconds"), run.output
 
 block persistent_cli_service:
   let repositoryRoot = currentSourcePath.parentDir.parentDir

@@ -1,6 +1,8 @@
 ## Minimal LSP 3.18 session handling for Nimdex.
 
-import std/[algorithm, json, os, sequtils, strutils, syncio, tables, monotimes, times]
+import
+  std/
+    [algorithm, json, options, os, sequtils, strutils, syncio, tables, monotimes, times]
 
 import chronicles
 import sigils
@@ -75,6 +77,9 @@ type
     language: LanguageRuntime
     home: SigilThreadPtr
     workspace: Workspace
+    startupLayoutRoot: string
+    startupLayout: ProjectLayout
+    startupLayoutStamp: string
     artifactRoots: seq[string]
     configuredCompilerPath: string
     configuredCompilerFrontend: CompilerFrontend
@@ -1792,6 +1797,27 @@ proc receiveCompilerRefreshCompletion(
   if restart and server.state == lssRunning:
     server.startCompilerRefresh()
 
+proc projectLayoutStamp(root: string, layout: ProjectLayout): string =
+  for path in @[root, root / "tests"] & layout.sourceDirs & layout.packageFiles:
+    result.add(path & "\0")
+    if fileExists(path) or dirExists(path):
+      let details = getFileInfo(path)
+      result.add($details.lastWriteTime.toUnixFloat() & ":" & $details.size)
+      if path in layout.packageFiles:
+        result.add(":" & $stableTextHash(readFile(path)))
+    result.add('\0')
+
+proc layoutForRoot(server: LspServer, rootUri: string): ProjectLayout =
+  let root = pathFromDocumentUri(rootUri)
+  if root == server.startupLayoutRoot and server.startupLayoutRoot.len > 0:
+    try:
+      if projectLayoutStamp(root, server.startupLayout) == server.startupLayoutStamp:
+        debug "Using startup Nimble layout", workingDir = root
+        return server.startupLayout
+    except CatchableError:
+      discard
+  discoverProjectLayout(root)
+
 proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
   if server.state != lssCreated:
     raiseLspError(RpcInvalidRequest, "server has already been initialized")
@@ -1807,14 +1833,15 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
     else:
       artifactRootsFromInitialize(initializeParams)
 
+  let layout = server.layoutForRoot(rootUri)
+
   var compilerRequested = compilerOptions.configured
   if not compilerRequested and not compilerOptions.autoCompileSet and
       configuredRoots.len == 0 and rootUri.len > 0:
     ## A normal workspace with a discoverable Nim entry point uses the
     ## compiler-backed path by default. Artifact-only mode remains available
     ## for explicit phase-2 compatibility roots.
-    let candidateWorkspace = initWorkspace(rootUri)
-    compilerRequested = discoverCompilerEntryPoints(candidateWorkspace).len > 0
+    compilerRequested = layout.heads.len > 0
 
   let resolvedCompilerPath = resolveCompilerPath(rootUri, compilerOptions.compilerPath)
   var resolvedCacheRoot = ""
@@ -1829,9 +1856,13 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
     compilerPath = resolvedCompilerPath,
     compilerFrontend = compilerOptions.compilerFrontend,
     cacheRoot = resolvedCacheRoot,
+    discoveredLayout = some(layout),
   )
   server.artifactRoots = server.workspace.artifactRoots
-  server.refreshEntryPoints = server.workspace.discoverCompilerEntryPoints()
+  server.refreshEntryPoints = server.workspace.discoverCompilerEntryPoints(layout)
+  server.startupLayout = ProjectLayout()
+  server.startupLayoutRoot = ""
+  server.startupLayoutStamp = ""
   server.savedHeads =
     server.savedHeads.filterIt(it.headPath in server.refreshEntryPoints)
   for source, head in compilerOptions.preferredHeads:
@@ -2117,6 +2148,26 @@ proc registerLspRoutes(server: LspServer) =
   server.adapter.registerSelectorMethod("textDocument/hover", server, hoverSelector)
   server.adapter.registerSelectorMethod(LspDebugMethod, server, debugSelector)
 
+proc preloadStartupLayout(server: LspServer) =
+  try:
+    let root = normalizeDocumentPath(getCurrentDir())
+    var hasNimble = false
+    for package in walkFiles(root / "*.nimble"):
+      hasNimble = true
+      break
+    if hasNimble:
+      server.startupLayoutRoot = root
+      server.startupLayout = discoverProjectLayout(root)
+      server.startupLayoutStamp = projectLayoutStamp(root, server.startupLayout)
+      info "Discovered Nimble project at startup",
+        workingDir = root,
+        nimbleFiles = samplePaths(server.startupLayout.packageFiles),
+        nimbleFileCount = server.startupLayout.packageFiles.len,
+        sourceDirs = samplePaths(server.startupLayout.sourceDirs),
+        headCount = server.startupLayout.heads.len
+  except CatchableError as error:
+    warn "Unable to preload Nimble project layout", failure = error.msg
+
 proc newNimdexLspServer*(
     workers = 1,
     artifactRoots: seq[string] = @[],
@@ -2139,6 +2190,7 @@ proc newNimdexLspServer*(
     publishedDiagnosticUris: initTable[string, bool](),
   )
   result.registerLspRoutes()
+  result.preloadStartupLayout()
 
 proc jsonRpcAdapter*(server: LspServer): JsonRpcAdapter =
   ## Return the transport-independent JSON-RPC adapter for this server.
