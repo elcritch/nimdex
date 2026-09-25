@@ -2,7 +2,8 @@ import std/[os, strutils]
 
 --mm:atomicArc
 --threads:on
-switch("define", "chronicles_default_output_device=stderr")
+switch("define", "chronicles_sinks=textblocks[stderr]")
+switch("define", "chronicles_colors=AnsiColors")
 
 task test, "run unit tests":
   for testFile in listFiles("tests/"):
