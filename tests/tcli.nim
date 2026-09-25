@@ -12,6 +12,24 @@ proc drainProtocolErrors(stream: Stream) {.thread.} =
   while not stream.atEnd():
     discard stream.readLine()
 
+proc readListenerPort(stream: Stream): string =
+  var ready = false
+  while not stream.atEnd():
+    let line = stream.readLine()
+    if line.contains("Nimdex CLI listener ready"):
+      ready = true
+    if ready:
+      let marker = "127.0.0.1:"
+      let start = line.find(marker)
+      if start >= 0:
+        for character in line[start + marker.len .. ^1]:
+          if character notin {'0' .. '9'}:
+            break
+          result.add(character)
+        if result.len > 0:
+          return
+  raise newException(IOError, "daemon exited before logging its listener port")
+
 proc sendProtocol(process: Process, methodName: string, params: JsonNode, id = 0) =
   var message = %*{"jsonrpc": "2.0", "method": methodName, "params": params}
   if id != 0:
@@ -209,6 +227,19 @@ block cli_package_layout:
   doAssert run.output.contains("\"actualHeads\"")
   doAssert run.output.contains("tpackage.nim")
 
+block cli_diagnostic_capture:
+  let root = getTempDir() / ("nimdex-cli-diagnostics-" & $getCurrentProcessId())
+  createDir(root)
+  defer:
+    removeDir(root)
+  let broken = root / "broken.nim"
+  writeFile(broken, "proc broken( = discard\n")
+  let run = runExternalCli(["check", root, "--entry-point", broken])
+  doAssert run.status != 0, run.output
+  doAssert run.output.contains("Compiler diagnostics captured"), run.output
+  doAssert run.output.contains(".diagnostics.log"), run.output
+  doAssert not run.output.contains("nimdex: file://"), run.output
+
 block persistent_cli_service:
   let repositoryRoot = currentSourcePath.parentDir.parentDir
   let compiler = repositoryRoot / "deps/nim-devel/bin/nim"
@@ -221,6 +252,7 @@ block persistent_cli_service:
     ],
     options = {poUsePath},
   )
+  let port = process.errorStream().readListenerPort()
   var errorThread: Thread[Stream]
   createThread(errorThread, drainProtocolErrors, process.errorStream())
   defer:
@@ -229,10 +261,6 @@ block persistent_cli_service:
       discard process.waitForExit()
     joinThread(errorThread)
     process.close()
-
-  let ready = process.outputStream().readLine()
-  doAssert ready.startsWith("nimdex listening on 127.0.0.1:"), ready
-  let port = ready.split(':')[1]
 
   let checked = runExternalCli(["check", FixtureRoot, "--connect", port])
   doAssert checked.status == 0, checked.output
@@ -261,3 +289,29 @@ block persistent_cli_service:
   doAssert stopped.status == 0, stopped.output
   doAssert stopped.output.contains("nimdex daemon stopped")
   doAssert process.waitForExit(10000) == 0
+  doAssert process.outputStream().readAll().len == 0
+
+  let restarted = startProcess(
+    testDaemon(),
+    args = [
+      "daemon", FixtureRoot, "--listen", "0", "--compiler", compiler, "--cache-root",
+      cacheRoot,
+    ],
+    options = {poUsePath},
+  )
+  let restartedPort = restarted.errorStream().readListenerPort()
+  var restartedErrors: Thread[Stream]
+  createThread(restartedErrors, drainProtocolErrors, restarted.errorStream())
+  defer:
+    if restarted.running():
+      restarted.kill()
+      discard restarted.waitForExit()
+    joinThread(restartedErrors)
+    restarted.close()
+  let reused = runExternalCli(["debug", FixtureRoot, "--connect", restartedPort])
+  doAssert reused.status == 0, reused.output
+  doAssert reused.output.contains("\"compiledHeads\": 0"), reused.output
+  doAssert reused.output.contains("\"restoredHeads\": 1"), reused.output
+  let restopped = runExternalCli(["stop", "--connect", restartedPort])
+  doAssert restopped.status == 0, restopped.output
+  doAssert restarted.waitForExit(10000) == 0

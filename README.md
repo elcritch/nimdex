@@ -25,6 +25,15 @@ summaries. BIF lists show a few filenames and a total;
 retains full paths. Compile with `-d:chronicles_log_level=TRACE` to include
 per-artifact and per-symbol indexing traces.
 
+Compiler stdout and stderr are captured in each head's cache directory as
+`.nimdex-compiler.stdout` and `.nimdex-compiler.stderr`; an info log gives both
+paths and byte counts after a compile. The CLI captures its child daemon's
+Chronicles output and forwarded compiler diagnostics in bounded temporary
+`nimdex-cli-*.daemon.log` and `nimdex-cli-*.diagnostics.log` files. It logs the
+paths instead of printing every diagnostic. Each capture keeps at most 8 MiB
+in its current file and 8 MiB in a `.1` rotation. Editor LSP diagnostics are
+still published normally.
+
 ## Command line
 
 Run the CLI directly from a checkout:
@@ -62,8 +71,9 @@ Start a listening daemon in one terminal, from this repository root:
 /tmp/nimdex daemon . --listen 49152 --compiler deps/nim-devel/bin/nim
 ```
 
-The daemon prints `nimdex listening on 127.0.0.1:49152` when it is ready to
-accept CLI requests. In another terminal, query the same project without
+The daemon logs `Nimdex CLI listener ready` with
+`address: 127.0.0.1:49152` on stderr when it is ready to accept CLI requests.
+In another terminal, query the same project without
 starting a new analysis process:
 
 ```sh
@@ -79,8 +89,12 @@ in-memory semantic index. `--entry-point tests/tnavigation.nim` limits the
 initial analysis to one head; otherwise Nimdex discovers the package and
 `tests/t*.nim` heads. The listener accepts connections only on loopback and
 serves one project. Use a different port for another project. Passing
-`--listen 0` chooses a free port and prints it. The plain `daemon` command
+`--listen 0` chooses a free port and logs its address. The plain `daemon` command
 still uses stdin/stdout LSP transport for editors.
+Stopping and restarting the listener with the same project, compiler, frontend,
+and cache root restores valid head analyses from disk. `nimdex debug . --connect
+PORT | jq '.refresh | {compiledHeads, restoredHeads}'` shows whether the new
+daemon reused them; source or configuration changes rebuild affected heads.
 
 Useful options are:
 

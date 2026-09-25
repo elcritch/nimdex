@@ -579,6 +579,14 @@ proc buildHead(
     request.capabilities.compilerPath, arguments, request.workspace.rootPath, cachePath,
     request.cancellation,
   )
+  info "Nim compiler output captured",
+    entryPoint = entryPoint,
+    cacheRunId = cachePath.extractFilename(),
+    stdoutPath = cachePath / ".nimdex-compiler.stdout",
+    stdoutBytes = process.stdout.len,
+    stderrPath = cachePath / ".nimdex-compiler.stderr",
+    stderrBytes = process.stderr.len,
+    exitCode = process.exitCode
   result.exitCode = process.exitCode
   result.stdout = process.stdout
   result.stderr = process.stderr

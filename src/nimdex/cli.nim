@@ -6,6 +6,7 @@ import chronicles
 import sigils/rpcs/json/jrFraming
 
 import ./cliipc
+import ./clicapture
 import ./documents
 import ./logsummary
 import ./lsp
@@ -51,10 +52,16 @@ type
     errorDrainState: RpcErrorDrain
     errorDrainThread: Thread[ptr RpcErrorDrain]
     parser: JsonRpcFrameParser
+    diagnosticLog: RollingLog
+    diagnosticCount: int
+    diagnosticCaptureFailed: bool
 
   RpcErrorDrain = object
     stream: Stream
     logPath: string
+    totalBytes: int
+    rotations: int
+    failure: string
 
   RpcReadResult = object
     found: bool
@@ -384,7 +391,7 @@ proc isResponseFor(frame: JsonNode, id: int): bool =
   frame.kind == JObject and frame.hasKey("id") and frame["id"].kind == JInt and
     frame["id"].getInt() == id
 
-proc reportNotification(frame: JsonNode, output: File) =
+proc reportNotification(session: RpcSession, frame: JsonNode) =
   if frame.kind != JObject or not frame.hasKey("method") or
       frame["method"].kind != JString:
     return
@@ -406,9 +413,19 @@ proc reportNotification(frame: JsonNode, output: File) =
         diagnostic["message"].getStr()
       else:
         $diagnostic
-    output.writeLine("nimdex: " & uri & ": " & message)
+    if not session.diagnosticCaptureFailed:
+      try:
+        session.diagnosticLog.write("nimdex: " & uri & ": " & message & "\n")
+        inc session.diagnosticCount
+        if session.diagnosticCount == 1:
+          info "Compiler diagnostics captured", path = session.diagnosticLog.path
+      except CatchableError as error:
+        session.diagnosticCaptureFailed = true
+        warn "Unable to capture compiler diagnostics",
+          path = session.diagnosticLog.path, failure = error.msg
 
 proc readResponse(session: RpcSession, id: int, diagnosticOutput: File): RpcCallResult =
+  discard diagnosticOutput
   while true:
     let read = session.readFrame()
     if read.error.len > 0:
@@ -418,38 +435,34 @@ proc readResponse(session: RpcSession, id: int, diagnosticOutput: File): RpcCall
       result.error = "Nimdex daemon did not return a response"
       return
     if read.frame.kind == JObject and read.frame.hasKey("method"):
-      reportNotification(read.frame, diagnosticOutput)
+      session.reportNotification(read.frame)
     if read.frame.isResponseFor(id):
       result.response = read.frame
       return
 
 proc drainRpcErrors(state: ptr RpcErrorDrain) {.thread.} =
-  var logFile: File
-  let saveLogs = state.logPath.len > 0 and open(logFile, state.logPath, fmWrite)
-  defer:
-    if saveLogs:
-      logFile.close()
-
   var buffer = newString(4096)
-  while true:
-    let bytesRead = state.stream.readData(addr buffer[0], buffer.len)
-    if bytesRead <= 0:
-      break
-    if saveLogs:
-      discard logFile.writeBuffer(addr buffer[0], bytesRead)
-    else:
-      discard stderr.writeBuffer(addr buffer[0], bytesRead)
+  var capture: RollingLog
+  try:
+    capture = initRollingLog(state.logPath)
+    while true:
+      let bytesRead = state.stream.readData(addr buffer[0], buffer.len)
+      if bytesRead <= 0:
+        break
+      capture.write(buffer[0 ..< bytesRead])
+  except CatchableError as error:
+    state.failure = error.msg
+    # Keep draining if capture fails so the child cannot block on a full pipe.
+    while state.stream.readData(addr buffer[0], buffer.len) > 0:
+      discard
+  finally:
+    state.totalBytes = capture.totalBytes
+    state.rotations = capture.rotations
+    capture.close()
 
-proc newRpcSession(root, daemonPath: string, persistent = false): RpcSession =
+proc newRpcSession(root, daemonPath: string): RpcSession =
   debug "Starting Nimdex daemon for CLI request",
     projectRoot = root, daemonPath = daemonPath, workingDirectory = root
-  let errorLogPath =
-    if persistent:
-      ""
-    else:
-      getTempDir() / ("nimdex-cli-daemon-" & $getCurrentProcessId() & ".stderr")
-  if errorLogPath.len > 0 and fileExists(errorLogPath):
-    removeFile(errorLogPath)
   result = RpcSession(
     process: startProcess(
       if daemonPath.len > 0:
@@ -465,11 +478,24 @@ proc newRpcSession(root, daemonPath: string, persistent = false): RpcSession =
   result.input = result.process.inputStream()
   result.output = result.process.outputStream()
   result.errorOutput = result.process.errorStream()
-  result.errorDrainState =
-    RpcErrorDrain(stream: result.errorOutput, logPath: errorLogPath)
-  createThread(result.errorDrainThread, drainRpcErrors, addr result.errorDrainState)
+  let logPrefix =
+    getTempDir() /
+    ("nimdex-cli-" & $getCurrentProcessId() & "-" & $result.process.processID())
+  try:
+    result.diagnosticLog = initRollingLog(logPrefix & ".diagnostics.log")
+    result.errorDrainState =
+      RpcErrorDrain(stream: result.errorOutput, logPath: logPrefix & ".daemon.log")
+    createThread(result.errorDrainThread, drainRpcErrors, addr result.errorDrainState)
+  except CatchableError:
+    result.diagnosticLog.close()
+    result.process.kill()
+    discard result.process.waitForExit()
+    result.process.close()
+    raise
+  info "Nimdex daemon output captured", path = result.errorDrainState.logPath
 
 proc stopRpcSession(session: RpcSession, diagnosticOutput: File) =
+  discard diagnosticOutput
   if session.isNil or session.process.isNil:
     return
   if session.process.running():
@@ -479,17 +505,20 @@ proc stopRpcSession(session: RpcSession, diagnosticOutput: File) =
       discard
   discard session.process.waitForExit()
   joinThread(session.errorDrainThread)
-  let daemonErrors =
-    if session.errorDrainState.logPath.len > 0 and
-        fileExists(session.errorDrainState.logPath):
-      readFile(session.errorDrainState.logPath).strip()
-    else:
-      ""
-  if daemonErrors.len > 0:
-    diagnosticOutput.writeLine(daemonErrors)
-  if session.errorDrainState.logPath.len > 0 and
-      fileExists(session.errorDrainState.logPath):
-    removeFile(session.errorDrainState.logPath)
+  session.diagnosticLog.close()
+  info "Nimdex daemon output captured",
+    path = session.errorDrainState.logPath,
+    bytes = session.errorDrainState.totalBytes,
+    rotations = session.errorDrainState.rotations
+  if session.diagnosticCount > 0:
+    info "Compiler diagnostics captured",
+      path = session.diagnosticLog.path,
+      count = session.diagnosticCount,
+      bytes = session.diagnosticLog.totalBytes,
+      rotations = session.diagnosticLog.rotations
+  if session.errorDrainState.failure.len > 0:
+    warn "Unable to capture Nimdex daemon output",
+      path = session.errorDrainState.logPath, failure = session.errorDrainState.failure
   session.process.close()
 
 proc responseError(response: JsonNode): string =
@@ -745,9 +774,7 @@ proc serviceReply(
     else:
       reply.debug
 
-proc runCliService(
-    options: CliOptions, output, errorOutput: File, daemonPath: string
-): int =
+proc runCliService(options: CliOptions, errorOutput: File, daemonPath: string): int =
   let project = options.projectRoot()
   if project.error.len > 0:
     errorOutput.writeLine("nimdex: " & project.error)
@@ -757,13 +784,13 @@ proc runCliService(
   try:
     listener.bindAddr(Port(options.listenPort), "127.0.0.1")
     listener.listen()
-    session = newRpcSession(project.path, daemonPath, persistent = true)
+    session = newRpcSession(project.path, daemonPath)
     let initError = session.initializeSession(options, project.path, errorOutput)
     if initError.len > 0:
       errorOutput.writeLine("nimdex: " & initError)
       return 1
-    output.writeLine("nimdex listening on 127.0.0.1:" & $listener.getLocalAddr()[1])
-    output.flushFile()
+    info "Nimdex CLI listener ready",
+      address = "127.0.0.1:" & $listener.getLocalAddr()[1], workingDir = project.path
     while true:
       var client: Socket
       listener.accept(client)
@@ -776,7 +803,7 @@ proc runCliService(
         else:
           if not session.process.running():
             session.stopRpcSession(errorOutput)
-            session = newRpcSession(project.path, daemonPath, persistent = true)
+            session = newRpcSession(project.path, daemonPath)
             let initError =
               session.initializeSession(options, project.path, errorOutput)
             if initError.len > 0:
@@ -898,7 +925,7 @@ proc runNimdexCli*(
     0
   of cliDaemon:
     if parsed.options.listenPort >= 0:
-      runCliService(parsed.options, output, errorOutput, daemonPath)
+      runCliService(parsed.options, errorOutput, daemonPath)
     else:
       runNimdexLspStdio(
         input,
