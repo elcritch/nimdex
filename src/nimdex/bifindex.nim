@@ -6,6 +6,8 @@ import binny/bif_safe
 import chronicles
 import sigils
 
+import ./workerlife
+
 import ./binnycompat
 import ./documents
 import ./semantic
@@ -97,7 +99,9 @@ proc requestedWorkerCount(options: BifIndexOptions, artifactCount: int): int =
     if options.workerCount > 0:
       options.workerCount
     else:
-      countProcessors()
+      # Each loader owns token and string pools until extraction finishes.
+      # Bound the default working set on machines with many logical CPUs.
+      min(countProcessors(), 4)
   min(max(configured, 1), artifactCount)
 
 proc indexArtifactsInPool(
@@ -140,6 +144,9 @@ proc indexArtifactsInPool(
 
   pool.stop()
   pool.join()
+  triggers.setLen(0)
+  proxies.setLen(0)
+  doAssert pool.disposeJoined()
   result = collector.results
 
 proc discoverBifArtifacts*(roots: openArray[string]): seq[string] =
@@ -271,6 +278,10 @@ proc moduleFromReport(report: BinnyArtifactReport, projectId: string): ModuleSna
         qualifiedName: declaration.name,
         modulePath: modulePath,
         kind: declaration.tag,
+        typeId: declaration.typeId,
+        instantiatedFrom: declaration.instantiatedFrom,
+        raisesKnown: declaration.raisesKnown,
+        raisesTypes: declaration.raisesTypes,
         visibility: if declaration.visibility == bvisExported: svExported else: svHidden,
         location: sourceLocation(
           locationPath,

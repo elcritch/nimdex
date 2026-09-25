@@ -9,6 +9,7 @@ bin            = @[
 
 requires "nim >= 2.0.0"
 
-requires "gh:elcritch/binny >= 0.5.22"
-requires "gh:elcritch/sigils >= 0.30.0"
+requires "gh:elcritch/binny#d21498d11ad5938b5e1371da07e64c91e7bb54d6"
+# Scheduler teardown is verified against this Sigils ownership contract.
+requires "gh:elcritch/sigils#8d7f00edae632ffe8be88cd2d3dfac6c4d651559"
 requires "chronicles >= 0.12.2"

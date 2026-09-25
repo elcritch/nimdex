@@ -1,6 +1,9 @@
 ## Controlled Nim compiler refreshes and owned compiler diagnostics.
 
-import std/[algorithm, atomics, os, osproc, strutils, tables, times]
+import std/[algorithm, atomics, os, osproc, strutils, tables, times, monotimes]
+
+when defined(posix):
+  import std/posix
 
 import chronicles
 
@@ -45,6 +48,7 @@ type
     previousHeads*: seq[HeadAnalysis]
     forceRebuild*: bool
     priorityHead*: string
+    overlays*: seq[DocumentSnapshot]
 
   CompilerHeadProgress* = object ## One independently validated head completion.
     stamp*: AnalysisStamp
@@ -141,8 +145,41 @@ proc readIfPresent(path: string): string =
     except CatchableError:
       discard
 
+const MaxCompilerCaptureBytes = 8 * 1024 * 1024
+
+proc readCompilerCapture(path: string): string =
+  if not fileExists(path):
+    return
+  let file = open(path)
+  defer:
+    file.close()
+  result = newString(int(min(getFileSize(path), MaxCompilerCaptureBytes.int64)))
+  if result.len > 0:
+    result.setLen(file.readBuffer(addr result[0], result.len))
+  if getFileSize(path) > MaxCompilerCaptureBytes:
+    result.add("\nError: compiler output exceeded the capture limit\n")
+
+proc terminateCompilerProcess(process: Process) =
+  when defined(posix):
+    let pid = Pid(process.processID)
+    if getpgid(pid) == pid:
+      discard posix.kill(-pid, SIGTERM)
+      sleep(100)
+      discard posix.kill(-pid, SIGKILL)
+    else:
+      process.kill()
+  elif defined(windows):
+    discard execCmd("taskkill /PID " & $process.processID & " /T /F")
+    if process.peekExitCode() == -1:
+      process.kill()
+  else:
+    process.kill()
+
 proc runExternalCommand(
-    executable: string, arguments: openArray[string], workingDir, captureDir: string
+    executable: string,
+    arguments: openArray[string],
+    workingDir, captureDir: string,
+    cancellation: CompilerCancellation = nil,
 ): CompilerProcessOutput =
   ## Use a shell only as a redirection wrapper. Every executable, argument, and
   ## capture path is quoted independently, so user configuration is not parsed
@@ -172,16 +209,40 @@ proc runExternalCommand(
     ]
   else:
     let shell = "/bin/sh"
-    let shellArguments =
-      ["-c", command & " > " & quoteShell(stdoutPath) & " 2> " & quoteShell(stderrPath)]
+    let shellArguments = [
+      "-c",
+      "exec " & command & " > " & quoteShell(stdoutPath) & " 2> " &
+        quoteShell(stderrPath),
+    ]
 
   var process = startProcess(
-    shell, workingDir = workingDir, args = shellArguments, options = {poUsePath}
+    shell,
+    workingDir = workingDir,
+    args = shellArguments,
+    options = {poUsePath, poDaemon},
   )
+  defer:
+    # Even an I/O exception while supervising must not leave a compiler alive.
+    if process.peekExitCode() == -1:
+      process.terminateCompilerProcess()
+      discard process.waitForExit()
+    process.close()
+  let started = getMonoTime()
+  var stopped = false
+  while process.peekExitCode() == -1:
+    if cancellation.isCompilerCancelled() or (getMonoTime() - started).inSeconds >= 300 or
+        (fileExists(stdoutPath) and getFileSize(stdoutPath) > MaxCompilerCaptureBytes) or
+        (fileExists(stderrPath) and getFileSize(stderrPath) > MaxCompilerCaptureBytes):
+      stopped = true
+      process.terminateCompilerProcess()
+      break
+    sleep(20)
   result.exitCode = process.waitForExit()
-  process.close()
-  result.stdout = readIfPresent(stdoutPath)
-  result.stderr = readIfPresent(stderrPath)
+  result.stdout = readCompilerCapture(stdoutPath)
+  result.stderr = readCompilerCapture(stderrPath)
+  if stopped and not cancellation.isCompilerCancelled() and
+      (getMonoTime() - started).inSeconds >= 300:
+    result.stderr.add("\nError: compiler exceeded the five-minute analysis limit\n")
   debug "Nim command completed",
     compilerPath = executable,
     exitCode = result.exitCode,
@@ -408,16 +469,19 @@ proc forbiddenCompilerArgument(argument: string): bool =
   let normalized = argument.toLowerAscii()
   normalized in [
     "r", "run", "e", "eval", "--run", "--eval", "--nimcache", "--genbif", "--out",
-    "--outdir",
+    "--outdir", "--trackdirty",
   ] or normalized.startsWith("--nimcache:") or normalized.startsWith("--genbif:") or
-    normalized.startsWith("--out:") or normalized.startsWith("--outdir:")
+    normalized.startsWith("--out:") or normalized.startsWith("--outdir:") or
+    normalized.startsWith("--trackdirty:") or normalized.startsWith("--trackdirty=")
 
 proc compilerArguments(
     request: CompilerRefreshRequest, cachePath, entryPoint: string
 ): seq[string] =
   # This compiler's `check --genBif:on` drops semantic statements in SemPass.
   # The default retains C generation; track uses the existing IC frontend.
-  result.add(if request.workspace.compilerFrontend == cfTrack: "track" else: "c")
+  let incremental =
+    request.workspace.compilerFrontend == cfTrack and request.overlays.len == 0
+  result.add(if incremental: "track" else: "c")
   for argument in request.workspace.nimArguments:
     result.add(argument)
   for importPath in request.workspace.importPaths:
@@ -425,12 +489,20 @@ proc compilerArguments(
   ## These options are appended after user switches so the refresh command is
   ## always an artifact-only, BIF-producing build in its private cache.
   result.add("--genBif:on")
-  if request.workspace.compilerFrontend == cfCompile:
+  if not incremental:
     result.add("--compileOnly:on")
   result.add("--colors:off")
   result.add("--filenames:abs")
   result.add("--nimcache:" & cachePath)
   result.add("--outdir:" & cachePath)
+  for overlay in request.overlays:
+    if ',' in overlay.path or ',' in cachePath:
+      raise newException(
+        ValueError, "Nim --trackDirty cannot represent paths containing commas"
+      )
+    let dirtyPath = cachePath / ("buffer-" & $stableTextHash(overlay.path) & ".nim")
+    writeFile(dirtyPath, overlay.content)
+    result.add("--trackDirty:" & dirtyPath & "," & overlay.path & ",1,0")
   result.add(entryPoint)
 
 proc addBuildFailure(result: var CompilerRefreshResult, message, fallbackPath: string) =
@@ -460,7 +532,8 @@ proc buildHead(
     HeadAnalysis(headPath: entryPoint, cachePath: cachePath, reuseKey: reuseKey)
   ensureDirectory(cachePath)
   forgetHead(cachePath)
-  let incremental = request.workspace.compilerFrontend == cfTrack
+  let incremental =
+    request.workspace.compilerFrontend == cfTrack and request.overlays.len == 0
   # The IC driver owns and may reset this directory. Keep manifests and process
   # captures outside it, and retain its outputs for per-module rebuild decisions.
   let compilerCache =
@@ -498,7 +571,8 @@ proc buildHead(
   let compileStarted = getTime()
   info "Compiling Nim head", entryPoint = entryPoint, cachePath = cachePath
   let process = runExternalCommand(
-    request.capabilities.compilerPath, arguments, request.workspace.rootPath, cachePath
+    request.capabilities.compilerPath, arguments, request.workspace.rootPath, cachePath,
+    request.cancellation,
   )
   result.exitCode = process.exitCode
   result.stdout = process.stdout
@@ -527,6 +601,23 @@ proc buildHead(
   if not snapshot.containsModule(entryPoint):
     result.error = "compiler artifacts do not contain the requested head"
     return
+  var overlayHashes: Table[string, uint64]
+  for overlay in request.overlays:
+    overlayHashes[overlay.path] = overlay.textHash
+  for module in snapshot.modules.mitems:
+    if module.sourcePath in overlayHashes:
+      module.sourceTextHash = overlayHashes[module.sourcePath]
+    var hasOverlay = false
+    for symbol in module.symbols:
+      if symbol.location.path in overlayHashes:
+        hasOverlay = true
+        break
+    if hasOverlay:
+      var symbols = module.symbols
+      for symbol in symbols.mitems:
+        if symbol.location.path in overlayHashes:
+          symbol.location.sourceTextHash = overlayHashes[symbol.location.path]
+      module.setSymbols(move(symbols))
   snapshot.recordHead(entryPoint)
   result.analysis.inputPaths = resolvedInputs(
     request.workspace, entryPoint, snapshot, process.stdout & process.stderr
@@ -575,6 +666,7 @@ proc buildHead(
               symbol.location.artifactModifiedUnix:
             symbol.location.artifactModifiedUnix = validatedTime
         module.setSymbols(move(symbols))
+  snapshot.compactHead()
   new(result.analysis.snapshot)
   result.analysis.snapshot[] = move(snapshot)
   result.analysis.diagnostics = result.diagnostics
@@ -582,7 +674,9 @@ proc buildHead(
 proc headSourceFingerprint*(heads: openArray[HeadAnalysis]): uint64 =
   var fingerprints: seq[string]
   for head in heads:
-    fingerprints.add(head.headPath & "\0" & $head.inputFingerprint)
+    fingerprints.add(
+      head.headPath & "\0" & $head.inputFingerprint & "\0" & $head.overlayFingerprint
+    )
   fingerprints.sort()
   stableTextHash(fingerprints.join("\0"))
 
@@ -679,6 +773,15 @@ proc runCompilerRefresh*(
       "\0" & $inventory & "\0" & $compilerEnvironmentFingerprint() & "\0" &
       $request.workspace.compilerFrontend & "-bif-v" & $HeadCacheVersion
   )
+  var overlayKeys: seq[string]
+  for overlay in request.overlays:
+    overlayKeys.add(overlay.path & "\0" & $overlay.textHash)
+  overlayKeys.sort()
+  let overlayFingerprint =
+    if overlayKeys.len == 0:
+      0'u64
+    else:
+      stableTextHash(overlayKeys.join("\0"))
   var artifactCache: BifReuseCache
   var inputCache: InputFingerprints
   var diskCache = initHeadCache(result.cachePath)
@@ -706,18 +809,23 @@ proc runCompilerRefresh*(
       selected = pending.find(priority)
     let entryPoint = entryPoints[pending[selected]]
     pending.delete(selected)
-    let cachePath = result.cachePath / $stableTextHash(entryPoint)
+    let cachePath =
+      if request.overlays.len == 0:
+        result.cachePath / $stableTextHash(entryPoint)
+      else:
+        result.cachePath / "overlays" / $stableTextHash(entryPoint)
     var progress = CompilerHeadProgress(stamp: result.stamp, headPath: entryPoint)
     try:
       for previous in request.previousHeads:
         if not request.forceRebuild and previous.headPath == entryPoint and
             not previous.snapshot.isNil and previous.reuseKey == reuseKey and
+            previous.overlayFingerprint == overlayFingerprint and
             fingerprintInputs(previous.inputPaths, inputCache) ==
             previous.inputFingerprint:
           progress.analysis = previous
           progress.reused = true
           break
-      if not progress.reused and not request.forceRebuild:
+      if not progress.reused and not request.forceRebuild and request.overlays.len == 0:
         progress.restored = diskCache.restoreHead(
           effectiveRequest.workspace, entryPoint, cachePath, reuseKey, inputCache,
           progress.analysis,
@@ -739,6 +847,7 @@ proc runCompilerRefresh*(
         if built.exitCode != 0:
           result.exitCode = built.exitCode
         progress.analysis = built.analysis
+        progress.analysis.overlayFingerprint = overlayFingerprint
         progress.error = built.error
         progress.diagnostics = built.diagnostics
       if request.cancellation.isCompilerCancelled():
@@ -773,7 +882,8 @@ proc runCompilerRefresh*(
     result.diagnostics.add(progress.diagnostics)
     if not onHead.isNil:
       onHead(progress)
-    if progress.ok and not progress.reused and not progress.restored:
+    if progress.ok and not progress.reused and not progress.restored and
+        request.overlays.len == 0:
       try:
         diskCache.storeHead(progress.analysis)
       except CatchableError as error:

@@ -22,3 +22,6 @@ tests/output/
 .tool-versions
 .env
 .env.*
+
+# Python profiling-tool bytecode.
+__pycache__/

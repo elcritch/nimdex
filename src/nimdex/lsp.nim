@@ -1,11 +1,13 @@
 ## Minimal LSP 3.18 session handling for Nimdex.
 
-import std/[algorithm, json, os, sequtils, strutils, syncio, tables]
+import std/[algorithm, json, os, sequtils, strutils, syncio, tables, monotimes, times]
 
 import chronicles
 import sigils
 import sigils/rpcs/jsonrpc
 import sigils/rpcs/json/jrStdio as jrStdio
+
+import ./workerlife
 
 import ./bifindex
 import ./compiler
@@ -85,6 +87,9 @@ type
     inputStopped: bool
     deferredShutdownResponse: string
     positionEncoding: PositionEncoding
+    openDocuments: DocumentStore
+    overlayIdentity: uint64
+    refreshDeadline: int64
     documentGeneration: uint64
     compilerSourceGeneration: uint64
     state: LspSessionState
@@ -95,6 +100,7 @@ type
     queued: seq[LspQueuedRequest]
     indexThread: ptr SigilThreadDefault
     indexJob: AgentProxy[BifIndexJob]
+    retiredThreads: seq[SigilThreadDefaultPtr]
     compilerThread: ptr SigilThreadDefault
     compilerJob: AgentProxy[CompilerRefreshJob]
     compilerCancellation: CompilerCancellation
@@ -103,6 +109,7 @@ type
     publishedDiagnosticUris: Table[string, bool]
     activeSnapshot: SemanticSnapshot
     compilerHeads: seq[HeadAnalysis]
+    savedHeads: seq[HeadAnalysis]
     refreshEntryPoints: seq[string]
     progressHeads: seq[HeadAnalysis]
     progressSnapshot: SemanticSnapshot
@@ -141,6 +148,7 @@ let
     selector[JsonNode, JsonNode]("workspace/didChangeWatchedFiles")
   documentSymbolSelector = selector[JsonNode, JsonNode]("textDocument/documentSymbol")
   workspaceSymbolSelector = selector[JsonNode, JsonNode]("workspace/symbol")
+  definitionSelector = selector[JsonNode, JsonNode]("textDocument/definition")
   hoverSelector = selector[JsonNode, JsonNode]("textDocument/hover")
   debugSelector = selector[JsonNode, JsonNode](LspDebugMethod)
 
@@ -687,6 +695,9 @@ proc debugLsp(server: LspServer, params: JsonNode): JsonNode =
   result["paths"] = paths
 
   let refresh = newJObject()
+  refresh["openBuffers"] = %server.openDocuments.len
+  refresh["debouncing"] = %(server.refreshDeadline > 0)
+  refresh["retiredWorkers"] = %server.retiredThreads.len
   refresh["cachePath"] = %server.lastCompilerCachePath
   refresh["exitCode"] = %server.lastCompilerExitCode
   refresh["stdoutBytes"] = %server.lastCompilerStdoutBytes
@@ -711,7 +722,7 @@ proc debugLsp(server: LspServer, params: JsonNode): JsonNode =
 
   var semanticNode: JsonNode = newJObject()
   semanticNode["ready"] = %server.semanticReady
-  semanticNode["loading"] = %server.semanticLoading
+  semanticNode["loading"] = %(server.semanticLoading or server.refreshDeadline > 0)
   semanticNode["failed"] = %server.semanticFailed
   semanticNode["moduleCount"] = %server.activeSnapshot.moduleCount()
   semanticNode["symbolCount"] = %server.activeSnapshot.symbolCount()
@@ -802,6 +813,13 @@ proc submitLanguageRequest(
 
 proc initializeLsp(server: LspServer, params: JsonNode): JsonNode
 
+proc reapWorkers(server: LspServer) =
+  var retained: seq[SigilThreadDefaultPtr]
+  for thread in server.retiredThreads:
+    if not thread.disposeJoined():
+      retained.add(thread)
+  server.retiredThreads = move(retained)
+
 proc stopSemanticIndex(server: LspServer) =
   if server.indexThread.isNil:
     return
@@ -810,8 +828,9 @@ proc stopSemanticIndex(server: LspServer) =
   ## completes. It is never run on a Sigils pool worker.
   server.indexThread.send(ThreadSignal(kind: Exit))
   server.indexThread.join()
-  server.indexThread = nil
   server.indexJob = nil
+  server.retiredThreads.add(server.indexThread)
+  server.indexThread = nil
 
 proc startSemanticIndex(server: LspServer) =
   if not server.semanticCapabilities or server.semanticLoading or server.semanticReady:
@@ -839,8 +858,9 @@ proc stopCompilerRefresh(server: LspServer) =
     server.compilerCancellation.cancelCompiler()
     server.compilerThread.send(ThreadSignal(kind: Exit))
     server.compilerThread.join()
-    server.compilerThread = nil
     server.compilerJob = nil
+    server.retiredThreads.add(server.compilerThread)
+    server.compilerThread = nil
   if not server.compilerCancellation.isNil:
     server.compilerCancellation.releaseCompilerCancellation()
     server.compilerCancellation = nil
@@ -851,17 +871,24 @@ proc compilerDiagnosticPosition(
 ): tuple[start, finish: TextPosition] =
   result.start = TextPosition(line: 0, character: 0)
   result.finish = result.start
-  if diagnostic.sourcePath.len == 0 or not diagnostic.hasLocation or
-      not fileExists(diagnostic.sourcePath):
+  if diagnostic.sourcePath.len == 0 or not diagnostic.hasLocation or (
+    not fileExists(diagnostic.sourcePath) and
+    not server.openDocuments.containsDocument(diagnostic.sourceUri)
+  ):
     result.start = TextPosition(
       line: max(int(diagnostic.line) - 1, 0), character: max(int(diagnostic.column), 0)
     )
     result.finish = result.start
     return
   try:
-    let document = initDocumentSnapshot(
-      diagnostic.sourceUri, readFile(diagnostic.sourcePath), 0, server.positionEncoding
-    )
+    var document: DocumentSnapshot
+    if not server.openDocuments.tryFindDocument(diagnostic.sourceUri, document):
+      document = initDocumentSnapshot(
+        diagnostic.sourceUri,
+        readFile(diagnostic.sourcePath),
+        0,
+        server.positionEncoding,
+      )
     let line = max(int(diagnostic.line) - 1, 0)
     let offset = document.lineStartOffset(line) + max(int(diagnostic.column), 0)
     if not document.tryPositionAt(offset, result.start):
@@ -921,6 +948,9 @@ proc publishCompilerDiagnostics(
   for uri in uris.keys:
     var params = newJObject()
     params["uri"] = %uri
+    var document: DocumentSnapshot
+    if server.openDocuments.tryFindDocument(uri, document):
+      params["version"] = %document.version
     var values = newJArray()
     if uri in grouped:
       for diagnostic in grouped[uri]:
@@ -981,6 +1011,8 @@ proc documentHasAnalysis(server: LspServer, uri: string): bool =
 
 proc prepareCompilerRefresh(server: LspServer) =
   server.refreshEntryPoints = server.workspace.discoverCompilerEntryPoints()
+  server.savedHeads =
+    server.savedHeads.filterIt(it.headPath in server.refreshEntryPoints)
   server.progressUsesPrevious =
     server.semanticReady and
     server.activeSnapshot.graph.heads == server.refreshEntryPoints
@@ -991,9 +1023,17 @@ proc prepareCompilerRefresh(server: LspServer) =
   server.completedHeads.setLen(0)
   server.failedHeads.setLen(0)
   server.headDiagnostics.clear()
-  for head in server.compilerHeads:
-    if head.headPath in server.refreshEntryPoints:
-      server.headDiagnostics[head.headPath] = head.diagnostics
+
+proc reusableHeads(server: LspServer): seq[HeadAnalysis] =
+  result = server.compilerHeads
+  for saved in server.savedHeads:
+    var retained = false
+    for head in result:
+      if head.headPath == saved.headPath and head.overlayFingerprint == 0:
+        retained = true
+        break
+    if not retained:
+      result.add(saved)
 
 proc startCompilerRefresh(server: LspServer) =
   if not server.compilerEnabled or server.compilerLoading:
@@ -1020,7 +1060,8 @@ proc startCompilerRefresh(server: LspServer) =
     documentGeneration: server.documentGeneration,
     sourceGeneration: server.compilerSourceGeneration,
     cancellation: cancellation,
-    previousHeads: server.compilerHeads,
+    previousHeads: server.reusableHeads(),
+    overlays: server.openDocuments.dirtyDocuments(),
     forceRebuild: server.forceCompilerRefresh,
     priorityHead: server.headForDocument(server.activeDocument),
   )
@@ -1043,6 +1084,7 @@ proc startCompilerRefresh(server: LspServer) =
 proc requestCompilerRefresh(server: LspServer) =
   if not server.compilerEnabled:
     return
+  server.refreshDeadline = 0
   if server.compilerLoading:
     server.compilerRefreshPending = true
     server.compilerCancellation.cancelCompiler()
@@ -1050,6 +1092,56 @@ proc requestCompilerRefresh(server: LspServer) =
     server.startCompilerRefresh()
   else:
     server.runCompilerRefreshSynchronously()
+
+proc validBufferUpdate(server: LspServer, request: LanguageRequest): bool =
+  var current: DocumentSnapshot
+  let opened = server.openDocuments.tryFindDocument(request.uri, current)
+  case request.kind
+  of lrkOpen:
+    not opened
+  of lrkChange:
+    opened and request.version > current.version
+  of lrkClose:
+    opened
+  else:
+    true
+
+proc recordBufferUpdate(server: LspServer, request: LanguageRequest) =
+  case request.kind
+  of lrkOpen:
+    discard server.openDocuments.openDocument(
+      request.uri, request.text, request.version, request.positionEncoding
+    )
+  of lrkChange:
+    discard server.openDocuments.updateDocument(
+      request.uri, request.text, request.version, request.positionEncoding
+    )
+  of lrkClose:
+    discard server.openDocuments.closeDocument(request.uri)
+  else:
+    return
+  var keys: seq[string]
+  for document in server.openDocuments.dirtyDocuments():
+    keys.add(document.path & "\0" & $document.textHash)
+  keys.sort()
+  let identity =
+    if keys.len == 0:
+      0'u64
+    else:
+      stableTextHash(keys.join("\0"))
+  if identity == server.overlayIdentity:
+    return
+  server.overlayIdentity = identity
+  if not server.compilerEnabled:
+    return
+  inc server.compilerSourceGeneration
+  server.compilerCancellation.cancelCompiler()
+  if server.asynchronousSession:
+    # Only the home loop advances this deadline. While waiting it polls in
+    # short intervals; with no pending edit it blocks normally without spinning.
+    server.refreshDeadline = getMonoTime().ticks + 200_000_000
+  else:
+    server.requestCompilerRefresh()
 
 proc runCompilerRefreshSynchronously(server: LspServer) =
   if not server.compilerEnabled:
@@ -1067,7 +1159,8 @@ proc runCompilerRefreshSynchronously(server: LspServer) =
         documentGeneration: server.documentGeneration,
         sourceGeneration: server.compilerSourceGeneration,
         cancellation: cancellation,
-        previousHeads: server.compilerHeads,
+        previousHeads: server.reusableHeads(),
+        overlays: server.openDocuments.dirtyDocuments(),
         forceRebuild: server.forceCompilerRefresh,
         priorityHead: server.headForDocument(server.activeDocument),
       ),
@@ -1201,6 +1294,10 @@ proc languageResult(kind: LanguageRequestKind, response: LanguageResponse): Json
     result = newJArray()
     for symbol in response.symbols:
       result.add(symbol.lspSymbolInformation())
+  of lrkDefinition:
+    result = newJArray()
+    for symbol in response.symbols:
+      result.add(symbol.lspSymbolInformation()["location"])
   of lrkHover:
     if not response.found:
       return newJNull()
@@ -1261,23 +1358,31 @@ proc submitLanguageRequest(
 
   var awaitingHead = false
   var missingHead = false
-  if hasResponse and server.compilerEnabled and kind in {lrkDocumentSymbols, lrkHover}:
+  if hasResponse and server.compilerEnabled and
+      kind in {lrkDocumentSymbols, lrkHover, lrkDefinition}:
     let path = pathFromDocumentUri(request.uri)
     let chosen = server.preferredHeads.getOrDefault(
       path, server.activeSnapshot.graph.preferredHead(path)
     )
-    missingHead = not server.documentHasAnalysis(request.uri)
+    missingHead =
+      not server.documentHasAnalysis(request.uri) or (
+        server.openDocuments.containsDocument(request.uri) and
+        (server.refreshDeadline > 0 or server.compilerRefreshPending)
+      )
     if missingHead:
       awaitingHead =
-        server.compilerLoading and
-        (chosen.len == 0 or chosen notin server.completedHeads)
+        server.refreshDeadline > 0 or (
+          server.compilerLoading and
+          (chosen.len == 0 or chosen notin server.completedHeads)
+        )
       if not awaitingHead:
         server.sendError(
           id, LspAnalysisUnavailable, "analysis unavailable for this document's head"
         )
         return false
 
-  if hasResponse and kind in {lrkDocumentSymbols, lrkWorkspaceSymbols, lrkHover} and
+  if hasResponse and
+      kind in {lrkDocumentSymbols, lrkWorkspaceSymbols, lrkHover, lrkDefinition} and
       server.semanticCapabilities and (
     awaitingHead or (kind == lrkWorkspaceSymbols and server.compilerLoading) or
     (not server.semanticReady and not server.semanticFailed)
@@ -1377,8 +1482,10 @@ proc submitAsyncLspRequest(
       request = parseDocumentSymbolsRequest(params, server.positionEncoding)
     of "workspace/symbol":
       request = parseWorkspaceSymbolsRequest(params, server.positionEncoding)
-    of "textDocument/hover":
+    of "textDocument/hover", "textDocument/definition":
       request = parseHoverRequest(params, server.positionEncoding)
+      if methodName == "textDocument/definition":
+        request.kind = lrkDefinition
     else:
       return
 
@@ -1389,13 +1496,21 @@ proc submitAsyncLspRequest(
       textBytes = request.text.len,
       query = request.query
 
+    if not server.validBufferUpdate(request):
+      debug "Ignoring stale or unordered buffer notification",
+        uri = request.uri, version = request.version
+      return
     var stamp = server.currentLanguageStamp()
     if request.kind in {lrkOpen, lrkChange, lrkClose}:
       inc stamp.documentGeneration
     let accepted = server.submitLanguageRequest(request, id, request.kind, stamp)
     if accepted and request.kind in {lrkOpen, lrkChange, lrkClose}:
       server.documentGeneration = stamp.documentGeneration
-    if accepted and request.kind in {lrkOpen, lrkChange, lrkDocumentSymbols, lrkHover}:
+      server.recordBufferUpdate(request)
+    if accepted and
+        request.kind in {
+          lrkOpen, lrkChange, lrkDocumentSymbols, lrkHover, lrkDefinition
+        }:
       server.prioritizeDocument(request.uri)
   except RpcRouteError as error:
     if hasResponse:
@@ -1474,7 +1589,7 @@ proc dispatchIncomingJsonRpc(server: LspServer, data: string) =
   if methodName == "textDocument/didOpen" or methodName == "textDocument/didChange" or
       methodName == "textDocument/didClose" or
       methodName == "textDocument/documentSymbol" or methodName == "workspace/symbol" or
-      methodName == "textDocument/hover":
+      methodName == "textDocument/hover" or methodName == "textDocument/definition":
     server.submitAsyncLspRequest(methodName, root.requestParams(), id)
     return
 
@@ -1657,7 +1772,10 @@ proc receiveCompilerRefreshCompletion(
       server.activeSnapshot.preferredHeads = server.preferredHeads
       server.language.installIndex(server.activeSnapshot)
     server.compilerHeads = refresh.heads
+    if server.openDocuments.dirtyDocuments().len == 0:
+      server.savedHeads = refresh.heads
     server.progressSnapshot = SemanticSnapshot()
+    server.progressHeads.setLen(0)
     server.semanticReady = refresh.heads.len > 0
     server.semanticFailed = not server.semanticReady
   if not refresh.ok:
@@ -1712,6 +1830,8 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
   )
   server.artifactRoots = server.workspace.artifactRoots
   server.refreshEntryPoints = server.workspace.discoverCompilerEntryPoints()
+  server.savedHeads =
+    server.savedHeads.filterIt(it.headPath in server.refreshEntryPoints)
   for source, head in compilerOptions.preferredHeads:
     let sourcePath = resolveWorkspacePaths(rootUri, @[source])[0]
     let headPath = resolveWorkspacePaths(rootUri, @[head])[0]
@@ -1765,6 +1885,7 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
     capabilities["documentSymbolProvider"] = %true
     capabilities["workspaceSymbolProvider"] = %true
     capabilities["hoverProvider"] = %true
+    capabilities["definitionProvider"] = %true
   result["capabilities"] = capabilities
 
   let serverInfo = newJObject()
@@ -1795,6 +1916,9 @@ proc shutdownLsp(server: LspServer, params: JsonNode): JsonNode =
   server.requireRunning()
   server.cancelQueuedLanguageWork()
   server.state = lssShuttingDown
+  server.refreshDeadline = 0
+  server.compilerRefreshPending = false
+  server.compilerCancellation.cancelCompiler()
   newJNull()
 
 proc exitLsp(server: LspServer, params: JsonNode): JsonNode =
@@ -1809,10 +1933,11 @@ proc exitLsp(server: LspServer, params: JsonNode): JsonNode =
 
 proc didOpenLsp(server: LspServer, params: JsonNode): JsonNode =
   server.requireRunning()
-  let response =
-    server.language.request(parseOpenRequest(params, server.positionEncoding))
+  let request = parseOpenRequest(params, server.positionEncoding)
+  let response = server.language.request(request)
   requireLanguageSuccess(response)
   inc server.documentGeneration
+  server.recordBufferUpdate(request)
   server.prioritizeDocument(
     requireString(params["textDocument"], "uri", "didOpen textDocument")
   )
@@ -1820,10 +1945,11 @@ proc didOpenLsp(server: LspServer, params: JsonNode): JsonNode =
 
 proc didChangeLsp(server: LspServer, params: JsonNode): JsonNode =
   server.requireRunning()
-  let response =
-    server.language.request(parseChangeRequest(params, server.positionEncoding))
+  let request = parseChangeRequest(params, server.positionEncoding)
+  let response = server.language.request(request)
   requireLanguageSuccess(response)
   inc server.documentGeneration
+  server.recordBufferUpdate(request)
   newJNull()
 
 proc noticeDiskChange(server: LspServer, uri: string) =
@@ -1874,9 +2000,11 @@ proc didChangeWatchedFilesLsp(server: LspServer, params: JsonNode): JsonNode =
 
 proc didCloseLsp(server: LspServer, params: JsonNode): JsonNode =
   server.requireRunning()
-  let response = server.language.request(parseCloseRequest(params))
+  let request = parseCloseRequest(params)
+  let response = server.language.request(request)
   requireLanguageSuccess(response)
   inc server.documentGeneration
+  server.recordBufferUpdate(request)
   newJNull()
 
 proc documentSymbolsLsp(server: LspServer, params: JsonNode): JsonNode =
@@ -1925,6 +2053,19 @@ proc hoverLsp(server: LspServer, params: JsonNode): JsonNode =
   result["contents"] = contents
   result["range"] = response.symbols[0].lspRange()
 
+proc definitionLsp(server: LspServer, params: JsonNode): JsonNode =
+  server.requireRunning()
+  var request = parseHoverRequest(params, server.positionEncoding)
+  request.kind = lrkDefinition
+  if server.compilerEnabled and not server.documentHasAnalysis(request.uri):
+    raiseLspError(
+      LspAnalysisUnavailable, "analysis unavailable for this document's head"
+    )
+  server.prioritizeDocument(request.uri)
+  let response = server.language.request(request)
+  requireLanguageSuccess(response)
+  languageResult(lrkDefinition, response)
+
 proc registerLspRoutes(server: LspServer) =
   discard server.addMethod(initializeSelector, toDynamicMethod(initializeLsp))
   discard server.addMethod(initializedSelector, toDynamicMethod(initializedLsp))
@@ -1940,6 +2081,7 @@ proc registerLspRoutes(server: LspServer) =
   discard server.addMethod(documentSymbolSelector, toDynamicMethod(documentSymbolsLsp))
   discard
     server.addMethod(workspaceSymbolSelector, toDynamicMethod(workspaceSymbolsLsp))
+  discard server.addMethod(definitionSelector, toDynamicMethod(definitionLsp))
   discard server.addMethod(hoverSelector, toDynamicMethod(hoverLsp))
   discard server.addMethod(debugSelector, toDynamicMethod(debugLsp))
 
@@ -1963,6 +2105,9 @@ proc registerLspRoutes(server: LspServer) =
   )
   server.adapter.registerSelectorMethod(
     "workspace/symbol", server, workspaceSymbolSelector
+  )
+  server.adapter.registerSelectorMethod(
+    "textDocument/definition", server, definitionSelector
   )
   server.adapter.registerSelectorMethod("textDocument/hover", server, hoverSelector)
   server.adapter.registerSelectorMethod(LspDebugMethod, server, debugSelector)
@@ -2013,9 +2158,39 @@ proc close*(server: LspServer) =
     server.stopSemanticIndex()
     server.stopCompilerRefresh()
     server.language.close()
+    server.reapWorkers()
+    server.compilerHeads.setLen(0)
+    server.savedHeads.setLen(0)
+    server.progressHeads.setLen(0)
+    server.activeSnapshot = SemanticSnapshot()
+    server.progressSnapshot = SemanticSnapshot()
+    server.openDocuments = DocumentStore()
 
 proc writeLspResponse(server: LspServer, response: JsonRpcResponse) {.slot.} =
   server.writer.queueResponse(boundedLspResponse(response))
+
+proc connectStdioReader(
+    server: LspServer,
+    dispatcher: JsonRpcDispatcher,
+    readerProxy: AgentProxy[NimdexLspStdioReader],
+) =
+  connect(dispatcher, jsonRpcResponseReady, server, writeLspResponse(LspServer))
+  connectThreaded(
+    readerProxy, jsonRpcRequestReceived, server, receiveJsonRpcRequest(LspServer)
+  )
+  connectThreaded(readerProxy, jsonRpcStopped, server, receiveJsonRpcStopped(LspServer))
+  connectThreaded(
+    dispatcher, jsonRpcStartRequested, readerProxy, JsonRpcIoAgent.startJsonRpcIo()
+  )
+  connectThreaded(
+    dispatcher, jsonRpcStopRequested, readerProxy, JsonRpcIoAgent.stopJsonRpcIo()
+  )
+  connectThreaded(
+    readerProxy, jsonRpcStarted, dispatcher, JsonRpcDispatcher.recordJsonRpcStarted()
+  )
+  connectThreaded(
+    readerProxy, jsonRpcStopped, dispatcher, JsonRpcDispatcher.recordJsonRpcStopped()
+  )
 
 proc runNimdexLspStdio*(
     input: File = stdin,
@@ -2041,25 +2216,9 @@ proc runNimdexLspStdio*(
   server.writer = writer
   let readerThread = newSigilThread()
   var reader = newNimdexLspStdioReader(input)
-  let readerProxy = reader.moveToThread(readerThread)
+  var readerProxy = reader.moveToThread(readerThread)
 
-  connect(dispatcher, jsonRpcResponseReady, server, writeLspResponse(LspServer))
-  connectThreaded(
-    readerProxy, jsonRpcRequestReceived, server, receiveJsonRpcRequest(LspServer)
-  )
-  connectThreaded(readerProxy, jsonRpcStopped, server, receiveJsonRpcStopped(LspServer))
-  connectThreaded(
-    dispatcher, jsonRpcStartRequested, readerProxy, JsonRpcIoAgent.startJsonRpcIo()
-  )
-  connectThreaded(
-    dispatcher, jsonRpcStopRequested, readerProxy, JsonRpcIoAgent.stopJsonRpcIo()
-  )
-  connectThreaded(
-    readerProxy, jsonRpcStarted, dispatcher, JsonRpcDispatcher.recordJsonRpcStarted()
-  )
-  connectThreaded(
-    readerProxy, jsonRpcStopped, dispatcher, JsonRpcDispatcher.recordJsonRpcStopped()
-  )
+  server.connectStdioReader(dispatcher, readerProxy)
 
   writer.startIo()
   readerThread.start()
@@ -2069,6 +2228,7 @@ proc runNimdexLspStdio*(
     while true:
       let processed = server.home.pollAll(NonBlocking)
       server.finishLanguageWork()
+      server.reapWorkers()
       if server.isExitRequested():
         if server.pending.len == 0 and server.queued.len == 0 and
             server.language.pendingCount() == 0:
@@ -2077,13 +2237,21 @@ proc runNimdexLspStdio*(
         server.exitStatus = LspExitFailure
         server.cancelAllLanguageWork()
         break
-      if processed == 0:
+      if server.refreshDeadline > 0:
+        if getMonoTime().ticks >= server.refreshDeadline:
+          server.requestCompilerRefresh()
+        elif processed == 0:
+          sleep(10)
+      elif processed == 0:
         discard server.home.poll(Blocking)
   finally:
     if not readerThread.isNil:
       readerThread.send(ThreadSignal(kind: Exit))
       readerThread.join()
+      readerProxy = nil
+      doAssert readerThread.disposeJoined()
     server.close()
+    server.reapWorkers()
     writer.stopIo()
     info "Nimdex LSP server stopped", exitStatus = server.exitStatus()
 

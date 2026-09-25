@@ -1,9 +1,12 @@
 ## Worker-pool language components used by the Nimdex LSP server.
 
-import std/[atomics, os, sets, strutils, tables, times]
+import std/[atomics, os, sets, sha1, strutils, tables, times]
+
+import ./workerlife
 
 import ./documents
 import ./semantic
+import ./binnycompat
 
 import sigils
 
@@ -18,6 +21,7 @@ type
     lrkClose ## Remove a document from the worker state.
     lrkDocumentSymbols ## Query declarations for one source document.
     lrkWorkspaceSymbols ## Search declarations across indexed modules.
+    lrkDefinition ## Resolve a verified use to its compiler declaration.
     lrkHover ## Query compiler-backed hover information when available.
 
   LanguageSymbol* = object ## A verified semantic symbol and its source range.
@@ -63,10 +67,15 @@ type
 
   LanguageSource = ref object of AgentActor
 
+  OccurrenceCache = ref object
+    artifactHash, uri: string
+    values: seq[BinnyOccurrence]
+
   LanguageService = ref object of AgentActor
     documents: DocumentStore
     semantic: SemanticSnapshot
     hasSemantic: bool
+    occurrences: seq[OccurrenceCache]
     documentGeneration: uint64
     configurationGeneration: uint64
     configurationFingerprint: uint64
@@ -130,6 +139,15 @@ proc sourceDocumentFor(
   if not location.valid or location.sourceTextHash == 0:
     return false
 
+  var overlay: DocumentSnapshot
+  if self.documents.tryFindDocument(location.uri, overlay):
+    if overlay.textHash != location.sourceTextHash:
+      return false
+    document = initDocumentSnapshot(
+      location.uri, overlay.content, overlay.version, positionEncoding
+    )
+    return true
+
   if location.path.len > 0:
     if not fileExists(location.path):
       return false
@@ -140,15 +158,6 @@ proc sourceDocumentFor(
           return false
       except CatchableError:
         return false
-
-  var overlay: DocumentSnapshot
-  if self.documents.tryFindDocument(location.uri, overlay):
-    if overlay.textHash != location.sourceTextHash:
-      return false
-    document = initDocumentSnapshot(
-      location.uri, overlay.content, overlay.version, positionEncoding
-    )
-    return true
 
   if location.path.len == 0:
     return false
@@ -161,10 +170,16 @@ proc sourceDocumentFor(
   except CatchableError:
     false
 
-proc moduleIsCurrent(self: LanguageService, module: ModuleSnapshot): bool =
-  let head = self.semantic.preferredHeads.getOrDefault(
-    module.sourcePath, self.semantic.graph.preferredHead(module.sourcePath)
-  )
+proc moduleIsCurrent(
+    self: LanguageService, module: ModuleSnapshot, chosenHead = ""
+): bool =
+  let head =
+    if chosenHead.len > 0:
+      chosenHead
+    else:
+      self.semantic.preferredHeads.getOrDefault(
+        module.sourcePath, self.semantic.graph.preferredHead(module.sourcePath)
+      )
   if head.len > 0 and head notin module.headFiles:
     return false
   if module.sourceTextHash == 0:
@@ -311,7 +326,35 @@ proc addWorkspaceSymbols(
           seen.incl(symbol.key)
   response.found = response.symbols.len > 0
 
-proc findHoverSymbol(
+proc occurrencesFor(
+    self: LanguageService, module: ModuleSnapshot, uri, sourcePath: string
+): OccurrenceCache =
+  for i, entry in self.occurrences:
+    if entry.artifactHash == module.artifactHash and entry.uri == uri:
+      let recent = entry
+      self.occurrences.delete(i)
+      self.occurrences.add(recent)
+      return recent
+  # The compiler may already be replacing a cache. Never pair newer uses with
+  # an older declaration snapshot. Persistence alone does not validate a BIF.
+  try:
+    if module.artifactHash.len == 0 or not fileExists(module.artifactPath) or
+        $secureHashFile(module.artifactPath) != module.artifactHash:
+      return OccurrenceCache()
+    result = OccurrenceCache(
+      artifactHash: module.artifactHash,
+      uri: uri,
+      values: readBinnyOccurrences(module.artifactPath, sourcePath),
+    )
+    if $secureHashFile(module.artifactPath) != module.artifactHash:
+      return OccurrenceCache()
+  except CatchableError:
+    return OccurrenceCache()
+  if self.occurrences.len >= 4:
+    self.occurrences.delete(0)
+  self.occurrences.add(result)
+
+proc findPositionSymbol(
     self: LanguageService,
     request: LanguageRequest,
     response: var LanguageResponse,
@@ -324,42 +367,136 @@ proc findHoverSymbol(
     return
   let position = TextPosition(line: request.line, character: request.character)
   var sourceDocuments = initTable[string, DocumentSnapshot]()
+  let sourcePath = pathFromDocumentUri(response.uri)
+  let head = self.semantic.preferredHeads.getOrDefault(
+    sourcePath, self.semantic.graph.preferredHead(sourcePath)
+  )
+  var targets: seq[SymbolInfo]
+  var useSymbol: SymbolInfo
+  var useDocument: DocumentSnapshot
+  var useStart, useFinish: int
   for module in self.semantic.modules:
     if cancellation.isCancelled():
       response.ok = false
       response.cancelled = true
       response.error = "language request was cancelled"
       return
-    if not self.moduleIsCurrent(module):
+    if head.len > 0 and head notin module.headFiles:
       continue
+    if module.sourceUri != response.uri and sourcePath notin module.includes:
+      continue
+    if not self.moduleIsCurrent(module, head):
+      continue
+    # Declaration hover/definition also works after artifacts have been evicted.
     for symbol in module.symbols:
-      if cancellation.isCancelled():
-        response.ok = false
-        response.cancelled = true
-        response.error = "language request was cancelled"
-        return
-      if not symbol.location.valid or symbol.location.uri != response.uri:
+      if symbol.instantiatedFrom.len > 0 or symbol.location.uri != response.uri or
+          symbol.location.line != request.line + 1:
         continue
       var document: DocumentSnapshot
-      var startOffset, finishOffset: int
-      if not self.symbolSpan(
+      var startOffset, finishOffset, offset: int
+      if self.symbolSpan(
         symbol, request.positionEncoding, sourceDocuments, document, startOffset,
         finishOffset,
-      ):
+      ) and document.tryOffsetAt(position, offset) and offset >= startOffset and
+          offset < finishOffset:
+        targets = @[symbol]
+        useSymbol = symbol
+        useDocument = document
+        useStart = startOffset
+        useFinish = finishOffset
+        break
+    if targets.len > 0:
+      break
+    for occurrence in self.occurrencesFor(module, response.uri, sourcePath).values:
+      if occurrence.location.line != request.line + 1:
         continue
-      var offset: int
-      if not document.tryOffsetAt(position, offset):
-        continue
-      if offset >= startOffset and offset < finishOffset:
-        response.found = true
-        response.version = document.version
-        if not response.addLanguageSymbol(symbol, document, startOffset, finishOffset):
-          response.found = false
-          return
-        response.preview =
-          "**" & symbol.name & "**\n\n`" & symbol.kind & "` `" & symbol.qualifiedName &
-          "`"
-        return
+      var candidates = self.semantic.findSymbols(
+        occurrence.name,
+        head,
+        (if occurrence.name.count('.') < 2: module.sourcePath else: ""),
+      )
+      for symbol in candidates:
+        var querySymbol = symbol
+        querySymbol.location = SourceLocation(
+          valid: true,
+          uri: response.uri,
+          path: sourcePath,
+          sourceTextHash: module.sourceTextHash,
+          artifactModifiedUnix: module.artifactModifiedUnix,
+          line: occurrence.location.line,
+          column: occurrence.location.column,
+        )
+        # Includes have their own content hash, recorded on declarations.
+        if sourcePath != module.sourcePath:
+          for declared in module.symbols:
+            if declared.location.path == sourcePath:
+              querySymbol.location.sourceTextHash = declared.location.sourceTextHash
+              break
+        var document: DocumentSnapshot
+        var startOffset, finishOffset, offset: int
+        if occurrence.atCall:
+          if not self.cachedSourceDocumentFor(
+            querySymbol.location, request.positionEncoding, sourceDocuments, document
+          ):
+            continue
+          let text = document.lineText(request.line)
+          var column = int(querySymbol.location.column)
+          if column < text.len and text[column] == '(':
+            dec column
+            while column >= 0 and text[column] in {' ', '\t'}:
+              dec column
+            if column >= 0 and text[column] == ']':
+              var brackets = 1
+              dec column
+              while column >= 0 and brackets > 0:
+                if text[column] == ']':
+                  inc brackets
+                elif text[column] == '[':
+                  dec brackets
+                dec column
+            while column >= 0 and (
+              text[column] in {'a' .. 'z', 'A' .. 'Z', '0' .. '9', '_'} or
+              ord(text[column]) >= 128
+            )
+            :
+              dec column
+            querySymbol.location.column = int32(column + 1)
+        if self.symbolSpan(
+          querySymbol, request.positionEncoding, sourceDocuments, document, startOffset,
+          finishOffset,
+        ) and document.tryOffsetAt(position, offset) and offset >= startOffset and
+            offset < finishOffset:
+          targets.add(symbol)
+          useSymbol = querySymbol
+          useDocument = document
+          useStart = startOffset
+          useFinish = finishOffset
+      if targets.len > 0:
+        break
+    if targets.len > 0:
+      break
+  var seen = initHashSet[string]()
+  for symbol in targets:
+    var document: DocumentSnapshot
+    var startOffset, finishOffset: int
+    if not self.symbolSpan(
+      symbol, request.positionEncoding, sourceDocuments, document, startOffset,
+      finishOffset,
+    ):
+      continue
+    if seen.containsOrIncl(symbol.key):
+      continue
+    if request.kind == lrkDefinition:
+      discard response.addLanguageSymbol(symbol, document, startOffset, finishOffset)
+    else:
+      discard response.addLanguageSymbol(useSymbol, useDocument, useStart, useFinish)
+      response.preview =
+        "**" & symbol.name & "**\n\n`" & symbol.kind & "` `" & symbol.qualifiedName & "`"
+      if symbol.kind in ["proc", "func", "method", "iterator", "converter"]:
+        response.preview.add("\n\n`" & self.semantic.raisesDisplay(symbol) & "`")
+      break
+  response.found = response.symbols.len > 0
+  response.version = useDocument.version
 
 proc installSemanticSnapshot(
     self: LanguageService, snapshot: sink SemanticSnapshot
@@ -367,6 +504,7 @@ proc installSemanticSnapshot(
   self.configurationGeneration = snapshot.configurationGeneration
   self.configurationFingerprint = snapshot.configurationFingerprint
   self.compilerFingerprint = snapshot.compilerFingerprint
+  self.occurrences.setLen(0)
   self.semantic = snapshot
   self.hasSemantic = true
 
@@ -414,6 +552,9 @@ proc processLanguageWork(self: LanguageService, work: LanguageWork) {.slot.} =
     of lrkClose:
       inc self.documentGeneration
       discard self.documents.closeDocument(work.request.uri)
+      for i in countdown(self.occurrences.high, 0):
+        if self.occurrences[i].uri == response.uri:
+          self.occurrences.delete(i)
     of lrkDocumentSymbols:
       if self.hasSemantic and work.request.stamp.valid and (
         work.request.stamp.documentGeneration != self.documentGeneration or
@@ -442,7 +583,7 @@ proc processLanguageWork(self: LanguageService, work: LanguageWork) {.slot.} =
         self.addWorkspaceSymbols(
           work.request.query, work.request.positionEncoding, response, work.cancellation
         )
-    of lrkHover:
+    of lrkHover, lrkDefinition:
       if self.hasSemantic and work.request.stamp.valid and (
         work.request.stamp.documentGeneration != self.documentGeneration or
         work.request.stamp.configurationGeneration != self.configurationGeneration or
@@ -453,7 +594,7 @@ proc processLanguageWork(self: LanguageService, work: LanguageWork) {.slot.} =
         response.superseded = true
         response.error = "language request was superseded by newer state"
       else:
-        self.findHoverSymbol(work.request, response, work.cancellation)
+        self.findPositionSymbol(work.request, response, work.cancellation)
     response.stamp = LanguageStamp(
       valid: work.request.stamp.valid,
       projectId: self.semantic.projectId,
@@ -626,6 +767,8 @@ proc close*(runtime: LanguageRuntime) =
   runtime.serviceProxy = nil
   runtime.pool.stop()
   runtime.pool.join()
+  doAssert runtime.pool.disposeJoined()
+  runtime.pool = nil
   for cancellation in runtime.pending.values:
     cancellation.releaseCancellation()
   for cancellation in runtime.retired.values:

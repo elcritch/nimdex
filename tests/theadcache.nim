@@ -79,7 +79,8 @@ suite "owned semantic cache":
 
     var manifest = parseJson(readFile(manifestPath))
     let recordPath =
-      root / "cache/semantic-v1" / (manifest["modules"][0]["digest"].getStr() & ".json")
+      root / "cache" / ("semantic-v" & $HeadCacheVersion) /
+      (manifest["modules"][0]["digest"].getStr() & ".json")
     writeFile(recordPath, "{\"damaged\":true}")
     reader = initHeadCache(root / "cache")
     check not reader.restoreHead(

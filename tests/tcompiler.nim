@@ -84,7 +84,7 @@ suite "Nimdex compiler refresh":
     )
     let unsaved = server.debugState()
     check unsaved["refresh"]["compiledHeads"].getInt() == 2
-    check unsaved["semantic"]["sourceFingerprint"] ==
+    check unsaved["semantic"]["sourceFingerprint"] !=
       cold["semantic"]["sourceFingerprint"]
     writeFile(source, edited)
     server.notify("textDocument/didSave", %*{"textDocument": {"uri": uri}})
@@ -127,6 +127,7 @@ suite "Nimdex compiler refresh":
     let removed = server.debugState()
     check removed["moduleGraph"]["actualHeads"].len == 2
 
+    server.notify("textDocument/didClose", %*{"textDocument": {"uri": uri}})
     writeFile(source, "proc broken( = discard\n")
     server.notify("textDocument/didSave", %*{"textDocument": {"uri": uri}})
     let failed = server.debugState()

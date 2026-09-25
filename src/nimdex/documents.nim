@@ -380,16 +380,40 @@ proc tryTokenSpanAt*(
     except ValueError:
       return false
   let column = int(compilerColumn)
-  if column + token.len > text.len:
+  if column >= text.len:
     return false
-  if text[column ..< column + token.len] != token:
-    return false
+  var finish = column
+  if text[column] == '`':
+    let closing = text.find('`', column + 1)
+    if closing < 0:
+      return false
+    let actual = text[column + 1 ..< closing]
+    if actual != token and
+        (actual.len == 0 or actual[0] != token[0] or cmpIgnoreStyle(actual, token) != 0):
+      return false
+    finish = closing + 1
+  elif column > 0 and text[column - 1] == '`':
+    return document.tryTokenSpanAt(
+      compilerLine, compilerColumn - 1, token, startOffset, finishOffset
+    )
+  elif text[column].isIdentifierByte and token[0].isIdentifierByte:
+    while finish < text.len and text[finish].isIdentifierByte:
+      inc finish
+    let actual = text[column ..< finish]
+    # Nim identifiers preserve the first character's case; subsequent ASCII
+    # letters ignore case and underscores. Compare the entire source token.
+    if actual[0] != token[0] or cmpIgnoreStyle(actual, token) != 0:
+      return false
+  else:
+    finish = column + token.len
+    if finish > text.len or text[column ..< finish] != token:
+      return false
   if column > 0 and text[column - 1].isIdentifierByte:
     return false
-  if column + token.len < text.len and text[column + token.len].isIdentifierByte:
+  if finish < text.len and text[finish].isIdentifierByte:
     return false
   startOffset = document.lineStartOffset(line) + column
-  finishOffset = startOffset + token.len
+  finishOffset = document.lineStartOffset(line) + finish
   if not document.tokenIsInSourceCode(startOffset):
     return false
   var position: TextPosition
@@ -468,3 +492,14 @@ proc tryFindDocument*(
 
 proc len*(store: DocumentStore): int =
   store.documents.len
+
+proc dirtyDocuments*(store: DocumentStore): seq[DocumentSnapshot] =
+  ## Open buffers whose current contents differ from the filesystem.
+  for document in store.documents.values:
+    try:
+      if fileExists(document.path) and
+          stableTextHash(readFile(document.path)) == document.textHash:
+        continue
+    except CatchableError:
+      discard
+    result.add(document)

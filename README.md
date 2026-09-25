@@ -96,13 +96,23 @@ Paths are relative to the workspace. The head must be discovered or explicitly
 configured. Otherwise, a head uses its own context and shared sources use the
 first resolved owner in path order.
 
-Nimdex currently provides document symbols, workspace symbols, hover, full
-document synchronization, and compiler diagnostics. Unsaved changes are
-synchronized, but position-sensitive semantic results remain unavailable
-until a matching compiler snapshot exists.
-Saving a document triggers analysis of disk contents. The server also accepts
-`workspace/didChangeWatchedFiles` for source, test, and configuration changes.
-Typing updates the buffer without repeatedly compiling unchanged disk files.
+Nimdex provides document symbols, workspace symbols, go to definition, hover,
+full document synchronization, and compiler diagnostics. Procedure hovers show
+compiler-derived static `raises` effects, including inferred exceptions and
+`raises: []`. Missing effect information is shown as `raises: unknown`.
+
+Edits are coalesced for 200 ms, then checked using Nim's dirty-file mappings.
+Multiple open buffers and includes retain their original source paths; editor
+text is never written over project files. Definitions and hover work on those
+checked buffers. Results from superseded revisions are discarded, and diagnostic
+notifications include the open document's version. Closing a buffer restores
+analysis of disk contents. Saves and `workspace/didChangeWatchedFiles` also
+trigger refreshes.
+
+Definition lookup uses compiler symbol identities to distinguish overloads,
+locals and generic instances within the selected actual head. Source ranges are
+verified against current text, including UTF-16 positions and Nim identifier
+spelling rules. Unverifiable generated locations return no target.
 
 ## How it works
 
@@ -128,6 +138,10 @@ which importers need rechecking. Only the current resolved module closure is
 indexed, so removed imports leave no stale symbols even though their old files
 remain in the compiler cache. Compiler state is separate from Nimdex's
 persistent semantic records. `compile` and `track` use distinct cache contexts.
+Dirty-buffer analysis currently uses `c --compileOnly:on` in a separate cache,
+even when saved-file analysis uses `track`. Dirty semantic records are never
+persisted as saved analyses. The compiler's dirty-file option cannot represent
+paths containing commas; these produce an analysis error.
 
 This mode is opt-in while broader compiler compatibility is evaluated.
 `nimcheck` conditionals and the incremental compiler's method dispatch behavior
@@ -141,15 +155,17 @@ the incremental compiler cache. Compilation work is still separate per head;
 sharing those artifacts across heads is future work.
 
 The daemon safely loads the generated BIF files through Binny and converts them into
-owned semantic records. BIF loading and indexing use Sigils worker pools; the
-blocking compiler process runs outside those workers.
+owned semantic records. BIF loading and indexing use Sigils worker pools, with at most four loaders by
+default to limit peak memory. Compiler processes run separately and are cancelled
+when superseded. Each compiler command has a five-minute limit and an 8 MiB
+capture limit per output stream.
 
 Resolved BIF imports and includes form the module graph. A module can belong
 to several actual heads, including a library compiled on its own and the tests
 that import it. Identical BIFs share immutable declaration records; different
 configurations and `isMainModule` branches retain their own variants.
 
-Opening a document or querying its symbols/hover prioritizes its head after
+Opening a document or querying its symbols/hover/definition prioritizes its head after
 the currently running head. Before its graph is known, Nimdex uses the closest
 head directory as a scheduling hint. Other heads load in the background.
 Document queries can complete as soon as their context is ready; workspace
@@ -174,8 +190,29 @@ heads. Changing environment variables between sessions invalidates reuse.
 `nimdex/debug` exposes pending/completed/failed heads, selected contexts, and
 `restoredHeads` alongside compilation and BIF reuse counts. Its optional
 `{"summaryOnly": true}` parameters omit module details for inexpensive polling.
-The compiler report also includes the selected `frontend`, `supportsTrack`,
-and the resolved companion executable paths.
+It also reports `openBuffers`, `debouncing`, and `retiredWorkers`. The compiler
+report includes the selected `frontend`, `supportsTrack`, and companion paths.
+
+The server uses open/close notifications and recent queries to manage its working
+set. A four-entry cache loads occurrences only for queried source files and drops
+them on buffer close or snapshot replacement. Identical declarations and immutable
+lookup indexes are shared; retained heads omit duplicate indexes.
+Sigils is pinned to the revision used to verify scheduler teardown. Saved analyses
+remain available while editing so closing buffers can reuse them. Binny is pinned
+to a revision that fixes token-buffer pool lifetime under ARC/atomic ARC.
+
+For a repeatable edit/close/reopen memory probe, build a release daemon and run:
+
+```sh
+deps/nim-devel/bin/nim c -d:release --out:/tmp/nimdex src/nimdex.nim
+python3 tools/profile_lsp.py --server /tmp/nimdex --cycles 100
+```
+
+The probe emits JSONL with daemon RSS, sampled compiler-tree RSS and cycle time.
+It also checks navigation, static effects, versioned diagnostics and clean shutdown.
+Use `--saved` for comparisons with older servers; use `--keep` to retain logs.
+See [the plan](PLAN.md#long-running-session-measurements) for measured results and
+remaining long-session work.
 
 The CLI uses the same protocol messages as an editor rather than calling the
 compiler or indexer through a separate shortcut.

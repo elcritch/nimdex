@@ -28,6 +28,7 @@ type
     reuseKey*: uint64
     inputPaths*: seq[string]
     inputFingerprint*: uint64
+    overlayFingerprint*: uint64
     snapshot*: ref SemanticSnapshot
     diagnostics*: seq[CompilerDiagnostic]
     artifactPaths*: seq[string]
@@ -52,7 +53,7 @@ type
     loadedModules*: int
 
 const
-  HeadCacheVersion* = 1
+  HeadCacheVersion* = 2
   MaxRecordBytes = 64'i64 * 1024 * 1024
   MaxManifestBytes = 8'i64 * 1024 * 1024
   MaxHeadBytes = 256'i64 * 1024 * 1024
@@ -180,6 +181,7 @@ proc restoreHead*(
     if not restored.snapshot[].containsModule(head):
       return false
     restored.snapshot[].recordHead(head)
+    restored.snapshot[].compactHead()
     analysis = move(restored)
     true
   except CatchableError:

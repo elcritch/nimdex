@@ -1,26 +1,30 @@
 # Binny-backed LSP plan
 
-Status: Phases 0–4b implemented. Phase 4c now includes progressive head loading,
+Status: Phases 0–4b and the first Phase 5 block are implemented. Phase 4c now includes progressive head loading,
 failure isolation, context selection, and persistent semantic records.
 Per-head `nim track` integration is implemented as an opt-in frontend; compiler
-artifact sharing across heads remains unimplemented. This document describes
+artifact sharing across heads remains unimplemented. Phase 5 now supplies
+cancellable compiler supervision, versioned dirty-buffer analysis, definitions,
+static `raises` hover information, and bounded occurrence caching. This document describes
 the remaining implementation stages and the compatibility gates for each one.
 
 ## Next work in order
 
-1. Complete the compatibility gates for the opt-in `nim track` frontend before
-   making it the default, especially persistence of diagnostics from skipped
-   modules. Per-head integration now lives entirely in Nimdex and uses the
-   current `deps/nim-devel/` toolchain without compiler changes.
-2. Validate reuse of compiler artifacts across compatible heads, starting with
-   prefilling separate head caches. Incrementality within one head does not
-   establish safe reuse between different heads.
-3. Add compiler process cancellation and unsaved-buffer analysis, preserving
-   source/configuration identity and rejecting superseded results.
-4. Index symbol occurrences and implement definition lookup, then references,
-   with verified source ranges and the selected actual-head context.
-5. Load lightweight ownership metadata before full semantic records and add
-   persistent-cache eviction. Track arbitrary compile-time inputs separately.
+1. Extend the repeatable edit/reopen soak to hours, larger projects, and Linux/
+   Windows CI. Track daemon and compiler RSS separately, cancellation of child
+   processes, failed edit recovery, and latency under queued requests.
+2. Complete diagnostic persistence for skipped `nim track` modules before
+   making that frontend the default. Dirty buffers currently use the verified
+   `c --compileOnly:on --trackDirty` path.
+3. Load lightweight ownership metadata before full semantic records, add a
+   resident-head budget, and evict unreferenced persistent records/compiler
+   artifacts. Open buffers and recent queries now guide the occurrence cache.
+4. Add references with explicit workspace completeness and actual-head context.
+   Extend definition fixtures for more macro-generated and multiline generic
+   call forms; keep unverified source mappings unavailable.
+5. Validate reuse of compiler artifacts across compatible heads, starting with
+   prefilling separate head caches. Track arbitrary compile-time inputs
+   separately from source/configuration dependencies.
 
 Keep the `nim check --genBif:on` compiler fix as an alternative frontend path
 and synthetic import batches as an optional background experiment. Neither is
@@ -53,7 +57,9 @@ The intended ownership boundary is:
 
 ## What the reviewed Binny checkout provides
 
-The dependency identifies itself as Binny 0.5.22 (`deps/binny/binny.nimble`); the checked-out revision is `a40e952`. The useful APIs for LSP work are the lower-level NIF/BIF reader APIs:
+Binny retains the 0.5.22 package version; Nimdex now pins revision
+`d21498d11ad5938b5e1371da07e64c91e7bb54d6` in `nimdex.nimble` for the token-buffer
+lifetime fix. The useful APIs for LSP work are the lower-level NIF/BIF reader APIs:
 
 - `binny/bif_safe` loads an owned, validated `BifModule`, applies resource limits, reports categorized failures, and offers `tryLoad` for a non-raising workspace-scan boundary.
 - `BifModule.index` records indexed global declarations with exported/hidden visibility. `declarations` enumerates them and `findDeclaration` looks up one declaration.
@@ -356,7 +362,7 @@ The local compiler revision `8f1a8f6` hashes absolute module paths for suffixes
 matching suffix nor a matching filename proves configuration compatibility.
 This phase reuses owned analyses; sharing frontend compilation across heads
 through `nim ic` requires separate compatibility work. Arbitrary compile-time
-file reads and unsaved-buffer overlays remain follow-up work. Phase 4c also
+file reads remain follow-up work; unsaved-buffer overlays are implemented in Phase 5. Phase 4c also
 invalidates persisted analyses when the compiler environment changes.
 Unknown client-reported disk changes conservatively invalidate all heads.
 
@@ -683,42 +689,92 @@ before claiming equivalence or measuring a startup improvement.
 
 #### Compiler cancellation and unsaved buffers
 
-- [ ] Replace the blocking compiler wait with cancellable process supervision.
-  Terminate and reap the driver and its `nifmake`/`nim m` children when work is
-  superseded or the server shuts down. Keep stdout/stderr draining and settle
-  each admitted request once; interrupted builds must not publish valid-cache
-  manifests. Test cancellation during a real child process and shutdown races.
-- [ ] Define a compiler overlay strategy that preserves original source paths,
-  import resolution, configuration discovery, includes, and artifact mapping
-  without writing client text over workspace files. Evaluate existing compiler
-  support before deciding whether a compiler extension is needed.
-- [ ] Key overlay analysis by document revisions/content and the selected
-  actual head. Keep overlay artifacts separate from disk-only cache entries;
-  preserve generation checks across edits, saves, closes, and out-of-order
-  completion. Debounce/coalesce edits to bound compiler work.
-- [ ] Verify imports and includes with multiple dirty buffers, diagnostics and
-  Unicode/CRLF positions, and save/revert behavior before serving semantic
-  results for unsaved text.
+- [x] Supervise the compiler with cancellation checkpoints, a five-minute
+  deadline, and bounded stdout/stderr captures. POSIX process groups terminate
+  and reap the driver; a real `staticExec` child cancellation test passes on
+  macOS. The Windows path uses `taskkill /T /F`; test it in Windows CI.
+- [x] Verify repeated `--trackDirty` mappings with the pinned compiler for heads,
+  imports and includes. Use a separate cache and `c --compileOnly:on` for dirty
+  analyses, retaining original source/configuration paths without modifying
+  workspace files. Commas in mapped paths are an explicit compiler limitation.
+- [x] Retain version-ordered open buffers on the protocol side and language
+  actor. Coalesce edits for 200 ms, stamp compiler work by source generation,
+  and reject superseded results. Out-of-order notifications cannot replace
+  current text. Clear obsolete pending-head diagnostics before new publication.
+- [x] Include dirty content fingerprints in per-head reuse and source identity.
+  Never persist dirty analyses as saved manifests. Retain at most one saved
+  analysis per actual head alongside the current analysis for close/revert reuse.
+- [x] Convert diagnostics against the checked open buffer and publish its version.
+  The soak exercises invalid edits, recovery, close/reopen and many edit bursts.
+- [ ] Verify Windows process-tree cancellation and broaden Unicode/CRLF dirty
+  diagnostic fixtures, including shutdown while the compiler is blocked.
 
-Full document synchronization alone is not compiler overlay support. Until
-overlay analysis exists, keep changed-buffer semantic positions unavailable.
+#### Occurrences, definitions, and static effects
 
-#### Occurrences, definitions, and references
+- [x] Extract local declarations and true symbol kinds through safe Binny loading.
+  Anonymous `td` compiler records are used while decoding effects, then discarded
+  instead of retaining them as non-source symbols.
+- [x] Load owned occurrences on demand into a four-entry cache keyed by artifact
+  hash and source URI. Verify BIF content before/after loading, and release cache
+  entries on document close or index replacement. Preserve selected-head context
+  and distinguish module-local identities. Traversal has a 100,000-use bound.
+- [x] Implement and advertise `textDocument/definition`. Real compiler tests cover
+  imports, overloads, shadowed locals, generic instances, includes, UTF-16,
+  style-insensitive identifiers, quoted operators, and stale/dirty buffers.
+  Inline generic callees use verified call-site tokens; speculative name lookup
+  is never substituted for compiler identity.
+- [x] Show explicit and inferred static `raises` lists for procedures, including
+  use-site hovers. Resolve inferred exception type identities through named
+  type declarations. Distinguish a proven empty list from unavailable effects.
+- [ ] Add references with context-aware deduplication and completeness while
+  heads are pending/failed. Broaden macro-generated and multiline generic
+  position coverage, and revisit occurrence limits for huge generated modules.
 
-- [ ] Extend safe BIF extraction with owned symbol occurrence records and
-  matching declaration identities, retaining source locations and actual-head
-  context. The compiler's `idetools` traversal can provide compatibility
-  evidence; Nimdex queries continue through its safe Binny boundary.
-- [ ] Implement `textDocument/definition` first, including imports, overloads,
-  locals, generics, includes, and generated-code locations where mapping is
-  proven. Verify source token ranges and negotiated position encoding.
-- [ ] Add `textDocument/references` after use-to-declaration identity is proven.
-  Deduplicate shared-module occurrences within the selected context and define
-  workspace completeness while heads are pending or failed. Do not merge
-  incompatible head variants into one symbol identity.
-- [ ] Advertise each capability only after real compiler fixtures and LSP
-  integration tests pass. Initial disk-backed occurrence work can proceed
-  before overlays, with the existing stale-buffer checks retained.
+#### Lifetime and memory work
+
+- [x] Release joined Sigils workers, their actors, channels, locks, and scheduler
+  state. Defer thread deallocation until callback-held proxies have unwound;
+  a proxy destructor can still send a release message to its scheduler.
+- [x] Share immutable lookup indexes with copy-on-write when adding another head;
+  a regression proves published readers retain their original indexes. Drop
+  duplicate indexes from retained per-head snapshots, and clear progressive
+  retention when the final snapshot is installed.
+- [x] Fix Binny's `TokenBuf` destructor to release managed pools and construction
+  state. A repeated safe-load probe and allocation stacks identified this leak.
+  Dependency lifetime tests cover both immediate destruction and cursors that
+  outlive the buffer; safe-loader and module suites also pass.
+- [x] Limit default concurrent BIF loaders to four. Explicit indexing options
+  can still select a different count; Atlas test job settings are unchanged.
+- [x] Add `tools/profile_lsp.py` for repeatable unique revisions, edit bursts,
+  failed edits, navigation/effects queries, close/reopen, RSS and shutdown.
+- [ ] Add resident-head and persistent-cache eviction; full semantic heads are
+  still retained. Extend short local soak evidence to hours on supported hosts.
+
+### Long-running-session measurements
+
+Measurements use release builds, atomic ARC, macOS arm64 and the pinned
+`deps/nim-devel/` compiler. RSS includes allocator reserves and should not be
+confused with live semantic payload. Compiler children are measured separately.
+
+| Probe | Result |
+| --- | --- |
+| Existing server, 15 repository heads and 20 unchanged saves | RSS 776.6 → 798.2 MiB |
+| Updated server, same 15 heads and 20 unchanged saves | RSS 230.6 → 256.5 MiB; plateau after three saves |
+| Updated server, 100 edit/close/reopen cycles | Final RSS 127.2 MiB; sampled peak 130.6 MiB |
+| Compiler process tree during that 100-cycle soak | Sampled peak 135.0 MiB, measured separately |
+
+The repository comparison indexes 212 unique modules after the changes (211
+before), about 68% less steady daemon RSS in this local run. The edit fixture
+uses unique procedure names, eight buffer changes per cycle, definition/raises
+queries, and an invalid edit every ten cycles. All 100 cycles, recovery checks,
+and shutdown completed. These are short local samples, not an hours-long or
+cross-platform stability claim. Timing overlapped other machine activity: the
+updated cold repository load took 136.9 s with the first document at 9.4 s;
+this run does not establish a cold-compilation speedup.
+
+Validation: 16 Nimdex test executables; three focused Binny lifetime/safe-loader
+executables; explicit real child-process cancellation; targeted navigation and
+snapshot-sharing regressions; `git diff --check`. All use `deps/nim-devel/`.
 
 Document highlights, completion, richer hover signatures, rename, and other
 features remain follow-ups requiring their own verified scope/range semantics.
