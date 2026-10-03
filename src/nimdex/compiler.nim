@@ -1,6 +1,10 @@
 ## Controlled Nim compiler refreshes and owned compiler diagnostics.
 
-import std/[algorithm, atomics, os, osproc, strutils, syncio, tables, times, monotimes]
+import
+  std/[
+    algorithm, atomics, json, os, osproc, strutils, syncio, tables, tempfiles, times,
+    monotimes,
+  ]
 
 when defined(posix):
   import std/posix
@@ -556,6 +560,49 @@ proc compilerArguments(
     result.add("--trackDirty:" & dirtyPath & "," & overlay.path & ",1,0")
   result.add(entryPoint)
 
+proc compilerCacheRoot(request: CompilerRefreshRequest, entryPoint: string): string =
+  if request.workspace.cacheRoot.len > 0:
+    return request.workspace.cacheRoot
+  var arguments = @["dump"]
+  arguments.add(request.workspace.nimArguments)
+  for path in request.workspace.importPaths:
+    arguments.add("--path:" & path)
+  arguments.add("--dump.format:json")
+  arguments.add("--colors:off")
+  arguments.add(entryPoint)
+  let captureDir = createTempDir("nimdex-cache-probe-", "")
+  defer:
+    removeDir(captureDir)
+  let output = runExternalCommand(
+    request.capabilities.compilerPath, arguments, request.workspace.rootPath,
+    captureDir, request.cancellation,
+  )
+  if output.exitCode == 0:
+    # Project configuration can echo text before Nim's one-line JSON dump.
+    for line in output.stdout.splitLines():
+      if not line.startsWith("{"):
+        continue
+      try:
+        let dumped = parseJson(line)
+        if dumped.kind == JObject and dumped.hasKey("nimcache") and
+            dumped["nimcache"].kind == JString:
+          let path = dumped["nimcache"].getStr()
+          if path.len > 0:
+            let absolute =
+              if isAbsolute(path):
+                path
+              else:
+                request.workspace.rootPath / path
+            return normalizeDocumentPath(absolute) / "nimdex"
+      except ValueError:
+        discard
+  raise newException(
+    IOError,
+    "unable to resolve the compiler's nimcache; configure cacheRoot or --cache-root" &
+      (if output.stderr.len > 0: ": " & output.stderr.strip()
+      else: ""),
+  )
+
 proc addBuildFailure(result: var CompilerRefreshResult, message, fallbackPath: string) =
   result.error = message
   result.diagnostics.add(
@@ -836,16 +883,20 @@ proc runCompilerRefresh*(
   if request.workspace.automaticImportPaths:
     effectiveRequest.workspace.importPaths =
       discoverProjectLayout(request.workspace.rootPath).sourceDirs
-  let cacheBase =
-    if request.workspace.cacheRoot.len > 0:
-      request.workspace.cacheRoot
-    else:
-      getTempDir() / "nimdex" / "nimcache"
+  var cacheBase: string
+  try:
+    cacheBase = compilerCacheRoot(effectiveRequest, entryPoints[0])
+  except CatchableError as error:
+    if request.cancellation.isCompilerCancelled():
+      result.cancelled = true
+    result.addBuildFailure(error.msg, entryPoints[0])
+    return
+  effectiveRequest.workspace.cacheRoot = cacheBase
   result.cachePath =
     cacheBase /
     ($result.compiler.fingerprint & "-" & $request.workspace.configurationFingerprint)
   ensureDirectory(result.cachePath)
-  let inventory = sourceInventory(request.workspace)
+  let inventory = sourceInventory(effectiveRequest.workspace)
   let reuseKey = stableTextHash(
     $result.compiler.fingerprint & "\0" & $request.workspace.configurationFingerprint &
       "\0" & $inventory & "\0" & $compilerEnvironmentFingerprint() & "\0" &
@@ -984,7 +1035,7 @@ proc runCompilerRefresh*(
   # Revalidate before the final snapshot: another head may have read changing inputs.
   var validated: seq[HeadAnalysis]
   var verificationCache: InputFingerprints
-  let inventoryCurrent = sourceInventory(request.workspace) == inventory
+  let inventoryCurrent = sourceInventory(effectiveRequest.workspace) == inventory
   for analysis in result.heads:
     if inventoryCurrent and
         fingerprintInputs(analysis.inputPaths, verificationCache) ==

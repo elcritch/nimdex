@@ -144,6 +144,44 @@ block cli_connection_validation:
   doAssert options.status == 2
   doAssert options.errors.contains("set analysis options when starting")
 
+block cli_log_file_validation:
+  let missing = runCli(["daemon", "--log-file"])
+  doAssert missing.status == 2
+  doAssert missing.errors.contains("--log-file requires a value")
+  let empty = runCli(["daemon", "--log-file", ""])
+  doAssert empty.status == 2
+  doAssert empty.errors.contains("--log-file requires a nonempty path")
+  let otherCommand = runCli(["check", "--log-file", "nimdex.log"])
+  doAssert otherCommand.status == 2
+  doAssert otherCommand.errors.contains("--log-file requires daemon")
+
+block daemon_log_file:
+  let directory = getTempDir() / ("nimdex-daemon-log-" & $getCurrentProcessId())
+  let logPath = directory / "daemon.log"
+  let process = startProcess(
+    testDaemon(), args = ["daemon", "--log-file", logPath], options = {poUsePath}
+  )
+  defer:
+    if process.running():
+      process.kill()
+      discard process.waitForExit()
+    process.close()
+    if fileExists(logPath):
+      removeFile(logPath)
+    if dirExists(directory):
+      removeDir(directory)
+  process.inputStream().close()
+  doAssert process.waitForExit(10000) != -1
+  let protocolOutput = process.outputStream().readAll()
+  let errorOutput = process.errorStream().readAll()
+  doAssert protocolOutput.len == 0
+  doAssert errorOutput.len == 0
+  doAssert readFile(logPath).contains("Starting Nimdex LSP server")
+
+  let invalid = runExternalCli(["daemon", "--log-file", directory])
+  doAssert invalid.status == 2
+  doAssert invalid.output.contains("could not open log file")
+
 block interactive_head_loading:
   let root = normalizeDocumentPath(
     getTempDir() / ("nimdex-stdio-heads-" & $getCurrentProcessId())
@@ -157,7 +195,9 @@ block interactive_head_loading:
   writeFile(bad, "proc broken( = discard\n")
   let compiler = currentSourcePath.parentDir.parentDir / "deps/nim-devel/bin/nim"
   let process = startProcess(
-    testDaemon(), args = ["daemon", "--frontend", "track"], options = {poUsePath}
+    testDaemon(),
+    args = ["daemon", "--frontend", "track", "--cache-root", "lsp-cache"],
+    options = {poUsePath},
   )
   var errorThread: Thread[Stream]
   createThread(errorThread, drainProtocolErrors, process.errorStream())
@@ -204,8 +244,14 @@ block interactive_head_loading:
         message["params"]["diagnostics"].len > 0:
       badDiagnostic = true
   doAssert badDiagnostic
-  process.sendProtocol("shutdown", %*{}, 5)
-  discard process.receiveProtocol(5, notifications)
+  process.sendProtocol("nimdex/debug", %*{}, 5)
+  let cacheDebug = process.receiveProtocol(5, notifications)["result"]
+  doAssert cacheDebug["workspace"]["cacheRoot"].getStr() == root / "lsp-cache"
+  doAssert cacheDebug["refresh"]["cachePath"].getStr().startsWith(
+    root / "lsp-cache" & DirSep
+  )
+  process.sendProtocol("shutdown", %*{}, 6)
+  discard process.receiveProtocol(6, notifications)
   process.sendProtocol("exit", %*{})
 
 block cli_symbols:

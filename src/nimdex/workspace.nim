@@ -23,7 +23,7 @@ type Workspace* = object
   artifactRoots*: seq[string]
   compilerPath*: string
   compilerFrontend*: CompilerFrontend
-  cacheRoot*: string
+  cacheRoot*: string ## Empty selects a Nimdex subdirectory of the compiler's nimcache.
   configurationGeneration*: uint64
   configurationFingerprint*: uint64
 
@@ -79,8 +79,6 @@ proc initWorkspace*(
   result.cacheRoot =
     if cacheRoot.len > 0:
       normalizeDocumentPath(cacheRoot)
-    elif result.rootPath.len > 0:
-      result.rootPath / ".nimdex" / "nimcache"
     else:
       ""
   result.configurationGeneration = configurationGeneration

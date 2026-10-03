@@ -350,6 +350,7 @@ else:
       removeDir(root)
     let head = root / "main.nim"
     writeFile(head, "proc visible*(): int = 1\n")
+    writeFile(root / "nim.cfg", "--nimcache:\"compiler-cache\"\n")
     let server = newNimdexLspServer(compilerPath = capabilities.compilerPath)
     defer:
       server.close()
@@ -385,7 +386,7 @@ else:
     require before.hasKey("result")
     require before["result"].len > 0
     var artifacts: Table[string, Time]
-    for path in walkDirRec(root / ".nimdex"):
+    for path in walkDirRec(root / "compiler-cache" / "nimdex"):
       if path.endsWith(".s.bif"):
         artifacts[path] = getLastModificationTime(path)
     require artifacts.len > 0

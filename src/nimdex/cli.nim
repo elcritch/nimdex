@@ -8,6 +8,19 @@ import
 
 when defined(posix):
   import std/posix
+  proc duplicateFd(fd: cint): cint =
+    posix.dup(fd)
+
+  proc redirectFd(source, target: cint): cint =
+    posix.dup2(source, target)
+
+  proc closeFd(fd: cint): cint =
+    posix.close(fd)
+
+else:
+  proc duplicateFd(fd: cint): cint {.importc: "_dup", header: "<io.h>".}
+  proc redirectFd(source, target: cint): cint {.importc: "_dup2", header: "<io.h>".}
+  proc closeFd(fd: cint): cint {.importc: "_close", header: "<io.h>".}
 
 import chronicles
 import sigils/rpcs/json/jrFraming
@@ -20,7 +33,7 @@ import ./lsp
 import ./projectlayout
 import ./workspace
 
-const NimdexVersion = "0.1.0"
+const NimdexVersion = "0.1.1"
 
 var cliServiceStopRequested: Atomic[bool]
 
@@ -49,6 +62,7 @@ type
     compilerPath: string
     compilerFrontend: string
     cacheRoot: string
+    logFile: string
     entryPoints: seq[string]
     importPaths: seq[string]
     artifactRoots: seq[string]
@@ -131,6 +145,7 @@ proc writeUsage(output: File) =
   output.writeLine("  --compiler PATH      Nim compiler or executable name")
   output.writeLine("  --frontend MODE      compile (default), track, or ic")
   output.writeLine("  --cache-root PATH    Nimdex compiler cache directory")
+  output.writeLine("  --log-file PATH      Append daemon stderr to PATH (daemon only)")
   output.writeLine("  --entry-point PATH   Nim entry point; may be repeated")
   output.writeLine("  --import-path PATH   Nim import path; may be repeated")
   output.writeLine("  --artifact-root PATH Existing BIF root; may be repeated")
@@ -268,6 +283,15 @@ proc parseCli(args: openArray[string]): CliParseResult =
         result.error = parsed.error
         return
       result.options.cacheRoot = parsed.value
+    of "--log-file":
+      let parsed = optionValue(args, index, argument)
+      if parsed.error.len > 0:
+        result.error = parsed.error
+        return
+      if parsed.value.len == 0:
+        result.error = "--log-file requires a nonempty path"
+        return
+      result.options.logFile = parsed.value
     of "--frontend":
       let parsed = optionValue(args, index, argument)
       if parsed.error.len > 0:
@@ -313,6 +337,9 @@ proc parseCli(args: openArray[string]): CliParseResult =
 
   if result.options.listenPort >= 0 and result.options.command != cliDaemon:
     result.error = "--listen requires daemon"
+    return
+  if result.options.logFile.len > 0 and result.options.command != cliDaemon:
+    result.error = "--log-file requires daemon"
     return
   if result.options.connectPort >= 0 and result.options.command == cliDaemon:
     result.error = "--connect is for CLI queries or stop"
@@ -1112,6 +1139,44 @@ proc runStopCommand(options: CliOptions, output, errorOutput: File): int =
     return 1
   0
 
+proc startDaemonLog(path: string, errorOutput: File): cint =
+  result = -1
+  try:
+    let directory = path.parentDir()
+    if directory.len > 0:
+      createDir(directory)
+    var logFile: File
+    if not logFile.open(path, fmAppend):
+      errorOutput.writeLine("nimdex: could not open log file: " & path)
+      return
+    defer:
+      logFile.close()
+
+    stderr.flushFile()
+    let savedFd = duplicateFd(stderr.getFileHandle().cint)
+    if savedFd < 0:
+      errorOutput.writeLine("nimdex: could not save stderr for log file: " & path)
+      return
+    when defined(posix):
+      if posix.fcntl(savedFd, posix.F_SETFD, posix.FD_CLOEXEC) < 0:
+        discard closeFd(savedFd)
+        errorOutput.writeLine("nimdex: could not prepare log file: " & path)
+        return
+    if redirectFd(logFile.getFileHandle().cint, stderr.getFileHandle().cint) < 0:
+      discard closeFd(savedFd)
+      errorOutput.writeLine("nimdex: could not redirect stderr to log file: " & path)
+      return
+    result = savedFd
+  except CatchableError as error:
+    errorOutput.writeLine(
+      "nimdex: could not prepare log file: " & path & ": " & error.msg
+    )
+
+proc stopDaemonLog(savedFd: cint) =
+  stderr.flushFile()
+  discard redirectFd(savedFd, stderr.getFileHandle().cint)
+  discard closeFd(savedFd)
+
 proc runNimdexCli*(
     args: openArray[string],
     output: File = stdout,
@@ -1131,27 +1196,39 @@ proc runNimdexCli*(
   case parsed.options.command
   of cliHelp:
     writeUsage(output)
-    0
+    return 0
   of cliVersion:
     output.writeLine("nimdex " & NimdexVersion)
-    0
+    return 0
   of cliDaemon:
-    if parsed.options.listenPort >= 0:
-      runCliService(parsed.options, errorOutput, daemonPath)
-    else:
-      runNimdexLspStdio(
-        input,
-        output,
-        compilerPath = parsed.options.compilerPath,
-        compilerFrontend =
-          if parsed.options.compilerFrontend == "track":
-            cfTrack
-          elif parsed.options.compilerFrontend == "ic":
-            cfIc
-          else:
-            cfCompile,
-      )
+    let savedFd =
+      if parsed.options.logFile.len > 0:
+        startDaemonLog(parsed.options.logFile, errorOutput)
+      else:
+        -1.cint
+    if parsed.options.logFile.len > 0 and savedFd < 0:
+      return 2
+    try:
+      if parsed.options.listenPort >= 0:
+        result = runCliService(parsed.options, errorOutput, daemonPath)
+      else:
+        result = runNimdexLspStdio(
+          input,
+          output,
+          compilerPath = parsed.options.compilerPath,
+          compilerFrontend =
+            if parsed.options.compilerFrontend == "track":
+              cfTrack
+            elif parsed.options.compilerFrontend == "ic":
+              cfIc
+            else:
+              cfCompile,
+          cacheRoot = parsed.options.cacheRoot,
+        )
+    finally:
+      if savedFd >= 0:
+        stopDaemonLog(savedFd)
   of cliStop:
-    runStopCommand(parsed.options, output, errorOutput)
+    result = runStopCommand(parsed.options, output, errorOutput)
   of cliCheck, cliSymbols, cliDebug:
-    runProjectCommand(parsed.options, output, errorOutput, daemonPath)
+    result = runProjectCommand(parsed.options, output, errorOutput, daemonPath)

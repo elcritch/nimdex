@@ -42,6 +42,68 @@ proc debugState(server: LspServer): JsonNode =
   )["result"]
 
 suite "Nimdex compiler refresh":
+  test "default cache follows Nim configuration and survives a new session":
+    let root = normalizeDocumentPath(
+      getTempDir() / ("nimdex-default-cache-" & $getCurrentProcessId())
+    )
+    createDir(root)
+    defer:
+      removeDir(root)
+    let head = root / "main.nim"
+    let source = root / "shared.nim"
+    writeFile(head, "import shared\nexport shared\n")
+    writeFile(source, "const cachedValue* = 1\n")
+    writeFile(
+      root / "config.nims",
+      "echo \"project configuration loaded\"\nswitch(\"nimcache\", \"compiler-cache\")\n",
+    )
+    let workspace = initWorkspace(
+      documentUriFromPath(root), entryPoints = @[head], compilerPath = projectCompiler()
+    )
+    var request = CompilerRefreshRequest(
+      workspace: workspace, capabilities: probeCompiler(projectCompiler())
+    )
+    let cold = runCompilerRefresh(request)
+    require cold.ok
+    check cold.compiledHeads == 1
+    check cold.cachePath.startsWith(root / "compiler-cache" / "nimdex" & DirSep)
+    check not dirExists(root / ".nimdex")
+    let originalDirectory = getCurrentDir()
+    let restarted = block:
+      setCurrentDir(getTempDir())
+      try:
+        runCompilerRefresh(request)
+      finally:
+        setCurrentDir(originalDirectory)
+    require restarted.ok
+    check restarted.cachePath == cold.cachePath
+    check restarted.compiledHeads == 0
+    check restarted.restoredHeads == 1
+    check restarted.commandLines.len == 0
+    check restarted.snapshot.findSymbols("cachedValue").len == 1
+
+    request.overlays =
+      @[
+        initDocumentSnapshot(documentUriFromPath(source), "const cachedValue* = 2\n", 1)
+      ]
+    let overlay = runCompilerRefresh(request)
+    checkpoint overlay.error
+    require overlay.ok
+    check overlay.heads[0].cachePath.contains(DirSep & "overlays" & DirSep)
+    request.overlays.setLen(0)
+    let afterOverlay = runCompilerRefresh(request)
+    require afterOverlay.ok
+    check afterOverlay.restoredHeads == 1
+    check afterOverlay.compiledHeads == 0
+
+    writeFile(source, "const changedValue* = 3\n")
+    let changed = runCompilerRefresh(request)
+    require changed.ok
+    check changed.compiledHeads == 1
+    check changed.restoredHeads == 0
+    check changed.snapshot.findSymbols("changedValue").len == 1
+    check changed.snapshot.findSymbols("cachedValue").len == 0
+
   test "refreshes on save and file events and exposes project graph and reuse":
     let root =
       normalizeDocumentPath(getTempDir() / ("nimdex-save-" & $getCurrentProcessId()))
@@ -50,6 +112,7 @@ suite "Nimdex compiler refresh":
     defer:
       removeDir(root)
     writeFile(root / "sample.nimble", "srcDir = \"src\"\n")
+    writeFile(root / "nim.cfg", "--nimcache:\"compiler-cache\"\n")
     let source = root / "src/sample.nim"
     let uri = documentUriFromPath(source)
     writeFile(source, "proc before*(): int = 1\n")

@@ -83,6 +83,7 @@ type
     artifactRoots: seq[string]
     configuredCompilerPath: string
     configuredCompilerFrontend: CompilerFrontend
+    configuredCacheRoot: string
     compiler: CompilerCapabilities
     compilerEnabled: bool
     semanticCapabilities: bool
@@ -322,11 +323,15 @@ proc initializationOptions(params: JsonNode): JsonNode =
   newJObject()
 
 proc compilerOptionsFromInitialize(
-    params: JsonNode, serverCompilerPath: string, serverFrontend: CompilerFrontend
+    params: JsonNode,
+    serverCompilerPath: string,
+    serverFrontend: CompilerFrontend,
+    serverCacheRoot: string,
 ): CompilerInitializeOptions =
   let options = initializationOptions(params)
   result.compilerFrontend = serverFrontend
-  if serverCompilerPath.len > 0 or serverFrontend != cfCompile:
+  result.cacheRoot = serverCacheRoot
+  if serverCompilerPath.len > 0 or serverFrontend != cfCompile or serverCacheRoot.len > 0:
     result.configured = true
   if options.kind != JObject:
     if serverCompilerPath.len > 0:
@@ -1827,7 +1832,8 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
   server.positionEncoding = negotiatePositionEncoding(params)
   let rootUri = rootUriFromInitialize(initializeParams)
   let compilerOptions = compilerOptionsFromInitialize(
-    initializeParams, server.configuredCompilerPath, server.configuredCompilerFrontend
+    initializeParams, server.configuredCompilerPath, server.configuredCompilerFrontend,
+    server.configuredCacheRoot,
   )
   let configuredRoots =
     if server.artifactRoots.len > 0:
@@ -1928,7 +1934,7 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
 
   let serverInfo = newJObject()
   serverInfo["name"] = %"nimdex"
-  serverInfo["version"] = %"0.1.0"
+  serverInfo["version"] = %"0.1.1"
   result["serverInfo"] = serverInfo
 
 proc initializedLsp(server: LspServer, params: JsonNode): JsonNode =
@@ -2175,6 +2181,7 @@ proc newNimdexLspServer*(
     artifactRoots: seq[string] = @[],
     compilerPath = "",
     compilerFrontend = cfCompile,
+    cacheRoot = "",
 ): LspServer =
   ## Create an LSP server with worker-owned document state.
   startLocalThreadDefault()
@@ -2185,6 +2192,7 @@ proc newNimdexLspServer*(
     artifactRoots: artifactRoots,
     configuredCompilerPath: compilerPath,
     configuredCompilerFrontend: compilerFrontend,
+    configuredCacheRoot: cacheRoot,
     state: lssCreated,
     exitStatus: LspExitSuccess,
     pending: initTable[LanguageWorkId, LspPendingRequest](),
@@ -2258,6 +2266,7 @@ proc runNimdexLspStdio*(
     artifactRoots: seq[string] = @[],
     compilerPath = "",
     compilerFrontend = cfCompile,
+    cacheRoot = "",
 ): int =
   ## Serve LSP Content-Length messages until EOF or an exit notification.
   ##
@@ -2269,8 +2278,9 @@ proc runNimdexLspStdio*(
     bifs = samplePaths(artifactRoots),
     total = artifactRoots.len,
     workers = workers
-  let server =
-    newNimdexLspServer(workers, artifactRoots, compilerPath, compilerFrontend)
+  let server = newNimdexLspServer(
+    workers, artifactRoots, compilerPath, compilerFrontend, cacheRoot
+  )
   server.asynchronousSession = true
   let dispatcher = newJsonRpcDispatcher(server.adapter)
   server.dispatcher = dispatcher

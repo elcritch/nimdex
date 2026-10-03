@@ -29,6 +29,18 @@ For development from a checkout, install project dependencies with
 
 Nimdex writes Chronicles text blocks to `stderr` with forced ANSI colors, even
 when the stream is redirected. LSP/JSON-RPC output on `stdout` remains clean.
+For a long-lived daemon, `--log-file PATH` appends stderr to a chosen file.
+Nimdex creates missing parent directories. A relative path uses the daemon's
+working directory; the option works with both stdio and `--listen` daemons.
+For example, set Kosmo's `nimLspCommand` to:
+
+```text
+/absolute/path/to/nimdex daemon --compiler /absolute/path/to/nim --log-file /absolute/path/to/nimdex.log
+```
+
+Restart the editor after changing its command. The log file retains ANSI color
+codes; omit `--log-file` to keep logs on stderr.
+
 Debug builds include debug-level details; release builds default to info-level
 summaries. BIF lists show a few filenames and a total;
 `cacheRunId` identifies their per-head cache subtree. The `debug` CLI command
@@ -109,13 +121,21 @@ Stopping and restarting the listener with the same project, compiler, frontend,
 and cache root restores valid head analyses from disk. `nimdex debug . --connect
 PORT | jq '.refresh | {compiledHeads, restoredHeads}'` shows whether the new
 daemon reused them; source or configuration changes rebuild affected heads.
+Without an explicit cache root, Nimdex asks the selected compiler for the
+resolved `nimcache` of the workspace's first entry point and stores artifacts and
+semantic records in its `nimdex/` subdirectory. This respects `nim.cfg`,
+`config.nims`, and the configured Nim arguments. Compiler/workspace fingerprints
+and per-head subdirectories keep analyses isolated; process IDs and launch
+directories do not select new caches. Unsaved buffers use a separate `overlays/`
+subdirectory and never replace the saved-source analyses.
 
 Useful options are:
 
 ```text
 --compiler PATH       Select the Nim compiler
 --frontend MODE       compile (default), track, or ic
---cache-root PATH     Store generated artifacts in PATH
+--cache-root PATH     Override the default nimcache/nimdex location
+--log-file PATH       Append daemon stderr to PATH (daemon only)
 --entry-point PATH    Add a Nim entry point (repeatable)
 --import-path PATH    Add a Nim import path (repeatable)
 --artifact-root PATH  Read existing BIF artifacts (repeatable)
@@ -132,6 +152,7 @@ Start the daemon directly when an editor launches an LSP server:
 
 ```sh
 nimdex daemon
+nimdex daemon --log-file /absolute/path/to/nimdex.log
 ```
 
 The client should send the project `rootUri` in `initialize`. Nimdex discovers
@@ -149,13 +170,17 @@ compiler configuration, put options such as these in
   "compilerPath": "/path/to/nim",
   "entryPoints": ["main.nim"],
   "importPaths": ["src"],
-  "cacheRoot": ".nimdex/nimcache"
+  "cacheRoot": "nimcache/nimdex"
 }
 ```
 
 Explicit `entryPoints` override automatic discovery. Computed Nimble metadata
 is reported in `nimdex/debug` under `workspace.discoveryWarnings`; configure
 entry points and import paths explicitly for those projects.
+Omit `cacheRoot` to use the compiler-resolved location. The stdio daemon's
+`--cache-root PATH` option also selects an explicit location for editor sessions;
+an initialization option overrides that command-line default. Relative cache
+paths are resolved against the initialized workspace root.
 
 For a source used under different test configurations, select its context with
 `"preferredHeads": {"src/shared.nim": "tests/tfeature.nim"}` in the same options.
