@@ -55,11 +55,32 @@ proc compilerRuns(refresh: CompilerRefreshResult): Table[string, Time] =
     result[artifact] = getLastModificationTime(edge)
 
 suite "incremental compiler frontend":
+  test "defaults saved-source analysis to ic":
+    let root = normalizeDocumentPath(createTempDir("nimdex-default-ic-", ""))
+    defer:
+      removeDir(root)
+    let head = root / "main.nim"
+    writeFile(head, "const defaultIcValue* = 1\n")
+    let workspace = initWorkspace(
+      documentUriFromPath(root), entryPoints = @[head], cacheRoot = root / ".nimdex"
+    )
+    check workspace.compilerFrontend == cfIc
+    let refreshed = runCompilerRefresh(
+      CompilerRefreshRequest(workspace: workspace, capabilities: capabilities)
+    )
+    checkpoint refreshed.error & "\n" & refreshed.stderr
+    require refreshed.ok
+    require refreshed.commandLines.len == 1
+    check " ic " in refreshed.commandLines[0]
+    check "--compileOnly:on" in refreshed.commandLines[0]
+    check "defaultIcValue" in refreshed.declarationNames(head)
+
   test "checks frontend prerequisites separately and rejects unknown LSP modes":
     check capabilities.requireCompiler(cfTrack) == ""
     check capabilities.requireCompiler(cfIc) == ""
     var missing = capabilities
     missing.nifmakePath = ""
+    check "nifmake" in missing.requireCompiler()
     check missing.requireCompiler(cfCompile) == ""
     check "nifmake" in missing.requireCompiler(cfTrack)
     check "nifmake" in missing.requireCompiler(cfIc)

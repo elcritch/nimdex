@@ -1,8 +1,10 @@
 ## Minimal LSP 3.18 session handling for Nimdex.
 
 import
-  std/
-    [algorithm, json, options, os, sequtils, strutils, syncio, tables, monotimes, times]
+  std/[
+    algorithm, json, nativesockets, net, options, os, sequtils, strutils, syncio,
+    tables, monotimes, times,
+  ]
 
 import chronicles
 import sigils
@@ -331,7 +333,8 @@ proc compilerOptionsFromInitialize(
   let options = initializationOptions(params)
   result.compilerFrontend = serverFrontend
   result.cacheRoot = serverCacheRoot
-  if serverCompilerPath.len > 0 or serverFrontend != cfCompile or serverCacheRoot.len > 0:
+  if serverCompilerPath.len > 0 or serverFrontend != DefaultCompilerFrontend or
+      serverCacheRoot.len > 0:
     result.configured = true
   if options.kind != JObject:
     if serverCompilerPath.len > 0:
@@ -1934,7 +1937,7 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
 
   let serverInfo = newJObject()
   serverInfo["name"] = %"nimdex"
-  serverInfo["version"] = %"0.1.1"
+  serverInfo["version"] = %"0.1.2"
   result["serverInfo"] = serverInfo
 
 proc initializedLsp(server: LspServer, params: JsonNode): JsonNode =
@@ -2180,7 +2183,7 @@ proc newNimdexLspServer*(
     workers = 1,
     artifactRoots: seq[string] = @[],
     compilerPath = "",
-    compilerFrontend = cfCompile,
+    compilerFrontend = DefaultCompilerFrontend,
     cacheRoot = "",
 ): LspServer =
   ## Create an LSP server with worker-owned document state.
@@ -2265,7 +2268,7 @@ proc runNimdexLspStdio*(
     workers = 1,
     artifactRoots: seq[string] = @[],
     compilerPath = "",
-    compilerFrontend = cfCompile,
+    compilerFrontend = DefaultCompilerFrontend,
     cacheRoot = "",
 ): int =
   ## Serve LSP Content-Length messages until EOF or an exit notification.
@@ -2328,3 +2331,97 @@ proc runNimdexLspStdio*(
     info "Nimdex LSP server stopped", exitStatus = server.exitStatus()
 
   server.exitStatus()
+
+proc runLspTcpSession(
+    socket: Socket,
+    workers: int,
+    artifactRoots: seq[string],
+    compilerPath: string,
+    compilerFrontend: CompilerFrontend,
+    cacheRoot: string,
+    stopRequested: proc(): bool {.nimcall.},
+): int =
+  let io = newNimdexLspTcpIo(socket)
+  let server = newNimdexLspServer(
+    workers, artifactRoots, compilerPath, compilerFrontend, cacheRoot
+  )
+  server.asynchronousSession = true
+  server.dispatcher = newJsonRpcDispatcher(server.adapter)
+  server.writer = io
+  connect(server.dispatcher, jsonRpcResponseReady, server, writeLspResponse(LspServer))
+  connect(io, jsonRpcRequestReceived, server, receiveJsonRpcRequest(LspServer))
+  connect(io, jsonRpcStopped, server, receiveJsonRpcStopped(LspServer))
+  io.startIo()
+  try:
+    while stopRequested.isNil or not stopRequested():
+      let processed = server.home.pollAll(NonBlocking)
+      server.finishLanguageWork()
+      server.reapWorkers()
+      if server.isExitRequested():
+        if server.pending.len == 0 and server.queued.len == 0 and
+            server.language.pendingCount() == 0:
+          break
+      elif server.inputStopped:
+        server.exitStatus = LspExitFailure
+        break
+      if server.refreshDeadline > 0 and getMonoTime().ticks >= server.refreshDeadline:
+        server.requestCompilerRefresh()
+      discard io.pollNimdexLspTcp(if processed == 0: 10 else: 0)
+
+    # Deliver any final responses before closing a healthy session. A stalled
+    # peer cannot keep the listener occupied indefinitely during shutdown.
+    let drainDeadline = getMonoTime().ticks + 1_000_000_000'i64
+    while io.hasPendingOutput() and getMonoTime().ticks < drainDeadline and
+        (stopRequested.isNil or not stopRequested()):
+      discard io.pollNimdexLspTcp()
+  finally:
+    io.stopIo()
+    server.close()
+    server.reapWorkers()
+    info "Nimdex LSP TCP session stopped", exitStatus = server.exitStatus()
+  server.exitStatus()
+
+proc runNimdexLspTcp*(
+    port: Port,
+    host = "127.0.0.1",
+    workers = 1,
+    artifactRoots: seq[string] = @[],
+    compilerPath = "",
+    compilerFrontend = DefaultCompilerFrontend,
+    cacheRoot = "",
+    stopRequested: proc(): bool {.nimcall.} = nil,
+): int =
+  ## Serve standard LSP Content-Length frames over TCP, one editor at a time.
+  ## Each connection owns a fresh LSP session; shutdown/exit closes that session
+  ## while the listener remains available. port 0 selects an available port.
+  let listener =
+    newSocket(domain = (if ':' in host: AF_INET6 else: AF_INET), buffered = false)
+  defer:
+    listener.close()
+  listener.setSockOpt(OptReuseAddr, true)
+  listener.getFd().setBlocking(false)
+  listener.bindAddr(port, host)
+  listener.listen()
+  info "Nimdex LSP TCP listener ready",
+    address = host & ":" & $listener.getLocalAddr()[1]
+  while stopRequested.isNil or not stopRequested():
+    var readable = @[listener.getFd()]
+    let ready = selectRead(readable, 100)
+    if stopRequested.isNil or not stopRequested():
+      if ready < 0:
+        raiseOSError(osLastError())
+      if ready > 0:
+        var client: Socket
+        var accepted = false
+        try:
+          listener.accept(client)
+          accepted = true
+          discard runLspTcpSession(
+            client, workers, artifactRoots, compilerPath, compilerFrontend, cacheRoot,
+            stopRequested,
+          )
+        except CatchableError as error:
+          warn "Nimdex LSP TCP session failed", failure = error.msg
+        finally:
+          if accepted:
+            client.close()

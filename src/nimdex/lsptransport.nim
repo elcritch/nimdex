@@ -1,6 +1,6 @@
 ## Responsive LSP input for the Sigils JSON-RPC dispatcher.
 
-import std/[json, syncio]
+import std/[json, nativesockets, net, os, syncio]
 
 import sigils
 import sigils/rpcs/json/jrAgents
@@ -43,6 +43,16 @@ type NimdexLspStdioReader* = ref object of JsonRpcIoAgent
   parser: JsonRpcFrameParser
   maxMessageSize: int
   running: bool
+
+type NimdexLspTcpIo* = ref object of JsonRpcIoAgent
+  ## One Content-Length connection, read and written by the LSP home thread.
+  socket: Socket
+  parser: JsonRpcFrameParser
+  maxMessageSize: int
+  output: string
+  outputOffset: int
+  running: bool
+  inputOpen: bool
 
 proc containsExitRequest(data: string): bool =
   ## LSP's exit notification terminates the reader after its frame is queued.
@@ -109,6 +119,114 @@ proc newNimdexLspStdioReader*(
     raise newException(ValueError, "JSON-RPC message size limit must be positive")
   NimdexLspStdioReader(
     input: input,
+    parser: initJsonRpcFrameParser(maxMessageSize),
+    maxMessageSize: maxMessageSize,
+  )
+
+proc finishInput(self: NimdexLspTcpIo) =
+  if self.inputOpen:
+    self.inputOpen = false
+    emit self.jsonRpcStopped()
+
+proc retrySocketOperation(error: OSErrorCode): bool =
+  when defined(windows):
+    error.int32 == WSAEWOULDBLOCK or error.int32 == WSAEINTR
+  else:
+    error.int32 == EAGAIN or error.int32 == EWOULDBLOCK or error.int32 == EINTR
+
+method startIo*(self: NimdexLspTcpIo) {.gcsafe.} =
+  if not self.running:
+    self.running = true
+    self.inputOpen = true
+    emit self.jsonRpcStarted("tcp")
+
+method stopIo*(self: NimdexLspTcpIo) {.gcsafe.} =
+  self.finishInput()
+  self.running = false
+  self.socket.close()
+
+proc flushOutput(self: NimdexLspTcpIo) =
+  if self.running and self.outputOffset < self.output.len:
+    let sent = self.socket.send(
+      unsafeAddr self.output[self.outputOffset], self.output.len - self.outputOffset
+    )
+    if sent > 0:
+      self.outputOffset += sent
+      if self.outputOffset == self.output.len:
+        self.output.setLen(0)
+        self.outputOffset = 0
+    elif sent == 0 or not retrySocketOperation(osLastError()):
+      self.stopIo()
+
+method queueResponse*(self: NimdexLspTcpIo, response: sink JsonRpcResponse) {.gcsafe.} =
+  if self.running:
+    let frame = frameJsonRpcMessage(response.data, self.maxMessageSize)
+    # Bound queued output when a peer stops reading while analysis continues.
+    if self.output.len - self.outputOffset + frame.len > 4 * self.maxMessageSize:
+      self.stopIo()
+    else:
+      if self.outputOffset > 0:
+        self.output = self.output[self.outputOffset .. ^1]
+        self.outputOffset = 0
+      self.output.add(frame)
+      self.flushOutput()
+
+proc hasPendingOutput*(self: NimdexLspTcpIo): bool =
+  ## Return whether the connected peer still has framed output to receive.
+  self.running and self.outputOffset < self.output.len
+
+proc pollNimdexLspTcp*(self: NimdexLspTcpIo, timeoutMs = 10): bool =
+  ## Dispatch available frames and flush output without blocking worker completion.
+  ## Return false after a socket failure; EOF is signalled through jsonRpcStopped.
+  self.flushOutput()
+  if self.running and self.inputOpen:
+    var readable = @[self.socket.getFd()]
+    let ready = selectRead(readable, timeoutMs)
+    if ready < 0:
+      if not retrySocketOperation(osLastError()):
+        self.stopIo()
+    elif ready > 0:
+      var chunk = newString(JsonRpcFrameReadSize)
+      let received = self.socket.recv(addr chunk[0], chunk.len)
+      if received == 0:
+        self.finishInput()
+      elif received < 0:
+        if not retrySocketOperation(osLastError()):
+          self.stopIo()
+      else:
+        chunk.setLen(received)
+        self.parser.add(move(chunk))
+        try:
+          while self.inputOpen:
+            let frame = self.parser.nextFrame()
+            if frame.isNone():
+              break
+            let payload = frame.get()
+            emit self.jsonRpcRequestReceived(
+              JsonRpcRequest(connectionId: JsonRpcDefaultConnectionId, data: payload)
+            )
+            if payload.containsExitRequest():
+              self.finishInput()
+        except JsonRpcFrameError:
+          self.finishInput()
+  elif self.hasPendingOutput() and timeoutMs > 0:
+    var writable = @[self.socket.getFd()]
+    discard selectWrite(writable, timeoutMs)
+  self.running
+
+proc newNimdexLspTcpIo*(
+    socket: Socket, maxMessageSize = DefaultNimdexMessageSize
+): NimdexLspTcpIo =
+  ## Take ownership of an unbuffered socket. stopIo closes it on the home thread.
+  if socket.isNil:
+    raise newException(ValueError, "LSP TCP socket must not be nil")
+  if maxMessageSize <= 0:
+    raise newException(ValueError, "JSON-RPC message size limit must be positive")
+  socket.getFd().setBlocking(false)
+  when defined(macosx):
+    setSockOptInt(socket.getFd(), SOL_SOCKET, SO_NOSIGPIPE, 1)
+  NimdexLspTcpIo(
+    socket: socket,
     parser: initJsonRpcFrameParser(maxMessageSize),
     maxMessageSize: maxMessageSize,
   )

@@ -368,7 +368,7 @@ proc probeCompiler*(path = ""): CompilerCapabilities =
   result.fingerprint = stableTextHash(fingerprintInput)
 
 proc requireCompiler*(
-    capabilities: CompilerCapabilities, frontend = cfCompile
+    capabilities: CompilerCapabilities, frontend = DefaultCompilerFrontend
 ): string =
   ## Return an actionable prerequisite error, or an empty string when ready.
   if not capabilities.available:

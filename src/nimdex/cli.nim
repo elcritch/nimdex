@@ -33,7 +33,7 @@ import ./lsp
 import ./projectlayout
 import ./workspace
 
-const NimdexVersion = "0.1.1"
+const NimdexVersion = "0.1.2"
 
 var cliServiceStopRequested: Atomic[bool]
 
@@ -71,6 +71,8 @@ type
     debug: bool
     listenPort: int
     connectPort: int
+    lspListenPort: int
+    lspHost: string
 
   CliParseResult = object
     options: CliOptions
@@ -130,7 +132,7 @@ proc writeUsage(output: File) =
   output.writeLine("Usage: nimdex <command> [project] [options]")
   output.writeLine("")
   output.writeLine("Commands:")
-  output.writeLine("  daemon      Run the LSP/JSON-RPC daemon on stdin/stdout")
+  output.writeLine("  daemon      Run the LSP/JSON-RPC daemon on stdin/stdout or TCP")
   output.writeLine("  check       Ask a daemon for a project analysis summary")
   output.writeLine("  symbols     List project symbols through the daemon")
   output.writeLine("  debug       Print daemon/compiler/BIF diagnostics")
@@ -143,7 +145,7 @@ proc writeUsage(output: File) =
   output.writeLine("Options:")
   output.writeLine("  --project PATH       Project directory")
   output.writeLine("  --compiler PATH      Nim compiler or executable name")
-  output.writeLine("  --frontend MODE      compile (default), track, or ic")
+  output.writeLine("  --frontend MODE      ic (default), compile, or track")
   output.writeLine("  --cache-root PATH    Nimdex compiler cache directory")
   output.writeLine("  --log-file PATH      Append daemon stderr to PATH (daemon only)")
   output.writeLine("  --entry-point PATH   Nim entry point; may be repeated")
@@ -160,6 +162,8 @@ proc writeUsage(output: File) =
   output.writeLine(
     "  --connect PORT       Query a listening daemon instead of starting one"
   )
+  output.writeLine("  --lsp-listen PORT    Serve editor LSP over TCP (daemon only)")
+  output.writeLine("  --lsp-host ADDRESS   LSP TCP bind address (default: 127.0.0.1)")
   output.writeLine("  -h, --help           Show this help")
 
 proc optionValue(
@@ -183,6 +187,7 @@ proc parseCli(args: openArray[string]): CliParseResult =
   result.options.command = cliCheck
   result.options.listenPort = -1
   result.options.connectPort = -1
+  result.options.lspListenPort = -1
   var commandSeen = false
   var positional: seq[string]
   var index = 0
@@ -248,7 +253,7 @@ proc parseCli(args: openArray[string]): CliParseResult =
       commandSeen = true
     of "--debug":
       result.options.debug = true
-    of "--listen", "--connect":
+    of "--listen", "--connect", "--lsp-listen":
       let parsed = optionValue(args, index, argument)
       if parsed.error.len > 0:
         result.error = parsed.error
@@ -256,10 +261,13 @@ proc parseCli(args: openArray[string]): CliParseResult =
       try:
         let port = parseInt(parsed.value)
         if port < 0 or port > 65535 or (argument == "--connect" and port == 0):
-          result.error = argument & " requires a valid port (1 to 65535)"
+          let minimum = if argument == "--connect": "1" else: "0"
+          result.error = argument & " requires a valid port (" & minimum & " to 65535)"
           return
         if argument == "--listen":
           result.options.listenPort = port
+        elif argument == "--lsp-listen":
+          result.options.lspListenPort = port
         else:
           result.options.connectPort = port
       except ValueError:
@@ -283,6 +291,15 @@ proc parseCli(args: openArray[string]): CliParseResult =
         result.error = parsed.error
         return
       result.options.cacheRoot = parsed.value
+    of "--lsp-host":
+      let parsed = optionValue(args, index, argument)
+      if parsed.error.len > 0:
+        result.error = parsed.error
+        return
+      if parsed.value.len == 0:
+        result.error = "--lsp-host requires a nonempty address"
+        return
+      result.options.lspHost = parsed.value
     of "--log-file":
       let parsed = optionValue(args, index, argument)
       if parsed.error.len > 0:
@@ -337,6 +354,15 @@ proc parseCli(args: openArray[string]): CliParseResult =
 
   if result.options.listenPort >= 0 and result.options.command != cliDaemon:
     result.error = "--listen requires daemon"
+    return
+  if result.options.lspListenPort >= 0 and result.options.command != cliDaemon:
+    result.error = "--lsp-listen requires daemon"
+    return
+  if result.options.lspListenPort >= 0 and result.options.listenPort >= 0:
+    result.error = "--listen and --lsp-listen select different daemon transports"
+    return
+  if result.options.lspHost.len > 0 and result.options.lspListenPort < 0:
+    result.error = "--lsp-host requires --lsp-listen"
     return
   if result.options.logFile.len > 0 and result.options.command != cliDaemon:
     result.error = "--log-file requires daemon"
@@ -1177,6 +1203,44 @@ proc stopDaemonLog(savedFd: cint) =
   discard redirectFd(savedFd, stderr.getFileHandle().cint)
   discard closeFd(savedFd)
 
+proc lspTcpStopRequested(): bool =
+  cliServiceStopRequested.load()
+
+proc selectedCompilerFrontend(options: CliOptions): CompilerFrontend =
+  case options.compilerFrontend
+  of "compile": cfCompile
+  of "track": cfTrack
+  of "ic": cfIc
+  else: DefaultCompilerFrontend
+
+proc runLspTcpService(options: CliOptions, errorOutput: File): int =
+  cliServiceStopRequested.store(false)
+  when defined(posix):
+    let previousInterrupt = posix.signal(SIGINT, requestCliServiceStop)
+    let previousTerminate = posix.signal(SIGTERM, requestCliServiceStop)
+    let previousHangup = posix.signal(SIGHUP, requestCliServiceStop)
+    let previousQuit = posix.signal(SIGQUIT, requestCliServiceStop)
+    defer:
+      discard posix.signal(SIGINT, previousInterrupt)
+      discard posix.signal(SIGTERM, previousTerminate)
+      discard posix.signal(SIGHUP, previousHangup)
+      discard posix.signal(SIGQUIT, previousQuit)
+  else:
+    setControlCHook(requestCliServiceStop)
+  try:
+    result = runNimdexLspTcp(
+      Port(options.lspListenPort),
+      host = (if options.lspHost.len > 0: options.lspHost else: "127.0.0.1"),
+      artifactRoots = options.artifactRoots,
+      compilerPath = options.compilerPath,
+      compilerFrontend = options.selectedCompilerFrontend(),
+      cacheRoot = options.cacheRoot,
+      stopRequested = lspTcpStopRequested,
+    )
+  except CatchableError as error:
+    errorOutput.writeLine("nimdex: could not start LSP TCP listener: " & error.msg)
+    result = 1
+
 proc runNimdexCli*(
     args: openArray[string],
     output: File = stdout,
@@ -1211,18 +1275,14 @@ proc runNimdexCli*(
     try:
       if parsed.options.listenPort >= 0:
         result = runCliService(parsed.options, errorOutput, daemonPath)
+      elif parsed.options.lspListenPort >= 0:
+        result = runLspTcpService(parsed.options, errorOutput)
       else:
         result = runNimdexLspStdio(
           input,
           output,
           compilerPath = parsed.options.compilerPath,
-          compilerFrontend =
-            if parsed.options.compilerFrontend == "track":
-              cfTrack
-            elif parsed.options.compilerFrontend == "ic":
-              cfIc
-            else:
-              cfCompile,
+          compilerFrontend = parsed.options.selectedCompilerFrontend(),
           cacheRoot = parsed.options.cacheRoot,
         )
     finally:

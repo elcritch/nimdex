@@ -5,9 +5,10 @@ small command-line client and an LSP server.
 
 ## Requirements
 
-Nimdex needs a Nim compiler that supports `--genBif:on`. This checkout
-includes one at `deps/nim-devel/bin/nim`; another environment must provide an
-equivalent compiler.
+Nimdex defaults to `nim ic` and needs a Nim compiler that supports `--genBif:on`,
+with matching `nifler` and `nifmake` companions beside Nim or on `PATH`. This
+checkout includes them at `deps/nim-devel/bin/`; another environment must provide
+an equivalent compiler and companions.
 
 Install the `nimdex` command with Nimble:
 
@@ -25,13 +26,21 @@ For development from a checkout, install project dependencies with
 `atlas install`. To install the current checkout as a command, run
 `nimble install` from the repository root.
 
+To build a local executable with the compiler included in this checkout:
+
+```sh
+deps/nim-devel/bin/nim c -d:release --out:nimdex.out src/nimdex.nim
+./nimdex.out version
+```
+
 ## Logging
 
 Nimdex writes Chronicles text blocks to `stderr` with forced ANSI colors, even
 when the stream is redirected. LSP/JSON-RPC output on `stdout` remains clean.
 For a long-lived daemon, `--log-file PATH` appends stderr to a chosen file.
 Nimdex creates missing parent directories. A relative path uses the daemon's
-working directory; the option works with both stdio and `--listen` daemons.
+working directory; the option works with stdio, `--listen`, and `--lsp-listen`
+daemons.
 For example, set Kosmo's `nimLspCommand` to:
 
 ```text
@@ -133,7 +142,7 @@ Useful options are:
 
 ```text
 --compiler PATH       Select the Nim compiler
---frontend MODE       compile (default), track, or ic
+--frontend MODE       ic (default), compile, or track
 --cache-root PATH     Override the default nimcache/nimdex location
 --log-file PATH       Append daemon stderr to PATH (daemon only)
 --entry-point PATH    Add a Nim entry point (repeatable)
@@ -144,6 +153,8 @@ Useful options are:
 --debug               Include the detailed daemon report with symbols
 --listen PORT         Listen for CLI requests (daemon only)
 --connect PORT        Query an existing listening daemon
+--lsp-listen PORT     Listen for editor LSP connections (daemon only)
+--lsp-host ADDRESS    LSP TCP bind address (default: 127.0.0.1)
 ```
 
 ## Editor integration
@@ -154,6 +165,47 @@ Start the daemon directly when an editor launches an LSP server:
 nimdex daemon
 nimdex daemon --log-file /absolute/path/to/nimdex.log
 ```
+
+### Connect an editor over TCP
+
+Start a persistent LSP listener:
+
+```sh
+nimdex daemon --lsp-listen 9257 --compiler /absolute/path/to/bif-enabled/nim
+```
+
+The listener uses standard LSP `Content-Length`/JSON-RPC framing and binds to
+`127.0.0.1` by default. `--lsp-listen 0` selects a free port and logs its address.
+It serves one editor session at a time. Each connection has its own workspace,
+open buffers, and request state; `shutdown`/`exit` closes that connection and
+leaves the listener running for the next editor connection. Ctrl-C or SIGTERM
+stops the listener and cancels the active session.
+
+For Neovim 0.11 or later, configure its
+[TCP connector](https://neovim.io/doc/user/lsp/#vim.lsp.rpc.connect()):
+
+```lua
+vim.lsp.config('nimdex_tcp', {
+  cmd = vim.lsp.rpc.connect('127.0.0.1', 9257),
+  filetypes = { 'nim' },
+  root_markers = { '.git', 'nim.cfg', 'config.nims' },
+})
+vim.lsp.enable('nimdex_tcp')
+```
+
+For an editor that launches an LSP executable, use a stdio-to-TCP bridge such
+as `nc 127.0.0.1 9257` as its server command. For example, Kosmo's
+`nimLspCommand` can be set to that command while the listener runs separately.
+
+To connect through Tailscale, bind to the server's Tailscale IP with
+`--lsp-host 100.x.y.z` and use that address in the editor or bridge. The transport
+is raw TCP. The server must be able to access the file paths in the editor's
+`rootUri` and document URIs; TCP does not map paths between different machines.
+
+`--listen` selects the CLI query protocol and `--lsp-listen` selects editor LSP.
+Choose one listener mode for each daemon process. The compiler, frontend,
+cache-root, and log-file options also apply to the LSP TCP daemon. An editor's
+initialization options can override the compiler and cache defaults.
 
 The client should send the project `rootUri` in `initialize`. Nimdex discovers
 the package module and declared binaries using literal `srcDir` and `bin`
@@ -208,11 +260,12 @@ spelling rules. Unverifiable generated locations return no target.
 
 ## How it works
 
-Nimdex probes the configured compiler and requires `--genBif:on`. The daemon
-runs `nim c --compileOnly:on --genBif:on` into a separate cache for each compiler,
-configuration, and entry point. This generates C and semantic BIFs but skips
-native compilation and linking. The current compiler's `nim check --genBif:on`
-omits declarations and include metadata, so it cannot yet replace this command.
+Nimdex probes the configured compiler and requires `--genBif:on`. By default,
+the CLI and editor server run `nim ic --compileOnly:on --genBif:on` into a
+separate cache for each compiler, configuration, and entry point. This generates
+C and semantic BIFs but skips native compilation and linking. The current
+compiler's `nim check --genBif:on` omits declarations and include metadata, so it
+cannot yet replace this command.
 
 The optional incremental frontend uses `nim track` to check modules and emit
 semantic BIFs without generating C or running the native toolchain:
@@ -222,17 +275,16 @@ nimdex check /path/to/project --frontend track
 nimdex daemon --frontend track
 ```
 
-`--frontend ic` runs `nim ic --compileOnly:on --genBif:on` through the same
-per-head incremental graph loader. It emits C into the compiler cache but skips
-native compilation and linking. Use it when checking compatibility with the
-full incremental compiler; `track` avoids the backend work and generated C.
+`ic` and `track` use the same per-head incremental graph loader.
 Both modes retain compiler state between edits and use separate cache contexts.
 
-Editors can select either mode with `"compilerFrontend": "track"` or
-`"compilerFrontend": "ic"` in `initializationOptions`. Both require the
-matching `nifler` and `nifmake` companions supplied with `deps/nim-devel/`.
-Each actual head retains its own
-compiler cache: unchanged modules are skipped, and dependency metadata decides
+Use `--frontend compile` to select `nim c --compileOnly:on --genBif:on`, or
+`--frontend track` to select `nim track`. Editors can set
+`"compilerFrontend": "compile"`, `"track"`, or `"ic"` in
+`initializationOptions`; omitting the option selects `ic`. `ic` and `track`
+require the matching `nifler` and `nifmake` companions supplied with
+`deps/nim-devel/`. Each actual head retains its own compiler cache: unchanged
+modules are skipped, and dependency metadata decides
 which importers need rechecking. Only the current resolved module closure is
 indexed, so removed imports leave no stale symbols even though their old files
 remain in the compiler cache. Compiler state is separate from Nimdex's
@@ -243,13 +295,11 @@ semantic records are never persisted as saved analyses. The compiler's
 dirty-file option cannot represent
 paths containing commas; these produce an analysis error.
 
-This mode is opt-in while broader compiler compatibility is evaluated.
 `nimcheck` conditionals and the incremental compiler's method dispatch behavior
 can differ from `nim c`; switch back with `--frontend compile` when needed.
 After a partial rebuild, diagnostics currently reflect modules checked in that
 invocation; warnings from skipped modules may disappear. Whole-head cache reuse
-retains its saved diagnostics. Complete diagnostic persistence across partial
-builds remains a gate before enabling this mode by default.
+retains its saved diagnostics.
 Configuration, environment, and source-inventory changes conservatively reset
 the incremental compiler cache. Compilation work is still separate per head;
 sharing those artifacts across heads is future work.

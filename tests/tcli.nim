@@ -1,4 +1,5 @@
-import std/[assertions, json, net, os, osproc, streams, strutils]
+import
+  std/[assertions, json, nativesockets, net, os, osproc, streams, strutils, unittest]
 
 import nimdex/cli
 import nimdex/clicapture
@@ -28,11 +29,13 @@ proc drainProtocolErrors(stream: Stream) {.thread.} =
   while not stream.atEnd():
     discard stream.readLine()
 
-proc readListenerPort(stream: Stream): string =
+proc readListenerPort(
+    stream: Stream, readyMessage = "Nimdex CLI listener ready"
+): string =
   var ready = false
   while not stream.atEnd():
     let line = stream.readLine()
-    if line.contains("Nimdex CLI listener ready"):
+    if line.contains(readyMessage):
       ready = true
     if ready:
       let marker = "127.0.0.1:"
@@ -68,6 +71,37 @@ proc receiveProtocol(
         return message
       notifications.add(message)
   raise newException(IOError, "daemon exited before replying")
+
+proc sendProtocol(socket: Socket, methodName: string, params: JsonNode, id = 0) =
+  var message = %*{"jsonrpc": "2.0", "method": methodName, "params": params}
+  if id != 0:
+    message["id"] = %id
+  socket.send(frameJsonRpcMessage($message))
+
+proc receiveProtocol(
+    socket: Socket,
+    parser: var JsonRpcFrameParser,
+    id: int,
+    notifications: var seq[JsonNode],
+): JsonNode =
+  while true:
+    let frame = parser.nextFrame()
+    if frame.isSome():
+      let message = parseJson(frame.get())
+      if message.hasKey("id"):
+        doAssert message["id"].getInt() == id
+        return message
+      notifications.add(message)
+    else:
+      var readable = @[socket.getFd()]
+      if selectRead(readable, 10000) != 1:
+        raise newException(IOError, "LSP TCP response timed out")
+      var chunk = newString(16 * 1024)
+      let received = socket.recv(addr chunk[0], chunk.len)
+      if received <= 0:
+        raise newException(IOError, "LSP TCP connection closed before replying")
+      chunk.setLen(received)
+      parser.add(move(chunk))
 
 proc testDaemon(): string =
   if testDaemonPath.len > 0:
@@ -127,6 +161,7 @@ block cli_help:
   doAssert run.status == 0
   doAssert run.output.contains("Usage: nimdex")
   doAssert run.output.contains("symbols")
+  doAssert run.output.contains("ic (default)")
 
 block cli_frontend_validation:
   let run = runCli(["check", "--frontend", "unknown"])
@@ -143,6 +178,163 @@ block cli_connection_validation:
   let options = runCli(["check", "--connect", "49152", "--frontend", "track"])
   doAssert options.status == 2
   doAssert options.errors.contains("set analysis options when starting")
+
+suite "Editor LSP TCP":
+  test "validates listener options":
+    for args in [
+      @["daemon", "--lsp-listen"],
+      @["daemon", "--lsp-listen", "invalid"],
+      @["daemon", "--lsp-listen", "65536"],
+      @["check", "--lsp-listen", "9257"],
+      @["daemon", "--listen", "9257", "--lsp-listen", "9258"],
+      @["daemon", "--lsp-host", "127.0.0.1"],
+      @["daemon", "--lsp-listen", "9257", "--lsp-host", ""],
+    ]:
+      let run = runCli(args)
+      check run.status == 2
+      check run.errors.len > 0
+
+  test "serves compiler-backed editor requests and isolates reconnects":
+    let root = normalizeDocumentPath(
+      getTempDir() / ("nimdex-tcp-editor-" & $getCurrentProcessId())
+    )
+    createDir(root)
+    defer:
+      removeDir(root)
+    let source = root / "main.nim"
+    writeFile(source, "const tcpValue* = 1\n")
+    let compiler = currentSourcePath.parentDir.parentDir / "deps/nim-devel/bin/nim"
+    let process = startProcess(
+      testDaemon(),
+      args = [
+        "daemon",
+        "--lsp-listen",
+        "0",
+        "--compiler",
+        compiler,
+        "--cache-root",
+        root / "cache",
+      ],
+      options = {poUsePath},
+    )
+    let port = Port(
+      parseInt(process.errorStream().readListenerPort("Nimdex LSP TCP listener ready"))
+    )
+    var errorThread: Thread[Stream]
+    createThread(errorThread, drainProtocolErrors, process.errorStream())
+    defer:
+      process.terminate()
+      if process.waitForExit(10000) == -1:
+        process.kill()
+        discard process.waitForExit()
+      joinThread(errorThread)
+      process.close()
+
+    for session in 0 .. 1:
+      let socket = newSocket(buffered = false)
+      defer:
+        socket.close()
+      socket.connect("127.0.0.1", port)
+      var parser = initJsonRpcFrameParser()
+      var notifications: seq[JsonNode]
+      # Split the header and batch following messages, as real TCP reads can.
+      let initialize = frameJsonRpcMessage(
+        $(
+          %*{
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {"rootUri": documentUriFromPath(root), "capabilities": {}},
+          }
+        )
+      )
+      socket.send(initialize[0 .. 5])
+      socket.send(
+        initialize[6 .. ^1] &
+          frameJsonRpcMessage(
+            $(%*{"jsonrpc": "2.0", "method": "initialized", "params": {}})
+          )
+      )
+      let initialized = socket.receiveProtocol(parser, 1, notifications)
+      require initialized.hasKey("result")
+      check initialized["result"]["capabilities"]["hoverProvider"].getBool()
+      let uri = documentUriFromPath(source)
+      if session == 0:
+        socket.sendProtocol(
+          "textDocument/didOpen",
+          %*{
+            "textDocument": {
+              "uri": uri,
+              "languageId": "nim",
+              "version": 1,
+              "text": "const unsavedTcpValue* = 2\n",
+            }
+          },
+        )
+      socket.sendProtocol(
+        "textDocument/documentSymbol", %*{"textDocument": {"uri": uri}}, 2
+      )
+      let symbols = socket.receiveProtocol(parser, 2, notifications)
+      require symbols.hasKey("result")
+      check symbols["result"][0]["name"].getStr() ==
+        (if session == 0: "unsavedTcpValue" else: "tcpValue")
+      socket.sendProtocol("nimdex/debug", %*{}, 4)
+      let debug = socket.receiveProtocol(parser, 4, notifications)
+      check debug["result"]["compiler"]["frontend"].getStr() == "ic"
+      socket.sendProtocol("shutdown", %*{}, 3)
+      check socket.receiveProtocol(parser, 3, notifications)["result"].kind == JNull
+      socket.sendProtocol("exit", %*{})
+      check socket.recv(1, timeout = 10000).len == 0
+      check process.running()
+
+  test "recovers from incomplete frames and stops with an idle editor":
+    let process = startProcess(
+      testDaemon(),
+      args = ["daemon", "--lsp-listen", "0", "--lsp-host", "127.0.0.1"],
+      options = {poUsePath},
+    )
+    let port = Port(
+      parseInt(process.errorStream().readListenerPort("Nimdex LSP TCP listener ready"))
+    )
+    var errorThread: Thread[Stream]
+    createThread(errorThread, drainProtocolErrors, process.errorStream())
+    defer:
+      if process.running():
+        process.kill()
+        discard process.waitForExit()
+      joinThread(errorThread)
+      process.close()
+    let broken = newSocket()
+    broken.connect("127.0.0.1", port)
+    broken.send("Content-Length: 100\r\n\r\n{\"partial\":")
+    broken.close()
+
+    for badHeader in [
+      "Content-Length: invalid\r\n\r\n", "Content-Length: 16777217\r\n\r\n"
+    ]:
+      let invalid = newSocket(buffered = false)
+      defer:
+        invalid.close()
+      invalid.connect("127.0.0.1", port)
+      invalid.send(badHeader)
+      check invalid.recv(1, timeout = 10000).len == 0
+
+    let socket = newSocket(buffered = false)
+    defer:
+      socket.close()
+    socket.connect("127.0.0.1", port)
+    var parser = initJsonRpcFrameParser()
+    var notifications: seq[JsonNode]
+    socket.sendProtocol("initialize", %*{"capabilities": {}}, 1)
+    check socket.receiveProtocol(parser, 1, notifications).hasKey("result")
+    process.terminate()
+    let status = process.waitForExit(10000)
+    when defined(posix):
+      check status == 0
+    else:
+      check status != -1
+    check socket.recv(1, timeout = 10000).len == 0
+    check process.outputStream().readAll().len == 0
 
 block cli_log_file_validation:
   let missing = runCli(["daemon", "--log-file"])
@@ -286,13 +478,20 @@ block cli_debug:
   doAssert run.output.contains("\"tokenCount\"")
   doAssert run.output.contains("\"frontend\": \"track\"")
 
-block cli_ic_debug:
+block cli_default_frontend_debug:
   let cacheRoot = getTempDir() / ("nimdex-cli-ic-cache-" & $getCurrentProcessId())
-  let run = runExternalCli(
-    ["debug", FixtureRoot, "--cache-root", cacheRoot, "--frontend", "ic"]
-  )
+  let run = runExternalCli(["debug", FixtureRoot, "--cache-root", cacheRoot])
   doAssert run.status == 0, run.output
   doAssert run.output.contains("\"frontend\": \"ic\"")
+  doAssert run.output.contains("\"artifactPaths\"")
+
+block cli_compile_debug:
+  let cacheRoot = getTempDir() / ("nimdex-cli-compile-cache-" & $getCurrentProcessId())
+  let run = runExternalCli(
+    ["debug", FixtureRoot, "--cache-root", cacheRoot, "--frontend", "compile"]
+  )
+  doAssert run.status == 0, run.output
+  doAssert run.output.contains("\"frontend\": \"compile\"")
   doAssert run.output.contains("\"artifactPaths\"")
 
 block cli_package_layout:

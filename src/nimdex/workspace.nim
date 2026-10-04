@@ -12,6 +12,9 @@ type CompilerFrontend* = enum
   cfTrack = "track"
   cfIc = "ic"
 
+const DefaultCompilerFrontend* = cfIc
+  ## Default compiler frontend for saved-source analysis.
+
 type Workspace* = object
   rootUri*: string
   rootPath*: string
@@ -50,7 +53,7 @@ proc initWorkspace*(
     compilerPath: string = "",
     cacheRoot: string = "",
     configurationGeneration: uint64 = 0,
-    compilerFrontend = cfCompile,
+    compilerFrontend = DefaultCompilerFrontend,
     discoveredLayout: Option[ProjectLayout] = none(ProjectLayout),
 ): Workspace =
   result.rootUri = normalizeDocumentUri(rootUri)
