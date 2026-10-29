@@ -121,10 +121,6 @@ proc releaseCompilerCancellation*(cancellation: CompilerCancellation) =
 
 proc resolveCompilerPath(path: string): string =
   if path.len == 0:
-    let projectCompiler =
-      currentSourcePath.parentDir.parentDir.parentDir / "deps/nim-devel/bin/nim"
-    if fileExists(projectCompiler):
-      return normalizeDocumentPath(projectCompiler)
     return findExe("nim")
 
   if isAbsolute(path) or DirSep in path or AltSep in path:
@@ -643,7 +639,7 @@ proc buildHead(
   if incremental:
     let contextPath = cachePath / "frontend-context"
     var reset = request.forceRebuild
-    if fileExists(compilerCache / "ic_config.cfg.nif"):
+    if dirExists(compilerCache):
       try:
         for path in incrementalConfigurationInputs(compilerCache):
           if path notin configPaths:

@@ -81,9 +81,8 @@ Do not call Binny's `findSemanticBifPath` directly from the server. Its implemen
 
 ### Compiler artifact availability
 
-Nimdex requires a Nim devel/compiler build that advertises `--genBif:on`.
-This checkout provides that baseline at `deps/nim-devel/bin/nim` (Nim 2.3.1)
-along with `deps/nim-devel/bin/nifler` and `deps/nim-devel/bin/nifmake`.
+Nimdex requires Nim 2.4.0 or newer with `--genBif:on`, along with matching
+`nifler` and `nifmake` companions.
 The compiler capability probe must
 record the exact compiler, revision, command line, Nim cache layout, and
 artifact names. The incremental frontend requires both companion executables:
@@ -839,8 +838,6 @@ The Binny integration is ready for the first production-facing LSP feature when:
 
 ## Open decisions
 
-- Which supported Nim compiler/devel revision is the minimum beyond the
-  project-local `deps/nim-devel` baseline for reproducible BIF generation?
 - Can the compiler's incremental frontend safely share compilation across
   heads while preserving configuration and main-module semantics?
 - How should persistent analysis caching validate arbitrary compile-time file

@@ -6,7 +6,7 @@
 ##   nim r tools/binny_phase0.nim --build
 ##
 ## Nimdex requires a compiler that advertises --genBif. The default compiler is
-## the project-local development compiler when it is present.
+## the nim executable on PATH.
 
 import std/[algorithm, os, osproc, strutils]
 
@@ -25,12 +25,6 @@ proc runCommand(arguments: openArray[string]): tuple[output: string, exitCode: i
   for argument in arguments:
     command.add(quoteShell(argument))
   execCmdEx(command.join(" "), options = {poStdErrToStdOut, poUsePath, poEvalCommand})
-
-proc defaultCompiler(repoRoot: string): string =
-  let projectCompiler = repoRoot / "deps/nim-devel/bin/nim"
-  if fileExists(projectCompiler):
-    return projectCompiler
-  findExe("nim")
 
 proc probeCompiler(compiler: string): CompilerProbe =
   result.compiler = compiler
@@ -133,7 +127,7 @@ proc main() =
     if paramCount() > 0 and not paramStr(1).startsWith("--"):
       paramStr(1)
     else:
-      defaultCompiler(repoRoot)
+      findExe("nim")
   if compiler.len == 0:
     stderr.writeLine("nimdex requires a Nim compiler with --genBif:on")
     quit(2)

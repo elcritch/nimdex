@@ -4,7 +4,7 @@ import nimdex/[compiler, documents, headcache, incremental, lsp, semantic, works
 import sigils/rpcs/jsonrpc
 
 const RepositoryRoot = currentSourcePath.parentDir.parentDir
-let capabilities = probeCompiler(RepositoryRoot / "deps/nim-devel/bin/nim")
+let capabilities = probeCompiler()
 
 proc requestFor(root, head: string, frontend = cfTrack): CompilerRefreshRequest =
   CompilerRefreshRequest(
@@ -394,15 +394,14 @@ else:
     discard server.jsonRpcAdapter().handleJsonRpc(
         $(%*{"jsonrpc": "2.0", "method": "initialized", "params": {}})
       )
-    let query =
-      $(
-        %*{
-          "jsonrpc": "2.0",
-          "id": 2,
-          "method": "textDocument/documentSymbol",
-          "params": {"textDocument": {"uri": documentUriFromPath(head)}},
-        }
-      )
+    let query = $(
+      %*{
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/documentSymbol",
+        "params": {"textDocument": {"uri": documentUriFromPath(head)}},
+      }
+    )
     let before = parseJson(server.jsonRpcAdapter().handleJsonRpc(query).get())
     require before.hasKey("result")
     require before["result"].len > 0

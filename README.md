@@ -5,10 +5,8 @@ small command-line client and an LSP server.
 
 ## Requirements
 
-Nimdex defaults to `nim ic` and needs a Nim compiler that supports `--genBif:on`,
-with matching `nifler` and `nifmake` companions beside Nim or on `PATH`. This
-checkout includes them at `deps/nim-devel/bin/`; another environment must provide
-an equivalent compiler and companions.
+Nimdex requires Nim 2.4.0 or newer. It defaults to `nim ic` and needs the
+matching `nifler` and `nifmake` companions beside Nim or on `PATH`.
 
 Install the `nimdex` command with Nimble:
 
@@ -26,10 +24,10 @@ For development from a checkout, install project dependencies with
 `atlas install`. To install the current checkout as a command, run
 `nimble install` from the repository root.
 
-To build a local executable with the compiler included in this checkout:
+To build a local executable:
 
 ```sh
-deps/nim-devel/bin/nim c -d:release --out:nimdex.out src/nimdex.nim
+nim c -d:release --out:nimdex.out src/nimdex.nim
 ./nimdex.out version
 ```
 
@@ -102,7 +100,7 @@ modules, source mappings, pool counts, and token counts. It also shows
 Start a listening daemon in one terminal, from this repository root:
 
 ```sh
-nimdex daemon . --listen 49152 --compiler deps/nim-devel/bin/nim
+nimdex daemon . --listen 49152
 ```
 
 The daemon logs `Nimdex CLI listener ready` with
@@ -282,8 +280,7 @@ Use `--frontend compile` to select `nim c --compileOnly:on --genBif:on`, or
 `--frontend track` to select `nim track`. Editors can set
 `"compilerFrontend": "compile"`, `"track"`, or `"ic"` in
 `initializationOptions`; omitting the option selects `ic`. `ic` and `track`
-require the matching `nifler` and `nifmake` companions supplied with
-`deps/nim-devel/`. Each actual head retains its own compiler cache: unchanged
+require the matching `nifler` and `nifmake` companions supplied with Nim. Each actual head retains its own compiler cache: unchanged
 modules are skipped, and dependency metadata decides
 which importers need rechecking. Only the current resolved module closure is
 indexed, so removed imports leave no stale symbols even though their old files
@@ -357,7 +354,7 @@ to a revision that fixes token-buffer pool lifetime under ARC/atomic ARC.
 For a repeatable edit/close/reopen memory probe, build a release daemon and run:
 
 ```sh
-deps/nim-devel/bin/nim c -d:release --out:/tmp/nimdex src/nimdex.nim
+nim c -d:release --out:/tmp/nimdex src/nimdex.nim
 python3 tools/profile_lsp.py --server /tmp/nimdex --cycles 100
 ```
 
@@ -378,5 +375,5 @@ Nimdex uses the generic LSP/JSON-RPC protocol and does not depend on the
 Run the full test suite with:
 
 ```sh
-atlas-run tests --nim=deps/nim-devel/bin/nim
+atlas-run tests
 ```

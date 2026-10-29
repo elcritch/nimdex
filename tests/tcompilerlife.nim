@@ -1,7 +1,7 @@
 import std/[monotimes, os, osproc, strutils, tempfiles, times, unittest]
 import nimdex/[compiler, documents, workspace]
 
-const Compiler = currentSourcePath.parentDir.parentDir / "deps/nim-devel/bin/nim"
+let Compiler = findExe("nim")
 
 when defined(posix):
   proc cancelWhenStarted(

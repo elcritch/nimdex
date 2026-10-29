@@ -12,7 +12,7 @@ const
   FixtureMain = FixtureRoot / "main.nim"
 
 proc projectCompiler(): string =
-  currentSourcePath.parentDir.parentDir / "deps/nim-devel/bin/nim"
+  findExe("nim")
 
 proc refreshFor(
     root, entryPoint, cacheRoot: string, source: CompilerCapabilities
@@ -82,10 +82,9 @@ suite "Nimdex compiler refresh":
     check restarted.commandLines.len == 0
     check restarted.snapshot.findSymbols("cachedValue").len == 1
 
-    request.overlays =
-      @[
-        initDocumentSnapshot(documentUriFromPath(source), "const cachedValue* = 2\n", 1)
-      ]
+    request.overlays = @[
+      initDocumentSnapshot(documentUriFromPath(source), "const cachedValue* = 2\n", 1)
+    ]
     let overlay = runCompilerRefresh(request)
     checkpoint overlay.error
     require overlay.ok
@@ -362,6 +361,8 @@ suite "Nimdex compiler refresh":
     doAssert capabilities.supportsGenBif
     doAssert capabilities.compilerPath == normalizeDocumentPath(projectCompiler())
     doAssert capabilities.fingerprint != 0
+    doAssert normalizeDocumentPath(probeCompiler().compilerPath) ==
+      normalizeDocumentPath(findExe("nim"))
 
   test "uses the selected head context and keeps healthy heads after failure":
     let root =
@@ -398,13 +399,12 @@ suite "Nimdex compiler refresh":
       },
     )
     server.notify("initialized", %*{})
-    let query =
-      %*{
-        "jsonrpc": "2.0",
-        "id": 2,
-        "method": "textDocument/documentSymbol",
-        "params": {"textDocument": {"uri": documentUriFromPath(shared)}},
-      }
+    let query = %*{
+      "jsonrpc": "2.0",
+      "id": 2,
+      "method": "textDocument/documentSymbol",
+      "params": {"textDocument": {"uri": documentUriFromPath(shared)}},
+    }
     let symbols = responseFor(server, query)
     var names: seq[string]
     for symbol in symbols["result"]:

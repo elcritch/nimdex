@@ -1,7 +1,7 @@
 import std/[os, strutils, tempfiles, times, unittest]
 import nimdex/[compiler, documents, language, semantic, workspace]
 
-const Compiler = currentSourcePath.parentDir.parentDir / "deps/nim-devel/bin/nim"
+let Compiler = findExe("nim")
 
 suite "compiler navigation, effects and overlays":
   test "resolves qualified uses and static effects against current buffer text":
@@ -10,8 +10,7 @@ suite "compiler navigation, effects and overlays":
       removeDir(root)
     let main = root / "main.nim"
     let support = root / "support.nim"
-    let mainText =
-      """import support
+    let mainText = """import support
 proc pure*(): int {.raises: [].} = 1
 proc inferred*() = risky()
 proc caught*() =
@@ -25,8 +24,7 @@ risky()
 include piece
 discard included()
 """
-    let supportText =
-      """proc risky*() {.raises: [ValueError, IOError].} =
+    let supportText = """proc risky*() {.raises: [ValueError, IOError].} =
   raise newException(ValueError, "oops")
 """
     let piece = root / "piece.nim"
@@ -134,12 +132,11 @@ discard included()
         workspace: workspace,
         capabilities: capabilities,
         previousHeads: cold.heads,
-        overlays:
-          @[
-            initDocumentSnapshot(uri, dirtyMain, 3),
-            initDocumentSnapshot(documentUriFromPath(support), dirtySupport, 1),
-            initDocumentSnapshot(documentUriFromPath(piece), dirtyPiece, 1),
-          ],
+        overlays: @[
+          initDocumentSnapshot(uri, dirtyMain, 3),
+          initDocumentSnapshot(documentUriFromPath(support), dirtySupport, 1),
+          initDocumentSnapshot(documentUriFromPath(piece), dirtyPiece, 1),
+        ],
       )
     )
     require dirty.ok
@@ -189,8 +186,7 @@ discard included()
     defer:
       removeDir(root)
     let main = root / "main.nim"
-    let text =
-      """proc label*(value: int): int = value
+    let text = """proc label*(value: int): int = value
 proc label*(value: string): string = value
 proc twice*[T](value: T): T = value + value
 let first = label(1)

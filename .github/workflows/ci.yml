@@ -14,7 +14,7 @@ jobs:
 
       - uses: jiro4989/setup-nim-action@v2
         with:
-          nim-version: '2.2.10'
+          nim-version: '2.4.0'
 
       - name: Cache Atlas deps
         uses: actions/cache@v4
@@ -40,24 +40,10 @@ jobs:
           atlas update binny
           atlas install
 
-      - name: Check out the BIF compiler
-        uses: actions/checkout@v4
-        with:
-          repository: nim-lang/Nim
-          ref: 8f1a8f6342642933c07be49b7250364cb8184ab6
-          path: deps/nim-devel
-
-      - name: Build the BIF compiler
-        working-directory: deps/nim-devel
-        run: ./build_all.sh
-
       - name: Verify incremental frontend companions
-        working-directory: deps/nim-devel
         run: |
-          test -x bin/nifler
-          test -x bin/nifmake
+          command -v nifler
+          command -v nifmake
 
       - name: Run tests
-        run: |
-          export PATH="$GITHUB_WORKSPACE/deps/nim-devel/bin:$PATH"
-          atlas-run tests --nim=deps/nim-devel/bin/nim
+        run: atlas-run tests

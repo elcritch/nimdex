@@ -30,7 +30,13 @@ proc readBuildMetadata(path: string): TokenBuf =
 
 proc incrementalConfigurationInputs*(cachePath: string): seq[string] =
   ## IC replays precompiled configuration and may omit ordinary config hints.
-  var config = readBuildMetadata(cachePath / "ic_config.cfg.nif")
+  var configPath = ""
+  for path in walkFiles(cachePath / "ic_config*.cfg.nif"):
+    if configPath.len > 0:
+      raise
+        newException(ValueError, "multiple incremental configurations: " & cachePath)
+    configPath = path
+  var config = readBuildMetadata(configPath)
   var cursor = config.beginRead()
   defer:
     cursor.endRead()
@@ -58,7 +64,9 @@ proc incrementalArtifacts*(cachePath, head: string): seq[string] =
   ## Return only artifacts reachable from the actual head and implicit system
   ## root. Old files remain available to the compiler but never enter the index.
   var buildFile = ""
-  for path in walkFiles(cachePath / "*.frontend.build.nif"):
+  for path in walkDirRec(cachePath / "configs"):
+    if not path.endsWith(".frontend.build.nif"):
+      continue
     if buildFile.len > 0:
       raise newException(ValueError, "multiple incremental build graphs: " & cachePath)
     buildFile = path
@@ -66,6 +74,8 @@ proc incrementalArtifacts*(cachePath, head: string): seq[string] =
     raise newException(ValueError, "missing or oversized incremental build graph")
 
   var artifacts = initTable[string, string]()
+  var parsedSources = initTable[string, string]()
+  var semanticOutputs = initTable[string, string]()
   var pending = @[normalizeDocumentPath(head)]
   var build = readBuildMetadata(buildFile)
   var cursor = build.beginRead()
@@ -91,16 +101,26 @@ proc incrementalArtifacts*(cachePath, head: string): seq[string] =
             if field.tagName() == "input" and source.len == 0 and path.endsWith(".nim"):
               source = normalizeDocumentPath(path)
             elif field.tagName() == "output" and path.endsWith(".p.nif"):
-              parsed = normalizeDocumentPath(path)
+              parsed =
+                path.extractFilename()[0 ..< path.extractFilename().len - ".p.nif".len]
+            elif command == "nim_m" and field.tagName() == "output" and
+                path.endsWith(".s.bif"):
+              let artifact = normalizeDocumentPath(path)
+              if not artifact.startsWith(normalizeDocumentPath(cachePath) & DirSep):
+                raise
+                  newException(ValueError, "incremental output is outside its cache")
+              let name = artifact.extractFilename()
+              semanticOutputs[name[0 ..< name.len - ".s.bif".len]] = artifact
         field.skip()
       if command == "nifler" and source.len > 0 and parsed.len > 0:
-        let artifact = parsed[0 ..< parsed.len - ".p.nif".len] & ".s.bif"
-        if artifact.parentDir != normalizeDocumentPath(cachePath):
-          raise newException(ValueError, "incremental output is outside its cache")
-        artifacts[source] = artifact
+        parsedSources[parsed] = source
       elif command == "nim_m" and source.extractFilename() == "system.nim":
         pending.add(source)
     rule.skip()
+
+  for name, artifact in semanticOutputs:
+    if name in parsedSources:
+      artifacts[parsedSources[name]] = artifact
 
   var seen = initHashSet[string]()
   while pending.len > 0:

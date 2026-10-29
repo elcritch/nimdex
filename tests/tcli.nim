@@ -109,7 +109,7 @@ proc testDaemon(): string =
   let repositoryRoot = currentSourcePath.parentDir.parentDir
   testDaemonPath = getTempDir() / ("nimdex-cli-daemon-" & $getCurrentProcessId())
   let nimCache = getTempDir() / ("nimdex-cli-daemon-cache-" & $getCurrentProcessId())
-  let compiler = repositoryRoot / "deps/nim-devel/bin/nim"
+  let compiler = findExe("nim")
   doAssert compiler.len > 0
   let compilerOutput = execProcess(
     compiler,
@@ -203,7 +203,7 @@ suite "Editor LSP TCP":
       removeDir(root)
     let source = root / "main.nim"
     writeFile(source, "const tcpValue* = 1\n")
-    let compiler = currentSourcePath.parentDir.parentDir / "deps/nim-devel/bin/nim"
+    let compiler = findExe("nim")
     let process = startProcess(
       testDaemon(),
       args = [
@@ -385,7 +385,7 @@ block interactive_head_loading:
   let bad = root / "b.nim"
   writeFile(good, "const healthy* = 1\n")
   writeFile(bad, "proc broken( = discard\n")
-  let compiler = currentSourcePath.parentDir.parentDir / "deps/nim-devel/bin/nim"
+  let compiler = findExe("nim")
   let process = startProcess(
     testDaemon(),
     args = ["daemon", "--frontend", "track", "--cache-root", "lsp-cache"],
@@ -585,7 +585,7 @@ when defined(posix):
       removeDir(root)
     let source = root / "main.nim"
     let wrapper = root / "slow-nim"
-    let compiler = currentSourcePath.parentDir.parentDir / "deps/nim-devel/bin/nim"
+    let compiler = findExe("nim")
     writeFile(source, "const answer* = 42\n")
     writeFile(
       wrapper,
@@ -608,7 +608,7 @@ when defined(posix):
 
 block persistent_cli_service:
   let repositoryRoot = currentSourcePath.parentDir.parentDir
-  let compiler = repositoryRoot / "deps/nim-devel/bin/nim"
+  let compiler = findExe("nim")
   let cacheRoot = getTempDir() / ("nimdex-cli-service-cache-" & $getCurrentProcessId())
   let process = startProcess(
     testDaemon(),
@@ -685,7 +685,7 @@ block persistent_cli_service:
 when defined(posix):
   block cli_service_signals:
     let repositoryRoot = currentSourcePath.parentDir.parentDir
-    let compiler = repositoryRoot / "deps/nim-devel/bin/nim"
+    let compiler = findExe("nim")
     for signalNumber in [SIGINT, SIGTERM, SIGHUP, SIGQUIT]:
       block signal_case:
         let process = startProcess(
@@ -718,7 +718,7 @@ when defined(posix):
 
   block cli_service_signal_during_request:
     let repositoryRoot = currentSourcePath.parentDir.parentDir
-    let compiler = repositoryRoot / "deps/nim-devel/bin/nim"
+    let compiler = findExe("nim")
     let root = normalizeDocumentPath(
       getTempDir() / ("nimdex-cli-signal-request-" & $getCurrentProcessId())
     )

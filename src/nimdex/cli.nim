@@ -33,7 +33,7 @@ import ./lsp
 import ./projectlayout
 import ./workspace
 
-const NimdexVersion = "0.1.2"
+const NimdexVersion = "0.1.3"
 
 var cliServiceStopRequested: Atomic[bool]
 

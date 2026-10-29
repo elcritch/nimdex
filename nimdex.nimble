@@ -1,11 +1,11 @@
-version       = "0.1.2"
+version       = "0.1.3"
 author        = "elcritch"
 description   = "Compiler-backed Nim LSP server and command-line client."
 license       = "MIT"
 srcDir        = "src"
 bin           = @["nimdex"]
 
-requires "nim >= 2.0.0"
+requires "nim >= 2.4.0"
 
 requires "gh:elcritch/binny#feat/checked-bif-string-lists"
 # Scheduler teardown is verified against this Sigils ownership contract.

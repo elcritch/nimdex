@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import select
+import shutil
 import subprocess
 import tempfile
 import threading
@@ -163,12 +164,14 @@ def run(args, root):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--server', type=Path, required=True)
-    parser.add_argument('--nim', type=Path, default=Path(__file__).resolve().parents[1]/'deps/nim-devel/bin/nim')
+    parser.add_argument('--nim', type=Path, default=shutil.which('nim'))
     parser.add_argument('--cycles', type=int, default=50)
     parser.add_argument('--saved', action='store_true')
     parser.add_argument('--keep', action='store_true', help='keep the fixture and stderr log')
     args = parser.parse_args()
-    args.server, args.nim = args.server.resolve(), args.nim.resolve()
+    if not args.nim:
+        parser.error('nim was not found on PATH; pass --nim')
+    args.server, args.nim = args.server.resolve(), Path(args.nim).resolve()
     if args.keep:
         root = Path(tempfile.mkdtemp(prefix='nimdex-soak-')).resolve()
         print(json.dumps({'fixture': str(root)}), flush=True)
