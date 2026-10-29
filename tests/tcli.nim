@@ -303,6 +303,11 @@ suite "Editor LSP TCP":
       source.add("import " & name & "\n")
       writeFile(root / (name & ".nim"), "const value" & $index & "* = " & $index & "\n")
     writeFile(root / "main.nim", source)
+    writeFile(root / "other.nim", "const other* = 42\n")
+    createDir(root / "deps" / "extra")
+    writeFile(root / "nim.cfg", "--path:\"deps/extra\"\n")
+    for index in 0 ..< 3:
+      writeFile(root / "deps" / "extra" / ("extra" & $index & ".nim"), "discard\n")
 
     let process = startProcess(
       testDaemon(),
@@ -338,7 +343,7 @@ suite "Editor LSP TCP":
       %*{
         "rootUri": documentUriFromPath(root),
         "capabilities": {"window": {"workDoneProgress": true}},
-        "initializationOptions": {"entryPoints": ["main.nim"]},
+        "initializationOptions": {"entryPoints": ["main.nim", "other.nim"]},
       },
       1,
     )
@@ -351,6 +356,10 @@ suite "Editor LSP TCP":
     var kinds: seq[string]
     var percentages: seq[int]
     var moduleReport = false
+    var projectReport = false
+    var sawExpectedCount = false
+    var completedHead = false
+    var restartedHead = false
     while getMonoTime() < deadline and (kinds.len == 0 or kinds[^1] != "end"):
       let frame = parser.nextFrame()
       if frame.isSome():
@@ -366,10 +375,23 @@ suite "Editor LSP TCP":
           check message["params"]["token"].getStr() == token
           let value = message["params"]["value"]
           kinds.add(value["kind"].getStr())
-          if value.hasKey("message") and
-              value["message"].getStr().contains("modules processed"):
+          if value.hasKey("message"):
+            let message = value["message"].getStr()
+            if completedHead and message.startsWith("0.00%"):
+              restartedHead = true
+            if message.startsWith("100.00%") and message.contains(": complete"):
+              completedHead = true
+          if value.hasKey("message") and (
+            value["message"].getStr().contains("files encountered") or
+            value["message"].getStr().contains("modules processed")
+          ):
             moduleReport = true
-            check value["percentage"].getInt() in 1 .. 90
+            check value["message"].getStr().contains("(of 45)")
+            if value["message"].getStr().contains("project files encountered"):
+              projectReport = true
+              if value["message"].getStr().contains("(of 45)"):
+                sawExpectedCount = true
+            check value["percentage"].getInt() in 0 .. 100
           if value.hasKey("percentage"):
             percentages.add(value["percentage"].getInt())
       else:
@@ -382,6 +404,9 @@ suite "Editor LSP TCP":
           parser.add(move(chunk))
     check token.len > 0
     check moduleReport
+    check projectReport
+    check sawExpectedCount
+    check restartedHead
     require kinds.len >= 2
     check kinds[0] == "begin"
     check kinds[^1] == "end"
@@ -727,11 +752,11 @@ when defined(posix):
     doAssert run.output.contains("Nim compiler still running"), run.output
     let heartbeatText = run.output[heartbeat ..< done]
     doAssert heartbeatText.contains("percentage"), run.output
-    doAssert heartbeatText.contains("0%"), run.output
+    doAssert heartbeatText.contains("0.00%"), run.output
     doAssert heartbeatText.contains("modulesProcessed"), run.output
     let nextHeartbeat = run.output.find("Nim compiler still running", done)
     doAssert nextHeartbeat > done, run.output
-    doAssert run.output[nextHeartbeat .. ^1].contains("50%"), run.output
+    doAssert run.output[nextHeartbeat .. ^1].contains("0.00%"), run.output
     doAssert run.output.contains("elapsedSeconds"), run.output
     doAssert run.output.contains("elapsedMilliseconds"), run.output
 

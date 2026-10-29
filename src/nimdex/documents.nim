@@ -325,7 +325,10 @@ proc tokenIsInSourceCode(document: DocumentSnapshot, offset: int): bool =
         else:
           inc cursor
         continue
-      elif value == '\'':
+      # Apostrophes following a numeric literal introduce a type suffix, as
+      # in 0.5'f32 or 0xFF'u8; they do not start character literals.
+      elif value == '\'' and
+          (cursor == 0 or not document.content[cursor - 1].isIdentifierByte):
         mode = slChar
       elif value == '`':
         mode = slBacktick

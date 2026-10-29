@@ -3,7 +3,7 @@
 ## resolved imports, including macro-generated imports. No compiler hashing or
 ## symbol pool identities are reproduced here.
 
-import std/[algorithm, os, sets, strutils, tables]
+import std/[algorithm, os, sets, sha1, strutils, tables]
 
 import binny/bif_safe
 import binny/native_dynlib/nif/nifcoreparse
@@ -28,14 +28,96 @@ proc readBuildMetadata(path: string): TokenBuf =
   if result.len == 0:
     raise newException(ValueError, "empty incremental metadata: " & path)
 
-proc incrementalConfigurationInputs*(cachePath: string): seq[string] =
+proc graphContainsHead(path, head: string): bool =
+  var build = readBuildMetadata(path)
+  var cursor = build.beginRead()
+  defer:
+    cursor.endRead()
+  if cursor.kind != TagLit or cursor.tagName() != "stmts":
+    return
+  let name = path.extractFilename()
+  let mainOutput = name[0 ..< name.len - ".frontend.build.nif".len] & ".p.nif"
+  var rule = cursor.childCursor()
+  while rule.hasMore:
+    if rule.kind == TagLit and rule.tagName() == "do":
+      var field = rule.childCursor()
+      if field.kind == Ident and field.strVal() == "nifler":
+        var matchesHead, matchesOutput: bool
+        field.skip()
+        while field.hasMore:
+          if field.kind == TagLit and field.tagName() in ["input", "output"]:
+            let value = field.childCursor()
+            if value.kind == StrLit:
+              if field.tagName() == "input" and value.strVal().endsWith(".nim") and
+                  normalizeDocumentPath(value.strVal()) == normalizeDocumentPath(head):
+                matchesHead = true
+              elif field.tagName() == "output" and
+                  value.strVal().extractFilename() == mainOutput:
+                matchesOutput = true
+          field.skip()
+        if matchesHead and matchesOutput:
+          return true
+    rule.skip()
+
+proc activeFrontendBuild(cachePath: string, head = ""): string =
+  ## Nim IC records the active configuration signature in ic_build_args.txt.
+  ## Its SHA-1 identifies the matching configuration directory.
+  let signaturePath = cachePath / "ic_build_args.txt"
+  let configRoot = cachePath / "configs"
+  var graphRoot = configRoot
+  if fileExists(signaturePath):
+    if getFileSize(signaturePath) > 16 * 1024 * 1024:
+      raise newException(ValueError, "oversized incremental build signature")
+    graphRoot = configRoot / $secureHash(readFile(signaturePath)) / "sem"
+  if not dirExists(graphRoot):
+    return
+  for path in walkDirRec(graphRoot):
+    if path.endsWith(".frontend.build.nif"):
+      if head.len > 0 and not graphContainsHead(path, head):
+        continue
+      if result.len > 0:
+        raise
+          newException(ValueError, "multiple incremental build graphs: " & graphRoot)
+      result = path
+
+proc incrementalExpectedModules*(cachePath: string, head = ""): int =
+  ## Estimate module work from the active IC frontend graph, when available.
+  try:
+    let path = activeFrontendBuild(cachePath, head)
+    if path.len == 0:
+      return
+    var build = readBuildMetadata(path)
+    var cursor = build.beginRead()
+    defer:
+      cursor.endRead()
+    if cursor.kind != TagLit or cursor.tagName() != "stmts":
+      return
+    var rule = cursor.childCursor()
+    while rule.hasMore:
+      if rule.kind == TagLit and rule.tagName() == "do":
+        let command = rule.childCursor()
+        if command.kind == Ident and command.strVal() == "nim_m":
+          inc result
+      rule.skip()
+  except CatchableError:
+    discard
+
+proc incrementalConfigurationInputs*(cachePath: string, head = ""): seq[string] =
   ## IC replays precompiled configuration and may omit ordinary config hints.
   var configPath = ""
-  for path in walkFiles(cachePath / "ic_config*.cfg.nif"):
-    if configPath.len > 0:
-      raise
-        newException(ValueError, "multiple incremental configurations: " & cachePath)
-    configPath = path
+  if head.len > 0:
+    let graph = activeFrontendBuild(cachePath, head)
+    if graph.len == 0:
+      return
+    let name = graph.extractFilename()
+    let suffix = name[0 ..< name.len - ".frontend.build.nif".len]
+    configPath = cachePath / ("ic_config_" & suffix & ".cfg.nif")
+  else:
+    for path in walkFiles(cachePath / "ic_config*.cfg.nif"):
+      if configPath.len > 0:
+        raise
+          newException(ValueError, "multiple incremental configurations: " & cachePath)
+      configPath = path
   var config = readBuildMetadata(configPath)
   var cursor = config.beginRead()
   defer:
@@ -63,13 +145,7 @@ proc resolvedImports(path: string): seq[string] =
 proc incrementalArtifacts*(cachePath, head: string): seq[string] =
   ## Return only artifacts reachable from the actual head and implicit system
   ## root. Old files remain available to the compiler but never enter the index.
-  var buildFile = ""
-  for path in walkDirRec(cachePath / "configs"):
-    if not path.endsWith(".frontend.build.nif"):
-      continue
-    if buildFile.len > 0:
-      raise newException(ValueError, "multiple incremental build graphs: " & cachePath)
-    buildFile = path
+  let buildFile = activeFrontendBuild(cachePath, head)
   if buildFile.len == 0 or getFileSize(buildFile) > 16 * 1024 * 1024:
     raise newException(ValueError, "missing or oversized incremental build graph")
 

@@ -64,7 +64,7 @@ in its current file and 8 MiB in a `.1` rotation. Editor LSP diagnostics are
 still published normally.
 The CLI relays concise compiler progress: a start message for each head with
 its project directory, Nim cache path, and cache run ID, a running heartbeat every five seconds with estimated progress,
-compiler completion with exit code and elapsed time, each completed head with
+the latest compiler processing line, compiler completion with exit code and elapsed time, each completed head with
 its completed/total count, and the compile log path.
 Detailed compiler warnings stay in the per-head log.
 
@@ -157,7 +157,7 @@ Useful options are:
 
 ## Editor integration
 
-Editors that support LSP work-done progress receive indexing updates during compiler cache refreshes. While the compiler runs, Nimdex estimates progress from semantic modules written to the cache, using the previous module graph when available. The estimate is approximate, especially for a first build or an incremental rebuild that reuses most modules.
+Editors that support LSP work-done progress receive indexing updates during compiler cache refreshes. The detailed percentage in the progress message describes the current entry point; the standard LSP percentage tracks the overall refresh. While the compiler runs, Nimdex estimates progress from processing messages and semantic modules, using a fixed per-entry-point estimate derived from `nim dump` search paths and the previous module graph. The estimate is approximate, especially for a first build or an incremental rebuild that reuses most modules.
 
 Start the daemon directly when an editor launches an LSP server:
 
@@ -262,8 +262,9 @@ spelling rules. Unverifiable generated locations return no target.
 
 Nimdex probes the configured compiler and requires `--genBif:on`. By default,
 the CLI and editor server run `nim ic --compileOnly:on --genBif:on` into a
-separate cache for each compiler, configuration, and entry point. This generates
-C and semantic BIFs but skips native compilation and linking. The current
+cache scoped to each compiler and workspace configuration. Test entry points in
+the same directory with matching configuration share an incremental frontend
+cache; other entry points retain separate caches. This generates C and semantic BIFs but skips native compilation and linking. The current
 compiler's `nim check --genBif:on` omits declarations and include metadata, so it
 cannot yet replace this command.
 
@@ -299,9 +300,9 @@ can differ from `nim c`; switch back with `--frontend compile` when needed.
 After a partial rebuild, diagnostics currently reflect modules checked in that
 invocation; warnings from skipped modules may disappear. Whole-head cache reuse
 retains its saved diagnostics.
-Configuration, environment, and source-inventory changes conservatively reset
-the incremental compiler cache. Compilation work is still separate per head;
-sharing those artifacts across heads is future work.
+Configuration, environment, and source-inventory changes select or reset the
+incremental compiler cache. Test entry points with matching configurations reuse
+their shared frontend cache while retaining separate analysis records.
 
 The daemon safely loads the generated BIF files through Binny and converts them into
 owned semantic records. BIF loading and indexing use Sigils worker pools, with at most four loaders by
@@ -328,8 +329,8 @@ and the local source inventory before restoring records. New manifests compare
 file content, so an mtime-only change does not force compilation. Older manifests
 are upgraded when their saved inputs still match. Valid restores run no compiler
 and load no BIF files. Missing, incompatible, or damaged cache entries rebuild.
-Cold compilation still runs once per head; sharing compiler frontend work
-across heads remains future work.
+Cold compilation still runs once per head; matching test entry points can reuse
+compiler frontend work from earlier heads.
 
 Each successful head publishes a stamped snapshot. Failed heads report
 diagnostics while healthy heads remain available; queries requiring a failed

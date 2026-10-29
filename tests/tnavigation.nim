@@ -4,6 +4,44 @@ import nimdex/[compiler, documents, language, semantic, workspace]
 let Compiler = findExe("nim")
 
 suite "compiler navigation, effects and overlays":
+  test "resolves a use in an include after numeric suffixes":
+    let root = normalizeDocumentPath(createTempDir("nimdex-included-navigation-", ""))
+    defer:
+      removeDir(root)
+    let main = root / "main.nim"
+    let support = root / "support.nim"
+    let piece = root / "piece.nim"
+    let pieceText = "let amount = 0.5'f32\ndiscard target(amount)\n"
+    writeFile(main, "import support\ninclude piece\n")
+    writeFile(support, "proc target*(amount: float32): float32 = amount\n")
+    writeFile(piece, pieceText)
+    let ws = initWorkspace(
+      documentUriFromPath(root),
+      entryPoints = @[main],
+      compilerPath = Compiler,
+      cacheRoot = root / "cache",
+    )
+    let refresh = runCompilerRefresh(
+      CompilerRefreshRequest(workspace: ws, capabilities: probeCompiler(Compiler))
+    )
+    require refresh.ok
+    let runtime = newLanguageRuntime()
+    defer:
+      runtime.close()
+    runtime.installIndex(refresh.snapshot)
+    let uri = documentUriFromPath(piece)
+    discard runtime.request(
+      LanguageRequest(kind: lrkOpen, uri: uri, text: pieceText, version: 1)
+    )
+    let definition = runtime.request(
+      LanguageRequest(
+        kind: lrkDefinition, uri: uri, line: 1, character: 10, positionEncoding: peUtf16
+      )
+    )
+    require definition.ok and definition.found
+    check definition.symbols[0].symbol.location.path == support
+    check definition.symbols[0].start == TextPosition(line: 0, character: 5)
+
   test "resolves qualified uses and static effects against current buffer text":
     let root = normalizeDocumentPath(createTempDir("nimdex-navigation-", ""))
     defer:

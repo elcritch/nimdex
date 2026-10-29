@@ -48,6 +48,10 @@ suite "Nimdex compiler refresh":
     check estimatedCompilerHeadPercentage(25, 50) == 45
     check estimatedCompilerHeadPercentage(100, 50) == 90
     check estimatedCompilerHeadPercentage(50, 0) == 45
+    check formatProgressPercent(0) == "0.00%"
+    check formatProgressPercent(1257) == "12.57%"
+    check formatProgressPercent(10000) == "100.00%"
+    check estimatedCompilerHeadHundredths(1, 80) == 112
 
   test "default cache follows Nim configuration and survives a new session":
     let root = normalizeDocumentPath(

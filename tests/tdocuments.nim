@@ -84,6 +84,15 @@ suite "Nimdex document and workspace values":
     doAssert not document.tryTokenSpanAt(3, 12, "exported", startOffset, finishOffset)
     doAssert not document.tryTokenSpanAt(4, 5, "exported", startOffset, finishOffset)
 
+  test "numeric suffixes do not hide later code":
+    let document = initDocumentSnapshot(
+      "file:///tmp/numeric-suffix.nim",
+      "let a = 0.5'f32\nlet b = 0xFF'u8\nlet c = 'x'\nproc target() = discard\n", 1,
+    )
+    var startOffset, finishOffset: int
+    check document.tryTokenSpanAt(4, 5, "target", startOffset, finishOffset)
+    check not document.tryTokenSpanAt(3, 9, "x", startOffset, finishOffset)
+
   test "orders document overlay versions":
     var store = initDocumentStore()
     let uri = "file:///tmp/phase1-overlay.nim"

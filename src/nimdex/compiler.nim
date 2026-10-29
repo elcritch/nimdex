@@ -3,7 +3,7 @@
 import
   std/[
     algorithm, atomics, json, os, osproc, strutils, syncio, tables, tempfiles, times,
-    monotimes,
+    monotimes, sets,
   ]
 
 when defined(posix):
@@ -72,6 +72,7 @@ type
     headPath*: string
     modulesProcessed*: int
     expectedModules*: int
+    projectFiles*: bool
 
   CompilerActivityCallback* = proc(activity: CompilerActivity) {.closure.}
 
@@ -184,16 +185,27 @@ proc terminateCompilerProcess(process: Process) =
   else:
     process.kill()
 
-func estimatedCompilerHeadPercentage*(modulesProcessed, expectedModules: int): int =
-  ## Estimate the compiler portion of one head, leaving room for indexing.
+func estimatedCompilerHeadHundredths*(modulesProcessed, expectedModules: int): int =
+  ## Estimate one compiler head in hundredths of a percent.
   if modulesProcessed <= 0:
     return 0
-  let estimate =
-    if expectedModules > 0:
-      min(90, modulesProcessed * 90 div expectedModules)
-    else:
-      modulesProcessed * 90 div (modulesProcessed + 50)
-  max(1, estimate)
+  if expectedModules > 0:
+    min(9000, modulesProcessed * 9000 div expectedModules)
+  else:
+    modulesProcessed * 9000 div (modulesProcessed + 50)
+
+func estimatedCompilerHeadPercentage*(modulesProcessed, expectedModules: int): int =
+  ## Return the whole-percent estimate for callers using integer progress.
+  let hundredths = estimatedCompilerHeadHundredths(modulesProcessed, expectedModules)
+  if hundredths > 0:
+    max(1, hundredths div 100)
+  else:
+    0
+
+func formatProgressPercent*(hundredths: int): string =
+  ## Format a bounded percentage with two decimal places.
+  let value = clamp(hundredths, 0, 10000)
+  $(value div 100) & "." & align($(value mod 100), 2, '0') & "%"
 
 proc semanticArtifactTimes(cachePath: string): Table[string, times.Time] =
   ## Observe completed semantic module files without reading the compiler's output.
@@ -209,6 +221,107 @@ proc semanticArtifactTimes(cachePath: string): Table[string, times.Time] =
   except OSError:
     discard
 
+proc projectNimFiles(
+    request: CompilerRefreshRequest,
+    entryPoint: string,
+    compilerPaths: openArray[string],
+): HashSet[string] =
+  ## Count files under configured project import paths, without following caches.
+  var roots = request.workspace.importPaths & @[entryPoint.parentDir]
+  roots.add(compilerPaths)
+  for argument in request.workspace.nimArguments:
+    if argument.startsWith("--path:") or argument.startsWith("--path="):
+      let path = argument[7 .. ^1]
+      roots.add(
+        if path.isAbsolute:
+          path
+        else:
+          request.workspace.rootPath / path
+      )
+  var seen = initHashSet[string]()
+  while roots.len > 0:
+    let dir = normalizeDocumentPath(roots.pop())
+    if dir in seen or not dirExists(dir):
+      continue
+    seen.incl(dir)
+    try:
+      for kind, path in walkDir(dir):
+        case kind
+        of pcDir:
+          if not path.lastPathPart.startsWith(".") and
+              path.lastPathPart notin ["nimcache", "deps", "vendor"] and
+              normalizeDocumentPath(path) != request.workspace.cacheRoot:
+            roots.add(path)
+        of pcFile:
+          if path.endsWith(".nim"):
+            result.incl(normalizeDocumentPath(path))
+        else:
+          discard
+    except OSError:
+      discard
+
+proc collectProcessedFiles(
+    path: string,
+    offset: var int64,
+    pending: var string,
+    projectFiles: HashSet[string],
+    processed: var HashSet[string],
+) =
+  ## Consume new complete processing lines once; the compiler may split writes.
+  try:
+    if not fileExists(path):
+      return
+    var file = open(path, fmRead)
+    defer:
+      file.close()
+    let size = file.getFileSize()
+    if size < offset:
+      offset = 0
+      pending.setLen(0)
+    file.setFilePos(offset)
+    let newBytes = file.readAll()
+    pending.add(newBytes)
+    offset += newBytes.len.int64
+    let lastNewline = pending.rfind('\n')
+    if lastNewline < 0:
+      if pending.len > 16384:
+        pending.setLen(0)
+      return
+    for line in pending[0 .. lastNewline].splitLines():
+      if not line.endsWith(" [Processing]"):
+        continue
+      var start = line.rfind(": import: ")
+      var markerLen = 10
+      if start < 0:
+        start = line.rfind(": include: ")
+        markerLen = 11
+      if start >= 0:
+        let filename = line[start + markerLen ..< line.len - " [Processing]".len]
+        let normalized = normalizeDocumentPath(filename)
+        if normalized in projectFiles:
+          processed.incl(normalized)
+    pending = pending[lastNewline + 1 .. ^1]
+  except CatchableError:
+    discard
+
+proc latestCompilerProcessing(path: string): string =
+  ## Read only the tail of the capture; compiler workers may write concurrently.
+  try:
+    if not fileExists(path):
+      return
+    var file = open(path, fmRead)
+    defer:
+      file.close()
+    let size = file.getFileSize()
+    file.setFilePos(max(0'i64, size - 16384))
+    let tail = file.readAll()
+    let lines = tail.splitLines()
+    for index in countdown(lines.high, 0):
+      if lines[index].endsWith(" [Processing]"):
+        return logText(lines[index], 240)
+  except CatchableError:
+    discard
+
 proc runExternalCommand(
     executable: string,
     arguments: openArray[string],
@@ -216,9 +329,8 @@ proc runExternalCommand(
     cancellation: CompilerCancellation = nil,
     progressHead = "",
     progressCache = "",
+    projectFiles: HashSet[string] = initHashSet[string](),
     expectedModules = 0,
-    completedHeads = 0,
-    totalHeads = 1,
     progressStamp = AnalysisStamp(),
     onActivity: CompilerActivityCallback = nil,
 ): CompilerProcessOutput =
@@ -276,43 +388,69 @@ proc runExternalCommand(
     process.close()
   let started = getMonoTime()
   var nextProgressSecond = 5'i64
-  var nextArtifactSample = getMonoTime() + initDuration(milliseconds = 500)
+  var nextProcessingSample = getMonoTime() + initDuration(milliseconds = 100)
+  var nextArtifactSample = nextProcessingSample
+  var nextGraphSample = nextProcessingSample
   var reportedModules = 0
+  var reportedPercentage = 0
+  var processedFiles = initHashSet[string]()
+  var reportedProjectFiles = 0
+  var processingOffset = 0'i64
+  var processingPending = ""
+  var observedExpected = max(expectedModules, projectFiles.len)
+  let progressExpected = observedExpected
   var stopped = false
   while process.peekExitCode() == -1:
     let now = getMonoTime()
     let elapsedSeconds = (now - started).inSeconds
-    if progressCache.len > 0 and now >= nextArtifactSample:
-      let current = semanticArtifactTimes(progressCache)
-      var changed = 0
-      for path, modified in current:
-        if path notin beforeArtifacts or beforeArtifacts[path] != modified:
-          inc changed
-      if changed > reportedModules:
-        reportedModules = changed
+    if progressCache.len > 0 and now >= nextProcessingSample:
+      collectProcessedFiles(
+        stderrPath, processingOffset, processingPending, projectFiles, processedFiles
+      )
+      let previousModules = reportedModules
+      if now >= nextArtifactSample:
+        if now >= nextGraphSample:
+          let graphModules = incrementalExpectedModules(progressCache, progressHead)
+          observedExpected = max(observedExpected, graphModules)
+          nextGraphSample = now + initDuration(seconds = 2)
+        let current = semanticArtifactTimes(progressCache)
+        var changed = 0
+        for path, modified in current:
+          if path notin beforeArtifacts or beforeArtifacts[path] != modified:
+            inc changed
+        reportedModules = max(reportedModules, changed)
+        nextArtifactSample = getMonoTime() + initDuration(seconds = 1)
+      let progressCount =
+        if projectFiles.len > 0: processedFiles.len else: reportedModules
+      let estimate = estimatedCompilerHeadHundredths(progressCount, progressExpected)
+      let previousPercentage = reportedPercentage
+      reportedPercentage = max(reportedPercentage, estimate)
+      if reportedModules > previousModules or reportedPercentage > previousPercentage or
+          processedFiles.len > reportedProjectFiles:
+        reportedProjectFiles = processedFiles.len
         if not onActivity.isNil:
           onActivity(
             CompilerActivity(
               stamp: progressStamp,
               headPath: progressHead,
-              modulesProcessed: changed,
-              expectedModules: expectedModules,
+              modulesProcessed: progressCount,
+              expectedModules: progressExpected,
+              projectFiles: projectFiles.len > 0,
             )
           )
-      nextArtifactSample = getMonoTime() + initDuration(milliseconds = 500)
+      nextProcessingSample = getMonoTime() + initDuration(milliseconds = 100)
     if progressHead.len > 0 and elapsedSeconds >= nextProgressSecond:
       info "Nim compiler still running",
         entryPoint = progressHead,
         elapsedSeconds = elapsedSeconds,
-        percentage =
-          $(
-            (
-              completedHeads * 100 +
-              estimatedCompilerHeadPercentage(reportedModules, expectedModules)
-            ) div max(totalHeads, 1)
-          ) & "%",
+        percentage = formatProgressPercent(reportedPercentage),
+        processing = latestCompilerProcessing(stderrPath),
         modulesProcessed = reportedModules,
-        expectedModules = expectedModules,
+        projectFilesEncountered = processedFiles.len,
+        projectFilesTotal = projectFiles.len,
+        expectedModules = (if progressExpected > 0: $progressExpected
+        else: "unknown"),
+        graphModules = observedExpected,
         stdoutBytes = (if fileExists(stdoutPath): getFileSize(stdoutPath)
         else: 0'i64),
         stderrBytes = (if fileExists(stderrPath): getFileSize(stderrPath)
@@ -326,6 +464,17 @@ proc runExternalCommand(
       break
     sleep(20)
   result.exitCode = process.waitForExit()
+  if progressHead.len > 0:
+    info "Nim compiler done",
+      entryPoint = progressHead,
+      nimCachePath = progressCache,
+      cacheRunId = captureDir.extractFilename(),
+      exitCode = result.exitCode,
+      elapsedMilliseconds = (getMonoTime() - started).inMilliseconds,
+      stdoutBytes = (if fileExists(stdoutPath): getFileSize(stdoutPath)
+      else: 0'i64),
+      stderrBytes = (if fileExists(stderrPath): getFileSize(stderrPath)
+      else: 0'i64)
   result.stdout = readCompilerCapture(stdoutPath)
   result.stderr = readCompilerCapture(stderrPath)
   if stopped and not cancellation.isCompilerCancelled() and
@@ -607,6 +756,7 @@ proc compilerArguments(
     else:
       "c"
   )
+  result.add("--processing:filenames")
   for argument in request.workspace.nimArguments:
     result.add(argument)
   for importPath in request.workspace.importPaths:
@@ -629,6 +779,53 @@ proc compilerArguments(
     writeFile(dirtyPath, overlay.content)
     result.add("--trackDirty:" & dirtyPath & "," & overlay.path & ",1,0")
   result.add(entryPoint)
+
+proc effectiveCompilerPaths(
+    request: CompilerRefreshRequest, entryPoint: string
+): seq[string] =
+  ## Query the actual compiler configuration, including paths installed by Atlas.
+  var args = @["dump"]
+  args.add(request.workspace.nimArguments)
+  for path in request.workspace.importPaths:
+    args.add("--path:" & path)
+  args.add(["--dump.format:json", "--colors:off", entryPoint])
+  let captureDir = createTempDir("nimdex-path-probe-", "")
+  defer:
+    removeDir(captureDir)
+  try:
+    let output = runExternalCommand(
+      request.capabilities.compilerPath, args, request.workspace.rootPath, captureDir,
+      request.cancellation,
+    )
+    if output.exitCode != 0:
+      return
+    for line in output.stdout.splitLines():
+      if not line.startsWith("{"):
+        continue
+      let data = parseJson(line)
+      if data.kind != JObject:
+        continue
+      var library = ""
+      if data.hasKey("libpath") and data["libpath"].kind == JString:
+        library = normalizeDocumentPath(data["libpath"].getStr())
+      for key in ["lib_paths"]:
+        if data.hasKey(key) and data[key].kind == JArray:
+          for item in data[key]:
+            if item.kind == JString:
+              let raw = item.getStr()
+              let full =
+                if raw.isAbsolute:
+                  raw
+                else:
+                  request.workspace.rootPath / raw
+              let path = normalizeDocumentPath(full)
+              if path.len > 0 and path != library and
+                  (library.len == 0 or not path.startsWith(library & DirSep)) and
+                  path notin result:
+                result.add(path)
+      return
+  except CatchableError as error:
+    debug "Unable to query compiler paths for progress", failure = error.msg
 
 proc compilerCacheRoot(request: CompilerRefreshRequest, entryPoint: string): string =
   if request.workspace.cacheRoot.len > 0:
@@ -695,7 +892,8 @@ proc buildHead(
     entryPoint, cachePath: string,
     reuseKey: uint64,
     artifactCache: var BifReuseCache,
-    expectedModules, completedHeads, totalHeads: int,
+    expectedModules: int,
+    sharedFrontend: string,
     stamp: AnalysisStamp,
     onActivity: CompilerActivityCallback,
 ): HeadBuild =
@@ -708,17 +906,22 @@ proc buildHead(
   # The IC driver owns and may reset this directory. Keep manifests and process
   # captures outside it, and retain its outputs for per-module rebuild decisions.
   let compilerCache =
-    if incremental:
+    if sharedFrontend.len > 0:
+      sharedFrontend
+    elif incremental:
       cachePath / "frontend"
     else:
       cachePath
+  var knownModules = expectedModules
+  if knownModules == 0 and incremental:
+    knownModules = incrementalExpectedModules(compilerCache, entryPoint)
   var configPaths = configurationInputs(request.workspace, entryPoint)
-  if incremental:
+  if incremental and sharedFrontend.len == 0:
     let contextPath = cachePath / "frontend-context"
     var reset = request.forceRebuild
     if dirExists(compilerCache):
       try:
-        for path in incrementalConfigurationInputs(compilerCache):
+        for path in incrementalConfigurationInputs(compilerCache, entryPoint):
           if path notin configPaths:
             configPaths.add(path)
       except CatchableError:
@@ -732,7 +935,7 @@ proc buildHead(
       if dirExists(compilerCache):
         removeDir(compilerCache)
     writeFile(contextPath, frontendKey)
-  else:
+  elif not incremental:
     for path in discoverBifArtifacts(@[compilerCache]):
       removeFile(path)
   let beforePaths = configPaths & @[entryPoint]
@@ -740,25 +943,28 @@ proc buildHead(
   let arguments = request.compilerArguments(compilerCache, entryPoint)
   result.command = commandLine(request.capabilities.compilerPath, arguments)
   let compileStarted = getTime()
-  let compilerStarted = getMonoTime()
+  let compilerPaths = request.effectiveCompilerPaths(entryPoint)
+  let projectFiles = projectNimFiles(request, entryPoint, compilerPaths)
   info "Nim compiler starting",
     workingDir = request.workspace.rootPath,
     entryPoint = entryPoint,
     nimCachePath = compilerCache,
-    cacheRunId = cachePath.extractFilename()
+    cacheRunId = cachePath.extractFilename(),
+    expectedModules = max(knownModules, projectFiles.len),
+    candidateFiles = projectFiles.len
+  if not onActivity.isNil:
+    onActivity(
+      CompilerActivity(
+        stamp: stamp,
+        headPath: entryPoint,
+        expectedModules: max(knownModules, projectFiles.len),
+      )
+    )
   let process = runExternalCommand(
     request.capabilities.compilerPath, arguments, request.workspace.rootPath, cachePath,
-    request.cancellation, entryPoint, compilerCache, expectedModules, completedHeads,
-    totalHeads, stamp, onActivity,
+    request.cancellation, entryPoint, compilerCache, projectFiles, knownModules, stamp,
+    onActivity,
   )
-  info "Nim compiler done",
-    entryPoint = entryPoint,
-    nimCachePath = compilerCache,
-    cacheRunId = cachePath.extractFilename(),
-    exitCode = process.exitCode,
-    elapsedMilliseconds = (getMonoTime() - compilerStarted).inMilliseconds,
-    stdoutBytes = process.stdout.len,
-    stderrBytes = process.stderr.len
   try:
     let compileLog = saveHeadCompilerLog(cachePath, entryPoint, result.command, process)
     info "Nim compiler output captured",
@@ -823,7 +1029,7 @@ proc buildHead(
     request.workspace, entryPoint, snapshot, process.stdout & process.stderr
   )
   if incremental:
-    for path in incrementalConfigurationInputs(compilerCache):
+    for path in incrementalConfigurationInputs(compilerCache, entryPoint):
       if path notin result.analysis.inputPaths:
         result.analysis.inputPaths.add(path)
       if path notin configPaths:
@@ -843,9 +1049,11 @@ proc buildHead(
     result.error = "compiler inputs changed during analysis; retry refresh"
     return
   if incremental:
-    writeFile(
-      cachePath / "frontend-context", $reuseKey & ":" & $fingerprintInputs(configPaths)
-    )
+    if sharedFrontend.len == 0:
+      writeFile(
+        cachePath / "frontend-context",
+        $reuseKey & ":" & $fingerprintInputs(configPaths),
+      )
     # Successful incremental checks can retain byte-identical BIFs with older
     # mtimes than their source (for example after a comment-only edit). Stamp
     # owned locations with the validated build time; never touch compiler files.
@@ -995,6 +1203,7 @@ proc runCompilerRefresh*(
   for previous in request.previousHeads:
     if not previous.snapshot.isNil:
       artifactCache.rememberModules(previous.snapshot[])
+  var resetShared = initHashSet[string]()
   var pending: seq[int]
   for index in 0 ..< entryPoints.len:
     pending.add(index)
@@ -1050,17 +1259,26 @@ proc runCompilerRefresh*(
           if previous.headPath == entryPoint:
             expectedModules = previous.artifactPaths.len
             break
+        var sharedFrontend = ""
+        let testsRoot = request.workspace.rootPath / "tests"
+        if request.overlays.len == 0 and
+            request.workspace.compilerFrontend in {cfTrack, cfIc} and
+            entryPoint.startsWith(testsRoot & DirSep):
+          var configs: seq[string]
+          for path in configurationInputs(effectiveRequest.workspace, entryPoint):
+            if fileExists(path):
+              configs.add(path)
+          let groupKey = stableTextHash(
+            entryPoint.parentDir & "\0" & $reuseKey & "\0" & $fingerprintInputs(configs)
+          )
+          sharedFrontend = result.cachePath / "test-frontends" / $groupKey / "frontend"
+          if request.forceRebuild and sharedFrontend notin resetShared:
+            resetShared.incl(sharedFrontend)
+            if dirExists(sharedFrontend):
+              removeDir(sharedFrontend)
         let built = buildHead(
-          effectiveRequest,
-          entryPoint,
-          cachePath,
-          reuseKey,
-          artifactCache,
-          expectedModules,
-          entryPoints.len - pending.len - 1,
-          entryPoints.len,
-          result.stamp,
-          onActivity,
+          effectiveRequest, entryPoint, cachePath, reuseKey, artifactCache,
+          expectedModules, sharedFrontend, result.stamp, onActivity,
         )
         if built.command.len > 0:
           result.commandLines.add(built.command)
@@ -1115,7 +1333,8 @@ proc runCompilerRefresh*(
           "reused"
         else:
           "compiled"
-      )
+      ),
+      failure = progress.error
     if not onHead.isNil:
       onHead(progress)
     if progress.ok and not progress.reused and not progress.restored and

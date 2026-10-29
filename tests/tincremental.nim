@@ -1,4 +1,5 @@
-import std/[algorithm, json, options, os, strutils, tables, tempfiles, times, unittest]
+import
+  std/[algorithm, json, options, os, sha1, strutils, tables, tempfiles, times, unittest]
 
 import nimdex/[compiler, documents, headcache, incremental, lsp, semantic, workspace]
 import sigils/rpcs/jsonrpc
@@ -55,6 +56,22 @@ proc compilerRuns(refresh: CompilerRefreshResult): Table[string, Time] =
     result[artifact] = getLastModificationTime(edge)
 
 suite "incremental compiler frontend":
+  test "counts compiler module rules from a frontend graph":
+    let root = createTempDir("nimdex-graph-count-", "")
+    defer:
+      removeDir(root)
+    createDir(root / "configs" / "test" / "sem")
+    let graph = root / "configs" / "test" / "sem" / "main.frontend.build.nif"
+    check incrementalExpectedModules(root) == 0
+    writeFile(graph, "(.nif27)\n(stmts (do nim_m) (do nifler) (do nim_m))\n")
+    check incrementalExpectedModules(root) == 2
+    let signature = "active configuration"
+    let active = root / "configs" / $secureHash(signature) / "sem"
+    createDir(active)
+    writeFile(root / "ic_build_args.txt", signature)
+    writeFile(active / "main.frontend.build.nif", "(.nif27)\n(stmts (do nim_m))\n")
+    check incrementalExpectedModules(root) == 1
+
   test "defaults saved-source analysis to ic":
     let root = normalizeDocumentPath(createTempDir("nimdex-default-ic-", ""))
     defer:
@@ -73,6 +90,14 @@ suite "incremental compiler frontend":
     require refreshed.commandLines.len == 1
     check " ic " in refreshed.commandLines[0]
     check "--compileOnly:on" in refreshed.commandLines[0]
+    check "--processing:filenames" in refreshed.commandLines[0]
+    check "[Processing]" in (refreshed.stdout & refreshed.stderr)
+    check incrementalExpectedModules(refreshed.heads[0].cachePath / "frontend") > 0
+    let frontend = refreshed.heads[0].cachePath / "frontend"
+    let staleDir = frontend / "configs" / "obsolete" / "sem"
+    createDir(staleDir)
+    writeFile(staleDir / "stale.frontend.build.nif", "(.nif27)\n(stmts)\n")
+    check incrementalArtifacts(frontend, head) == refreshed.artifactPaths
     check "defaultIcValue" in refreshed.declarationNames(head)
 
   test "checks frontend prerequisites separately and rejects unknown LSP modes":
@@ -321,6 +346,55 @@ when defined(testContext):
     checkpoint newConfig.error & "\n" & newConfig.stderr
     require newConfig.ok
     check "testContextValue" notin newConfig.declarationNames(head)
+
+  test "test entry points share an IC cache and preserve their main modules":
+    let root = normalizeDocumentPath(createTempDir("nimdex-shared-tests-", ""))
+    defer:
+      removeDir(root)
+    createDir(root / "tests")
+    let first = root / "tests" / "ta.nim"
+    let second = root / "tests" / "tb.nim"
+    let shared = root / "tests" / "shared.nim"
+    writeFile(shared, "const common* = 1\n")
+    writeFile(first, "import shared\nwhen isMainModule:\n  const onlyA* = common\n")
+    writeFile(
+      second, "import shared, ta\nwhen isMainModule:\n  const onlyB* = common\n"
+    )
+    var request = CompilerRefreshRequest(
+      workspace: initWorkspace(
+        documentUriFromPath(root),
+        entryPoints = @[first, second],
+        importPaths = @[root / "tests"],
+        cacheRoot = root / "cache",
+        compilerFrontend = cfIc,
+      ),
+      capabilities: capabilities,
+    )
+    let cold = runCompilerRefresh(request)
+    checkpoint cold.error & "\n" & cold.stderr
+    require cold.ok
+    require cold.heads.len == 2
+    require cold.commandLines.len == 2
+    var caches: seq[string]
+    for command in cold.commandLines:
+      for argument in command.splitWhitespace():
+        if argument.startsWith("--nimcache:"):
+          caches.add(argument)
+    require caches.len == 2
+    check caches[0] == caches[1]
+    check cold.heads[0].cachePath != cold.heads[1].cachePath
+    check cold.heads[0].snapshot[].findSymbols("onlyA").len == 1
+    check cold.heads[0].snapshot[].findSymbols("onlyB").len == 0
+    check cold.heads[1].snapshot[].findSymbols("onlyB").len == 1
+    check cold.heads[1].snapshot[].findSymbols("onlyA").len == 0
+    request.previousHeads = cold.heads
+    writeFile(shared, "const common* = 2\n")
+    let updated = runCompilerRefresh(request)
+    checkpoint updated.error & "\n" & updated.stderr
+    require updated.ok
+    check updated.compiledHeads == 2
+    check updated.heads[0].snapshot[].findSymbols("onlyA").len == 1
+    check updated.heads[1].snapshot[].findSymbols("onlyB").len == 1
 
   test "keeps actual-head and test configuration variants isolated":
     let root = normalizeDocumentPath(createTempDir("nimdex-track-heads-", ""))

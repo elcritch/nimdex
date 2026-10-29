@@ -111,9 +111,13 @@ type
     progressCacheRunId: string
     progressNimCachePath: string
     progressPercentage: string
+    progressProcessing: string
     progressModules: int
-    progressExpectedModules: int
+    progressExpectedModules: string
+    progressProjectFiles: int
+    progressProjectTotal: int
     progressStatus: string
+    progressFailure: string
     progressLog: string
     progressElapsed: int
     progressElapsedMilliseconds: int
@@ -588,13 +592,17 @@ proc relayCompilerProgress(raw: string, context: pointer) {.nimcall, gcsafe.} =
         workingDir = state.progressWorkingDir,
         entryPoint = state.progressHead,
         nimCachePath = state.progressNimCachePath,
-        cacheRunId = state.progressCacheRunId
+        cacheRunId = state.progressCacheRunId,
+        expectedModules = state.progressExpectedModules
     of clkRunning:
       info "Nim compiler still running",
         entryPoint = state.progressHead,
         elapsedSeconds = state.progressElapsed,
         percentage = state.progressPercentage,
+        processing = state.progressProcessing,
         modulesProcessed = state.progressModules,
+        projectFilesEncountered = state.progressProjectFiles,
+        projectFilesTotal = state.progressProjectTotal,
         expectedModules = state.progressExpectedModules,
         stdoutBytes = state.progressStdoutBytes,
         stderrBytes = state.progressStderrBytes
@@ -612,7 +620,8 @@ proc relayCompilerProgress(raw: string, context: pointer) {.nimcall, gcsafe.} =
         entryPoint = state.progressHead,
         completedHeads = state.progressCompleted,
         totalHeads = state.progressTotal,
-        status = state.progressStatus
+        status = state.progressStatus,
+        failure = state.progressFailure
     of clkCapture:
       info "Nim compiler output captured",
         entryPoint = state.progressHead,
@@ -641,9 +650,13 @@ proc relayCompilerProgress(raw: string, context: pointer) {.nimcall, gcsafe.} =
     state.progressCacheRunId = ""
     state.progressNimCachePath = ""
     state.progressPercentage = ""
+    state.progressProcessing = ""
     state.progressModules = 0
-    state.progressExpectedModules = 0
+    state.progressExpectedModules = ""
+    state.progressProjectFiles = 0
+    state.progressProjectTotal = 0
     state.progressStatus = ""
+    state.progressFailure = ""
     state.progressLog = ""
     state.progressElapsed = 0
     state.progressElapsedMilliseconds = 0
@@ -671,12 +684,19 @@ proc relayCompilerProgress(raw: string, context: pointer) {.nimcall, gcsafe.} =
     state.progressNimCachePath = value
   of "percentage":
     state.progressPercentage = value
+  of "processing":
+    state.progressProcessing = value
+  of "expectedModules":
+    state.progressExpectedModules = value
   of "status":
     state.progressStatus = value
+  of "failure":
+    state.progressFailure = value
   of "compileLog":
     state.progressLog = value
   of "elapsedSeconds", "elapsedMilliseconds", "exitCode", "completedHeads",
-      "totalHeads", "stdoutBytes", "stderrBytes", "modulesProcessed", "expectedModules":
+      "totalHeads", "stdoutBytes", "stderrBytes", "modulesProcessed",
+      "projectFilesEncountered", "projectFilesTotal":
     try:
       let number = parseInt(value)
       case name
@@ -690,10 +710,12 @@ proc relayCompilerProgress(raw: string, context: pointer) {.nimcall, gcsafe.} =
         state.progressCompleted = number
       of "totalHeads":
         state.progressTotal = number
+      of "projectFilesEncountered":
+        state.progressProjectFiles = number
+      of "projectFilesTotal":
+        state.progressProjectTotal = number
       of "modulesProcessed":
         state.progressModules = number
-      of "expectedModules":
-        state.progressExpectedModules = number
       of "stdoutBytes":
         state.progressStdoutBytes = number
       of "stderrBytes":

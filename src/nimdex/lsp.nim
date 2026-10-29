@@ -118,7 +118,8 @@ type
     progressSerial: int
     progressToken: string
     progressStarted: bool
-    progressHeadPercent: int
+    progressHeadHundredths: int
+    progressHeadPath: string
     progressModuleMessage: string
     compilerRefreshPending: bool
     publishedDiagnosticUris: Table[string, bool]
@@ -1047,7 +1048,8 @@ proc prepareCompilerRefresh(server: LspServer) =
   server.semanticFailed = false
   server.progressHeads.setLen(0)
   server.completedHeads.setLen(0)
-  server.progressHeadPercent = 0
+  server.progressHeadHundredths = 0
+  server.progressHeadPath = ""
   server.progressModuleMessage = ""
   server.failedHeads.setLen(0)
   server.headDiagnostics.clear()
@@ -1063,11 +1065,11 @@ proc reusableHeads(server: LspServer): seq[HeadAnalysis] =
     if not retained:
       result.add(saved)
 
-proc compilerProgressPercentage(server: LspServer): int =
+proc compilerProgressHundredths(server: LspServer): int =
   if server.refreshEntryPoints.len > 0:
     min(
-      100,
-      (server.completedHeads.len * 100 + server.progressHeadPercent) div
+      10000,
+      (server.completedHeads.len * 10000 + server.progressHeadHundredths) div
         server.refreshEntryPoints.len,
     )
   else:
@@ -1078,9 +1080,12 @@ proc sendCompilerProgress(server: LspServer, kind: string) =
     return
   var value = %*{"kind": kind}
   if kind != "end":
-    value["percentage"] = %server.compilerProgressPercentage()
-    if server.progressModuleMessage.len > 0:
-      value["message"] = %server.progressModuleMessage
+    let hundredths = server.compilerProgressHundredths()
+    value["percentage"] = %(hundredths div 100)
+    value["message"] = %(
+      formatProgressPercent(server.progressHeadHundredths) & " " &
+      server.progressModuleMessage
+    )
     if kind == "begin":
       value["title"] = %"Nimdex indexing"
   server.dispatcher.sendJsonRpcNotification(
@@ -1117,10 +1122,19 @@ proc receiveCompilerActivity(server: LspServer, activity: CompilerActivity) {.sl
       activity.headPath in server.completedHeads or
       server.compilerCancellation.isCompilerCancelled():
     return
+  if server.progressHeadPath != activity.headPath:
+    server.progressHeadPath = activity.headPath
+    server.progressHeadHundredths = 0
   let estimate =
-    estimatedCompilerHeadPercentage(activity.modulesProcessed, activity.expectedModules)
-  server.progressHeadPercent = max(server.progressHeadPercent, estimate)
-  server.progressModuleMessage = $activity.modulesProcessed & " modules processed"
+    estimatedCompilerHeadHundredths(activity.modulesProcessed, activity.expectedModules)
+  server.progressHeadHundredths = max(server.progressHeadHundredths, estimate)
+  server.progressModuleMessage =
+    activity.headPath.extractFilename() & ": " & $activity.modulesProcessed &
+    (if activity.projectFiles: " project files encountered" else: " modules processed") &
+    (
+      if activity.expectedModules > 0: " (of " & $activity.expectedModules & ")"
+      else: ""
+    )
   server.sendCompilerProgress("report")
 
 proc startCompilerRefresh(server: LspServer) =
@@ -1771,10 +1785,16 @@ proc receiveCompilerHeadProgress(
       not server.compilerStampMatches(progress.stamp) or
       server.compilerCancellation.isCompilerCancelled():
     return
-  server.completedHeads.add(progress.headPath)
-  server.progressHeadPercent = 0
-  server.progressModuleMessage = ""
+  if progress.ok:
+    server.progressHeadHundredths = 10000
+  server.progressModuleMessage =
+    progress.headPath.extractFilename() & (
+      if progress.ok: ": complete" else: ": failed"
+    )
   server.sendCompilerProgress("report")
+  server.completedHeads.add(progress.headPath)
+  server.progressHeadHundredths = 0
+  server.progressHeadPath = ""
   server.headDiagnostics[progress.headPath] = progress.diagnostics
   if progress.ok:
     server.progressHeads.add(progress.analysis)
