@@ -33,7 +33,7 @@ import ./lsp
 import ./projectlayout
 import ./workspace
 
-const NimdexVersion = "0.1.3"
+const NimdexVersion = "0.1.4"
 
 var cliServiceStopRequested: Atomic[bool]
 
@@ -109,6 +109,10 @@ type
     progressHead: string
     progressWorkingDir: string
     progressCacheRunId: string
+    progressNimCachePath: string
+    progressPercentage: string
+    progressModules: int
+    progressExpectedModules: int
     progressStatus: string
     progressLog: string
     progressElapsed: int
@@ -583,16 +587,21 @@ proc relayCompilerProgress(raw: string, context: pointer) {.nimcall, gcsafe.} =
       info "Nim compiler starting",
         workingDir = state.progressWorkingDir,
         entryPoint = state.progressHead,
+        nimCachePath = state.progressNimCachePath,
         cacheRunId = state.progressCacheRunId
     of clkRunning:
       info "Nim compiler still running",
         entryPoint = state.progressHead,
         elapsedSeconds = state.progressElapsed,
+        percentage = state.progressPercentage,
+        modulesProcessed = state.progressModules,
+        expectedModules = state.progressExpectedModules,
         stdoutBytes = state.progressStdoutBytes,
         stderrBytes = state.progressStderrBytes
     of clkDone:
       info "Nim compiler done",
         entryPoint = state.progressHead,
+        nimCachePath = state.progressNimCachePath,
         cacheRunId = state.progressCacheRunId,
         exitCode = state.progressExitCode,
         elapsedMilliseconds = state.progressElapsedMilliseconds,
@@ -630,6 +639,10 @@ proc relayCompilerProgress(raw: string, context: pointer) {.nimcall, gcsafe.} =
     state.progressHead = ""
     state.progressWorkingDir = ""
     state.progressCacheRunId = ""
+    state.progressNimCachePath = ""
+    state.progressPercentage = ""
+    state.progressModules = 0
+    state.progressExpectedModules = 0
     state.progressStatus = ""
     state.progressLog = ""
     state.progressElapsed = 0
@@ -654,12 +667,16 @@ proc relayCompilerProgress(raw: string, context: pointer) {.nimcall, gcsafe.} =
     state.progressHead = value
   of "cacheRunId":
     state.progressCacheRunId = value
+  of "nimCachePath":
+    state.progressNimCachePath = value
+  of "percentage":
+    state.progressPercentage = value
   of "status":
     state.progressStatus = value
   of "compileLog":
     state.progressLog = value
   of "elapsedSeconds", "elapsedMilliseconds", "exitCode", "completedHeads",
-      "totalHeads", "stdoutBytes", "stderrBytes":
+      "totalHeads", "stdoutBytes", "stderrBytes", "modulesProcessed", "expectedModules":
     try:
       let number = parseInt(value)
       case name
@@ -673,6 +690,10 @@ proc relayCompilerProgress(raw: string, context: pointer) {.nimcall, gcsafe.} =
         state.progressCompleted = number
       of "totalHeads":
         state.progressTotal = number
+      of "modulesProcessed":
+        state.progressModules = number
+      of "expectedModules":
+        state.progressExpectedModules = number
       of "stdoutBytes":
         state.progressStdoutBytes = number
       of "stderrBytes":
@@ -951,13 +972,12 @@ proc runConnectedRequest(
     options: CliOptions, root: string
 ): tuple[response: JsonNode, debug: JsonNode, error: string] =
   try:
-    let request =
-      %*{
-        "command": $options.command,
-        "root": root,
-        "query": options.query,
-        "debug": options.debug,
-      }
+    let request = %*{
+      "command": $options.command,
+      "root": root,
+      "query": options.query,
+      "debug": options.debug,
+    }
     let reply = callListeningDaemon(options.connectPort, request)
     if reply.kind != JObject:
       result.error = "listening daemon returned an invalid response"

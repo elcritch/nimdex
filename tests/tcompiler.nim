@@ -42,6 +42,13 @@ proc debugState(server: LspServer): JsonNode =
   )["result"]
 
 suite "Nimdex compiler refresh":
+  test "estimates progress from observed and expected modules":
+    check estimatedCompilerHeadPercentage(0, 100) == 0
+    check estimatedCompilerHeadPercentage(1, 1000) == 1
+    check estimatedCompilerHeadPercentage(25, 50) == 45
+    check estimatedCompilerHeadPercentage(100, 50) == 90
+    check estimatedCompilerHeadPercentage(50, 0) == 45
+
   test "default cache follows Nim configuration and survives a new session":
     let root = normalizeDocumentPath(
       getTempDir() / ("nimdex-default-cache-" & $getCurrentProcessId())

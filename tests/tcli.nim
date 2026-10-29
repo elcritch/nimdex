@@ -1,5 +1,8 @@
 import
-  std/[assertions, json, nativesockets, net, os, osproc, streams, strutils, unittest]
+  std/[
+    assertions, json, monotimes, nativesockets, net, os, osproc, streams, strutils,
+    times, unittest,
+  ]
 
 import nimdex/cli
 import nimdex/clicapture
@@ -286,6 +289,107 @@ suite "Editor LSP TCP":
       socket.sendProtocol("exit", %*{})
       check socket.recv(1, timeout = 10000).len == 0
       check process.running()
+
+  test "reports compiler refresh progress through LSP work-done tokens":
+    let root = normalizeDocumentPath(
+      getTempDir() / ("nimdex-progress-" & $getCurrentProcessId())
+    )
+    createDir(root)
+    defer:
+      removeDir(root)
+    var source = ""
+    for index in 0 ..< 40:
+      let name = "module" & $index
+      source.add("import " & name & "\n")
+      writeFile(root / (name & ".nim"), "const value" & $index & "* = " & $index & "\n")
+    writeFile(root / "main.nim", source)
+
+    let process = startProcess(
+      testDaemon(),
+      args = [
+        "daemon",
+        "--lsp-listen",
+        "0",
+        "--compiler",
+        findExe("nim"),
+        "--cache-root",
+        root / "cache",
+      ],
+      options = {poUsePath},
+    )
+    let port = Port(
+      parseInt(process.errorStream().readListenerPort("Nimdex LSP TCP listener ready"))
+    )
+    var errorThread: Thread[Stream]
+    createThread(errorThread, drainProtocolErrors, process.errorStream())
+    defer:
+      process.terminate()
+      if process.waitForExit(10000) == -1:
+        process.kill()
+        discard process.waitForExit()
+      joinThread(errorThread)
+      process.close()
+    let socket = newSocket(buffered = false)
+    defer:
+      socket.close()
+    socket.connect("127.0.0.1", port)
+    socket.sendProtocol(
+      "initialize",
+      %*{
+        "rootUri": documentUriFromPath(root),
+        "capabilities": {"window": {"workDoneProgress": true}},
+        "initializationOptions": {"entryPoints": ["main.nim"]},
+      },
+      1,
+    )
+    var parser = initJsonRpcFrameParser()
+    var notifications: seq[JsonNode]
+    require socket.receiveProtocol(parser, 1, notifications).hasKey("result")
+    socket.sendProtocol("initialized", %*{})
+    let deadline = getMonoTime() + initDuration(seconds = 60)
+    var token = ""
+    var kinds: seq[string]
+    var percentages: seq[int]
+    var moduleReport = false
+    while getMonoTime() < deadline and (kinds.len == 0 or kinds[^1] != "end"):
+      let frame = parser.nextFrame()
+      if frame.isSome():
+        let message = parseJson(frame.get())
+        if message{"method"}.getStr() == "window/workDoneProgress/create":
+          token = message["params"]["token"].getStr()
+          socket.send(
+            frameJsonRpcMessage(
+              $(%*{"jsonrpc": "2.0", "id": message["id"], "result": nil})
+            )
+          )
+        elif message{"method"}.getStr() == "$/progress":
+          check message["params"]["token"].getStr() == token
+          let value = message["params"]["value"]
+          kinds.add(value["kind"].getStr())
+          if value.hasKey("message") and
+              value["message"].getStr().contains("modules processed"):
+            moduleReport = true
+            check value["percentage"].getInt() in 1 .. 90
+          if value.hasKey("percentage"):
+            percentages.add(value["percentage"].getInt())
+      else:
+        var readable = @[socket.getFd()]
+        if selectRead(readable, 20) > 0:
+          var chunk = newString(16384)
+          let count = socket.recv(addr chunk[0], chunk.len)
+          require count > 0
+          chunk.setLen(count)
+          parser.add(move(chunk))
+    check token.len > 0
+    check moduleReport
+    require kinds.len >= 2
+    check kinds[0] == "begin"
+    check kinds[^1] == "end"
+    require percentages.len > 0
+    check percentages[0] in 0 .. 100
+    check percentages[^1] == 100
+    for i in 1 ..< percentages.len:
+      check percentages[i] >= percentages[i - 1]
 
   test "recovers from incomplete frames and stops with an idle editor":
     let process = startProcess(
@@ -584,9 +688,11 @@ when defined(posix):
     defer:
       removeDir(root)
     let source = root / "main.nim"
+    let otherSource = root / "other.nim"
     let wrapper = root / "slow-nim"
     let compiler = findExe("nim")
     writeFile(source, "const answer* = 42\n")
+    writeFile(otherSource, "const second* = 43\n")
     writeFile(
       wrapper,
       "#!/bin/sh\ncase \"$1\" in --version|--fullhelp) ;; *) sleep 6 ;; esac\n" & "exec " &
@@ -594,15 +700,38 @@ when defined(posix):
     )
     setFilePermissions(wrapper, {fpUserRead, fpUserWrite, fpUserExec})
     let run = runExternalCli(
-      ["check", root, "--compiler", wrapper, "--cache-root", root / "cache"]
+      [
+        "check",
+        root,
+        "--compiler",
+        wrapper,
+        "--cache-root",
+        root / "cache",
+        "--entry-point",
+        source,
+        "--entry-point",
+        otherSource,
+      ]
     )
     doAssert run.status == 0, run.output
     let starting = run.output.find("Nim compiler starting")
     let heartbeat = run.output.find("Nim compiler still running")
     let done = run.output.find("Nim compiler done")
     doAssert starting >= 0 and starting < heartbeat, run.output
+    doAssert run.output[starting ..< heartbeat].contains("nimCachePath"), run.output
+    doAssert run.output[starting ..< heartbeat].contains(
+      normalizeDocumentPath(root / "cache")
+    ), run.output
     doAssert heartbeat < done, run.output
+    doAssert run.output[done .. ^1].contains("nimCachePath"), run.output
     doAssert run.output.contains("Nim compiler still running"), run.output
+    let heartbeatText = run.output[heartbeat ..< done]
+    doAssert heartbeatText.contains("percentage"), run.output
+    doAssert heartbeatText.contains("0%"), run.output
+    doAssert heartbeatText.contains("modulesProcessed"), run.output
+    let nextHeartbeat = run.output.find("Nim compiler still running", done)
+    doAssert nextHeartbeat > done, run.output
+    doAssert run.output[nextHeartbeat .. ^1].contains("50%"), run.output
     doAssert run.output.contains("elapsedSeconds"), run.output
     doAssert run.output.contains("elapsedMilliseconds"), run.output
 

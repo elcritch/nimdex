@@ -114,6 +114,12 @@ type
     compilerJob: AgentProxy[CompilerRefreshJob]
     compilerCancellation: CompilerCancellation
     compilerLoading: bool
+    supportsWorkDoneProgress: bool
+    progressSerial: int
+    progressToken: string
+    progressStarted: bool
+    progressHeadPercent: int
+    progressModuleMessage: string
     compilerRefreshPending: bool
     publishedDiagnosticUris: Table[string, bool]
     activeSnapshot: SemanticSnapshot
@@ -167,6 +173,8 @@ proc compilerRefreshRequested(source: CompilerRefreshTrigger) {.signal.}
 proc compilerRefreshCompleted(
   source: CompilerRefreshJob, completion: sink CompilerRefreshCompletion
 ) {.signal.}
+
+proc compilerActivity(source: CompilerRefreshJob, activity: CompilerActivity) {.signal.}
 
 proc compilerHeadCompleted(
   source: CompilerRefreshJob, progress: CompilerHeadProgress
@@ -235,6 +243,9 @@ proc runCompilerRefresh(job: CompilerRefreshJob) {.slot.} =
       job.request,
       proc(progress: CompilerHeadProgress) =
         emit job.compilerHeadCompleted(progress)
+      ,
+      proc(activity: CompilerActivity) =
+        emit job.compilerActivity(activity)
       ,
     )
   except CatchableError as error:
@@ -784,10 +795,9 @@ proc debugLsp(server: LspServer, params: JsonNode): JsonNode =
     let node = newJObject()
     node["sourcePath"] = %path
     addJsonStrings(node, "headFiles", server.activeSnapshot.graph.headsFor(path))
-    node["preferredHead"] =
-      %server.preferredHeads.getOrDefault(
-        path, server.activeSnapshot.graph.preferredHead(path)
-      )
+    node["preferredHead"] = %server.preferredHeads.getOrDefault(
+      path, server.activeSnapshot.graph.preferredHead(path)
+    )
     let dependencies = server.activeSnapshot.graph.modules.getOrDefault(path)
     addJsonStrings(node, "imports", dependencies.imports)
     addJsonStrings(node, "includes", dependencies.includes)
@@ -1037,6 +1047,8 @@ proc prepareCompilerRefresh(server: LspServer) =
   server.semanticFailed = false
   server.progressHeads.setLen(0)
   server.completedHeads.setLen(0)
+  server.progressHeadPercent = 0
+  server.progressModuleMessage = ""
   server.failedHeads.setLen(0)
   server.headDiagnostics.clear()
 
@@ -1051,12 +1063,73 @@ proc reusableHeads(server: LspServer): seq[HeadAnalysis] =
     if not retained:
       result.add(saved)
 
+proc compilerProgressPercentage(server: LspServer): int =
+  if server.refreshEntryPoints.len > 0:
+    min(
+      100,
+      (server.completedHeads.len * 100 + server.progressHeadPercent) div
+        server.refreshEntryPoints.len,
+    )
+  else:
+    0
+
+proc sendCompilerProgress(server: LspServer, kind: string) =
+  if server.dispatcher.isNil or not server.progressStarted:
+    return
+  var value = %*{"kind": kind}
+  if kind != "end":
+    value["percentage"] = %server.compilerProgressPercentage()
+    if server.progressModuleMessage.len > 0:
+      value["message"] = %server.progressModuleMessage
+    if kind == "begin":
+      value["title"] = %"Nimdex indexing"
+  server.dispatcher.sendJsonRpcNotification(
+    "$/progress", %*{"token": server.progressToken, "value": value}
+  )
+
+proc beginCompilerProgress(server: LspServer) =
+  if not server.supportsWorkDoneProgress or server.dispatcher.isNil:
+    return
+  inc server.progressSerial
+  server.progressToken = "nimdex-index-" & $server.progressSerial
+  server.progressStarted = false
+  server.dispatcher.sendJsonRpcMessage(
+    $(
+      %*{
+        "jsonrpc": "2.0",
+        "id": server.progressToken,
+        "method": "window/workDoneProgress/create",
+        "params": {"token": server.progressToken},
+      }
+    )
+  )
+
+proc endCompilerProgress(server: LspServer) =
+  server.sendCompilerProgress("end")
+  server.progressStarted = false
+  server.progressToken = ""
+
+proc compilerStampMatches(server: LspServer, stamp: AnalysisStamp): bool
+
+proc receiveCompilerActivity(server: LspServer, activity: CompilerActivity) {.slot.} =
+  if server.isNil or server.state != lssRunning or
+      not server.compilerStampMatches(activity.stamp) or
+      activity.headPath in server.completedHeads or
+      server.compilerCancellation.isCompilerCancelled():
+    return
+  let estimate =
+    estimatedCompilerHeadPercentage(activity.modulesProcessed, activity.expectedModules)
+  server.progressHeadPercent = max(server.progressHeadPercent, estimate)
+  server.progressModuleMessage = $activity.modulesProcessed & " modules processed"
+  server.sendCompilerProgress("report")
+
 proc startCompilerRefresh(server: LspServer) =
   if not server.compilerEnabled or server.compilerLoading:
     return
   server.compilerLoading = true
   server.semanticLoading = true
   server.prepareCompilerRefresh()
+  server.beginCompilerProgress()
   info "Starting compiler refresh",
     workingDir = server.workspace.rootPath,
     compilerPath = server.compiler.compilerPath,
@@ -1095,6 +1168,7 @@ proc startCompilerRefresh(server: LspServer) =
   connectThreaded(
     proxy, compilerHeadCompleted, server, receiveCompilerHeadProgress(LspServer)
   )
+  connectThreaded(proxy, compilerActivity, server, receiveCompilerActivity(LspServer))
   thread.start()
   emit trigger.compilerRefreshRequested()
 
@@ -1183,6 +1257,8 @@ proc runCompilerRefreshSynchronously(server: LspServer) =
       ),
       proc(progress: CompilerHeadProgress) =
         server.receiveCompilerHeadProgress(progress),
+      proc(activity: CompilerActivity) =
+        server.receiveCompilerActivity(activity),
     )
   )
   server.forceCompilerRefresh = false
@@ -1550,6 +1626,14 @@ proc dispatchIncomingJsonRpc(server: LspServer, data: string) =
       server.dispatcher.sendJsonRpcMessage(response.get())
     return
 
+  if root.kind == JObject and not root.hasKey("method") and root.hasKey("id") and
+      root["id"].kind == JString and root["id"].getStr().startsWith("nimdex-index-"):
+    if root["id"].getStr() == server.progressToken and server.compilerLoading and
+        root.hasKey("result") and not root.hasKey("error"):
+      server.progressStarted = true
+      server.sendCompilerProgress("begin")
+    return
+
   if root.kind != JObject or not root.hasKey("method") or root["method"].kind != JString or
       (root.hasKey("id") and not root["id"].validJsonRpcId()):
     let response = server.adapter.handleJsonRpc(data)
@@ -1688,6 +1772,9 @@ proc receiveCompilerHeadProgress(
       server.compilerCancellation.isCompilerCancelled():
     return
   server.completedHeads.add(progress.headPath)
+  server.progressHeadPercent = 0
+  server.progressModuleMessage = ""
+  server.sendCompilerProgress("report")
   server.headDiagnostics[progress.headPath] = progress.diagnostics
   if progress.ok:
     server.progressHeads.add(progress.analysis)
@@ -1734,6 +1821,7 @@ proc receiveCompilerRefreshCompletion(
   if server.isNil:
     return
 
+  server.endCompilerProgress()
   let refresh = completion.result
   let current = server.compilerStampMatches(refresh.stamp)
   let restart = server.compilerRefreshPending and not server.exitRequested
@@ -1833,6 +1921,14 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
     raiseLspError(RpcInvalidRequest, "server has already been initialized")
   let initializeParams = requireObject(params, "initialize params")
   server.positionEncoding = negotiatePositionEncoding(params)
+  if initializeParams.hasKey("capabilities") and
+      initializeParams["capabilities"].kind == JObject:
+    let caps = initializeParams["capabilities"]
+    if caps.hasKey("window") and caps["window"].kind == JObject:
+      let window = caps["window"]
+      server.supportsWorkDoneProgress =
+        window.hasKey("workDoneProgress") and window["workDoneProgress"].kind == JBool and
+        window["workDoneProgress"].getBool()
   let rootUri = rootUriFromInitialize(initializeParams)
   let compilerOptions = compilerOptionsFromInitialize(
     initializeParams, server.configuredCompilerPath, server.configuredCompilerFrontend,
@@ -1937,7 +2033,7 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
 
   let serverInfo = newJObject()
   serverInfo["name"] = %"nimdex"
-  serverInfo["version"] = %"0.1.3"
+  serverInfo["version"] = %"0.1.4"
   result["serverInfo"] = serverInfo
 
 proc initializedLsp(server: LspServer, params: JsonNode): JsonNode =

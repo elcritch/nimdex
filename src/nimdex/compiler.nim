@@ -67,6 +67,14 @@ type
 
   CompilerProgressCallback* = proc(progress: CompilerHeadProgress) {.closure.}
 
+  CompilerActivity* = object ## Approximate progress while one compiler head runs.
+    stamp*: AnalysisStamp
+    headPath*: string
+    modulesProcessed*: int
+    expectedModules*: int
+
+  CompilerActivityCallback* = proc(activity: CompilerActivity) {.closure.}
+
   CompilerRefreshResult* = object ## Owned output of a compiler refresh.
     ok*: bool
     cancelled*: bool
@@ -176,12 +184,43 @@ proc terminateCompilerProcess(process: Process) =
   else:
     process.kill()
 
+func estimatedCompilerHeadPercentage*(modulesProcessed, expectedModules: int): int =
+  ## Estimate the compiler portion of one head, leaving room for indexing.
+  if modulesProcessed <= 0:
+    return 0
+  let estimate =
+    if expectedModules > 0:
+      min(90, modulesProcessed * 90 div expectedModules)
+    else:
+      modulesProcessed * 90 div (modulesProcessed + 50)
+  max(1, estimate)
+
+proc semanticArtifactTimes(cachePath: string): Table[string, times.Time] =
+  ## Observe completed semantic module files without reading the compiler's output.
+  if not dirExists(cachePath):
+    return
+  try:
+    for path in walkDirRec(cachePath):
+      if path.endsWith(".s.bif"):
+        try:
+          result[path] = getLastModificationTime(path)
+        except OSError:
+          discard # The compiler can replace files during a scan.
+  except OSError:
+    discard
+
 proc runExternalCommand(
     executable: string,
     arguments: openArray[string],
     workingDir, captureDir: string,
     cancellation: CompilerCancellation = nil,
     progressHead = "",
+    progressCache = "",
+    expectedModules = 0,
+    completedHeads = 0,
+    totalHeads = 1,
+    progressStamp = AnalysisStamp(),
+    onActivity: CompilerActivityCallback = nil,
 ): CompilerProcessOutput =
   ## Use a shell only as a redirection wrapper. Every executable, argument, and
   ## capture path is quoted independently, so user configuration is not parsed
@@ -218,6 +257,11 @@ proc runExternalCommand(
         quoteShell(stderrPath),
     ]
 
+  let beforeArtifacts =
+    if progressCache.len == 0:
+      initTable[string, times.Time]()
+    else:
+      semanticArtifactTimes(progressCache)
   var process = startProcess(
     shell,
     workingDir = workingDir,
@@ -232,13 +276,43 @@ proc runExternalCommand(
     process.close()
   let started = getMonoTime()
   var nextProgressSecond = 5'i64
+  var nextArtifactSample = getMonoTime() + initDuration(milliseconds = 500)
+  var reportedModules = 0
   var stopped = false
   while process.peekExitCode() == -1:
-    let elapsedSeconds = (getMonoTime() - started).inSeconds
+    let now = getMonoTime()
+    let elapsedSeconds = (now - started).inSeconds
+    if progressCache.len > 0 and now >= nextArtifactSample:
+      let current = semanticArtifactTimes(progressCache)
+      var changed = 0
+      for path, modified in current:
+        if path notin beforeArtifacts or beforeArtifacts[path] != modified:
+          inc changed
+      if changed > reportedModules:
+        reportedModules = changed
+        if not onActivity.isNil:
+          onActivity(
+            CompilerActivity(
+              stamp: progressStamp,
+              headPath: progressHead,
+              modulesProcessed: changed,
+              expectedModules: expectedModules,
+            )
+          )
+      nextArtifactSample = getMonoTime() + initDuration(milliseconds = 500)
     if progressHead.len > 0 and elapsedSeconds >= nextProgressSecond:
       info "Nim compiler still running",
         entryPoint = progressHead,
         elapsedSeconds = elapsedSeconds,
+        percentage =
+          $(
+            (
+              completedHeads * 100 +
+              estimatedCompilerHeadPercentage(reportedModules, expectedModules)
+            ) div max(totalHeads, 1)
+          ) & "%",
+        modulesProcessed = reportedModules,
+        expectedModules = expectedModules,
         stdoutBytes = (if fileExists(stdoutPath): getFileSize(stdoutPath)
         else: 0'i64),
         stderrBytes = (if fileExists(stderrPath): getFileSize(stderrPath)
@@ -621,6 +695,9 @@ proc buildHead(
     entryPoint, cachePath: string,
     reuseKey: uint64,
     artifactCache: var BifReuseCache,
+    expectedModules, completedHeads, totalHeads: int,
+    stamp: AnalysisStamp,
+    onActivity: CompilerActivityCallback,
 ): HeadBuild =
   result.analysis =
     HeadAnalysis(headPath: entryPoint, cachePath: cachePath, reuseKey: reuseKey)
@@ -667,13 +744,16 @@ proc buildHead(
   info "Nim compiler starting",
     workingDir = request.workspace.rootPath,
     entryPoint = entryPoint,
+    nimCachePath = compilerCache,
     cacheRunId = cachePath.extractFilename()
   let process = runExternalCommand(
     request.capabilities.compilerPath, arguments, request.workspace.rootPath, cachePath,
-    request.cancellation, entryPoint,
+    request.cancellation, entryPoint, compilerCache, expectedModules, completedHeads,
+    totalHeads, stamp, onActivity,
   )
   info "Nim compiler done",
     entryPoint = entryPoint,
+    nimCachePath = compilerCache,
     cacheRunId = cachePath.extractFilename(),
     exitCode = process.exitCode,
     elapsedMilliseconds = (getMonoTime() - compilerStarted).inMilliseconds,
@@ -821,7 +901,9 @@ proc combinedHeadSnapshot*(
   result.graph.heads = actualHeads
 
 proc runCompilerRefresh*(
-    request: CompilerRefreshRequest, onHead: CompilerProgressCallback = nil
+    request: CompilerRefreshRequest,
+    onHead: CompilerProgressCallback = nil,
+    onActivity: CompilerActivityCallback = nil,
 ): CompilerRefreshResult =
   ## Report validated heads progressively and isolate failures to their contexts.
   result.compiler = request.capabilities
@@ -963,8 +1045,23 @@ proc runCompilerRefresh*(
         progress.diagnostics = progress.analysis.diagnostics
       else:
         inc result.compiledHeads
-        let built =
-          buildHead(effectiveRequest, entryPoint, cachePath, reuseKey, artifactCache)
+        var expectedModules = 0
+        for previous in request.previousHeads:
+          if previous.headPath == entryPoint:
+            expectedModules = previous.artifactPaths.len
+            break
+        let built = buildHead(
+          effectiveRequest,
+          entryPoint,
+          cachePath,
+          reuseKey,
+          artifactCache,
+          expectedModules,
+          entryPoints.len - pending.len - 1,
+          entryPoints.len,
+          result.stamp,
+          onActivity,
+        )
         if built.command.len > 0:
           result.commandLines.add(built.command)
         result.stdout.add(built.stdout)
