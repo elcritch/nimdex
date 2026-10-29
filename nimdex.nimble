@@ -1,4 +1,4 @@
-version       = "0.1.4"
+version       = "0.1.5"
 author        = "elcritch"
 description   = "Compiler-backed Nim LSP server and command-line client."
 license       = "MIT"
