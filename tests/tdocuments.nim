@@ -131,6 +131,21 @@ suite "Nimdex document and workspace values":
     doAssert not store.containsDocument(uri)
     doAssert store.updateDocument(uri, "missing", 3) == dusMissing
 
+  test "a missing final newline does not make an open document dirty":
+    let path =
+      getTempDir() / ("nimdex-final-newline-" & $getCurrentProcessId() & ".nim")
+    defer:
+      removeFile(path)
+    writeFile(path, "discard value\n")
+    let uri = documentUriFromPath(path)
+    var store = initDocumentStore()
+    check store.openDocument(uri, "discard value", 1) == dusApplied
+    check store.dirtyDocuments().len == 0
+    check store.updateDocument(uri, "discard other", 2) == dusApplied
+    check store.dirtyDocuments().len == 1
+    check sameSourceText("one\r\n", "one")
+    check not sameSourceText("one\n\n", "one")
+
   test "identifies workspace paths and configuration":
     let rootPath = normalizeDocumentPath(getTempDir() / "nimdex-workspace")
     let workspace = initWorkspace(

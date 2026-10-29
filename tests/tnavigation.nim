@@ -31,7 +31,7 @@ suite "compiler navigation, effects and overlays":
     runtime.installIndex(refresh.snapshot)
     let uri = documentUriFromPath(piece)
     discard runtime.request(
-      LanguageRequest(kind: lrkOpen, uri: uri, text: pieceText, version: 1)
+      LanguageRequest(kind: lrkOpen, uri: uri, text: pieceText[0 .. ^2], version: 1)
     )
     let definition = runtime.request(
       LanguageRequest(
@@ -41,6 +41,20 @@ suite "compiler navigation, effects and overlays":
     require definition.ok and definition.found
     check definition.symbols[0].symbol.location.path == support
     check definition.symbols[0].start == TextPosition(line: 0, character: 5)
+    discard runtime.request(
+      LanguageRequest(
+        kind: lrkChange,
+        uri: uri,
+        text: pieceText.replace("target", "other"),
+        version: 2,
+      )
+    )
+    let stale = runtime.request(
+      LanguageRequest(
+        kind: lrkDefinition, uri: uri, line: 1, character: 10, positionEncoding: peUtf16
+      )
+    )
+    check stale.ok and not stale.found
 
   test "resolves qualified uses and static effects against current buffer text":
     let root = normalizeDocumentPath(createTempDir("nimdex-navigation-", ""))

@@ -142,7 +142,15 @@ proc sourceDocumentFor(
   var overlay: DocumentSnapshot
   if self.documents.tryFindDocument(location.uri, overlay):
     if overlay.textHash != location.sourceTextHash:
-      return false
+      try:
+        if location.path.len == 0 or not fileExists(location.path):
+          return false
+        let saved = readFile(location.path)
+        if stableTextHash(saved) != location.sourceTextHash or
+            not sameSourceText(saved, overlay.content):
+          return false
+      except CatchableError:
+        return false
     document = initDocumentSnapshot(
       location.uri, overlay.content, overlay.version, positionEncoding
     )

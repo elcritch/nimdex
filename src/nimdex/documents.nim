@@ -43,6 +43,17 @@ proc stableTextHash*(text: string): uint64 =
   for value in text:
     result = (result xor uint64(ord(value))) * prime
 
+proc sameSourceText*(a, b: string): bool =
+  ## A final line terminator does not change any compiler token positions.
+  if a == b:
+    return true
+  let shorter = if a.len < b.len: a else: b
+  let longer = if a.len < b.len: b else: a
+  if longer.len == shorter.len + 1 and longer[^1] == '\n':
+    return longer.startsWith(shorter)
+  if longer.len == shorter.len + 2 and longer.endsWith("\r\n"):
+    return longer.startsWith(shorter)
+
 proc normalizeDocumentPath*(path: string): string =
   ## Canonicalize existing ancestors too: compiler BIFs resolve symlinks, and
   ## new/missing documents must retain the same identity before and after save.
@@ -453,7 +464,7 @@ proc dirtyDocuments*(store: DocumentStore): seq[DocumentSnapshot] =
   for document in store.documents.values:
     try:
       if fileExists(document.path) and
-          stableTextHash(readFile(document.path)) == document.textHash:
+          sameSourceText(readFile(document.path), document.content):
         continue
     except CatchableError:
       discard
