@@ -93,6 +93,31 @@ suite "Nimdex document and workspace values":
     check document.tryTokenSpanAt(4, 5, "target", startOffset, finishOffset)
     check not document.tryTokenSpanAt(3, 9, "x", startOffset, finishOffset)
 
+  test "compiler lexer distinguishes source tokens from literals and comments":
+    let document = initDocumentSnapshot(
+      "file:///tmp/lexer.nim",
+      "let raw = r\"ends with slash\\\"\n" &
+        "let text = \"\"\"target\\\nmore target\"\"\"\n" &
+        "#[ outer #[ target ]# still target ]#\n" & "## target\n" &
+        "proc `target`() = discard\n" & "discard target()\n",
+      1,
+    )
+    var startOffset, finishOffset: int
+    check not document.tryTokenSpanAt(2, 14, "target", startOffset, finishOffset)
+    check not document.tryTokenSpanAt(3, 5, "target", startOffset, finishOffset)
+    check not document.tryTokenSpanAt(4, 12, "target", startOffset, finishOffset)
+    check not document.tryTokenSpanAt(5, 3, "target", startOffset, finishOffset)
+    check document.tryTokenSpanAt(6, 6, "target", startOffset, finishOffset)
+    check document.tryTokenSpanAt(7, 8, "target", startOffset, finishOffset)
+
+  test "lexer accepts code before an unfinished literal":
+    let document = initDocumentSnapshot(
+      "file:///tmp/incomplete.nim", "discard target()\nlet text = \"unfinished", 1
+    )
+    var startOffset, finishOffset: int
+    check document.tryTokenSpanAt(1, 8, "target", startOffset, finishOffset)
+    check not document.tryTokenSpanAt(2, 12, "unfinished", startOffset, finishOffset)
+
   test "orders document overlay versions":
     var store = initDocumentStore()
     let uri = "file:///tmp/phase1-overlay.nim"

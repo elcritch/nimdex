@@ -7,6 +7,11 @@ small command-line client and an LSP server.
 
 Nimdex requires Nim 2.4.0 or newer. It defaults to `nim ic` and needs the
 matching `nifler` and `nifmake` companions beside Nim or on `PATH`.
+Building Nimdex also requires the compiler sources for the Nim installation
+used to build it; its configuration adds `$nim` to the import path, as Atlas
+does. Nimdex uses that compiler's lexer to validate source positions. If a
+different compiler is selected at runtime, its lexical rules may differ from
+the lexer built into Nimdex.
 
 Install the `nimdex` command with Nimble:
 

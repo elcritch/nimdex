@@ -1,5 +1,6 @@
 import std/[os, strutils]
 
+--path:"$nim"
 --mm:atomicArc
 --threads:on
 switch("define", "chronicles_sinks=textblocks[stderr]")

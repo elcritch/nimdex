@@ -2,6 +2,8 @@
 
 import std/[os, strutils, tables, unicode, uri]
 
+import compiler/[idents, lexer, lineinfos, llstream, options, pathutils]
+
 type
   PositionEncoding* = enum
     peUtf16
@@ -287,84 +289,34 @@ proc positionAt*(document: DocumentSnapshot, offset: int): TextPosition =
 proc isIdentifierByte(value: char): bool =
   value == '_' or value.isAlphaNumeric or (ord(value) and 0x80) != 0
 
-type SourceLexMode = enum
-  slCode
-  slLineComment
-  slBlockComment
-  slString
-  slChar
-  slBacktick
+proc ignoreLexerError(conf: ConfigRef, info: TLineInfo, msg: TMsgKind, arg: string) =
+  ## Editor buffers may be incomplete; lexical errors must not terminate Nimdex.
+  discard
 
-proc tokenIsInSourceCode(document: DocumentSnapshot, offset: int): bool =
-  ## Reject positions that are lexically inside comments, strings, or chars.
-  ## This is deliberately conservative; the compiler position remains the
-  ## authority for syntax, while this prevents accidental substring matches.
-  var mode = slCode
-  var blockDepth = 0
-  var escaped = false
-  var tripleString = false
-  var cursor = 0
-  while cursor < offset:
-    let value = document.content[cursor]
-    case mode
-    of slCode:
-      if value == '#' and cursor + 1 < offset and document.content[cursor + 1] == '[':
-        mode = slBlockComment
-        blockDepth = 1
-        cursor += 2
-        continue
-      if value == '#':
-        mode = slLineComment
-      elif value == '"':
-        mode = slString
-        tripleString =
-          cursor + 2 < offset and document.content[cursor + 1] == '"' and
-          document.content[cursor + 2] == '"'
-        if tripleString:
-          cursor += 3
-        else:
-          inc cursor
-        continue
-      # Apostrophes following a numeric literal introduce a type suffix, as
-      # in 0.5'f32 or 0xFF'u8; they do not start character literals.
-      elif value == '\'' and
-          (cursor == 0 or not document.content[cursor - 1].isIdentifierByte):
-        mode = slChar
-      elif value == '`':
-        mode = slBacktick
-    of slLineComment:
-      if value in {'\r', '\n'}:
-        mode = slCode
-    of slBlockComment:
-      if value == '#' and cursor + 1 < offset and document.content[cursor + 1] == '[':
-        inc blockDepth
-        cursor += 2
-        continue
-      if value == ']' and cursor + 1 < offset and document.content[cursor + 1] == '#':
-        dec blockDepth
-        cursor += 2
-        if blockDepth == 0:
-          mode = slCode
-        continue
-    of slString, slChar:
-      if escaped:
-        escaped = false
-      elif value == '\\':
-        escaped = true
-      elif tripleString:
-        if value == '"' and cursor + 2 < offset and document.content[cursor + 1] == '"' and
-            document.content[cursor + 2] == '"':
-          mode = slCode
-          tripleString = false
-          cursor += 3
-          continue
-      elif (mode == slString and value == '"') or (mode == slChar and value == '\''):
-        mode = slCode
-    of slBacktick:
-      if value == '`':
-        mode = slCode
-    inc cursor
-  mode == slCode
+proc tokenIsInSourceCode(document: DocumentSnapshot, line, column: int): bool =
+  ## A compiler token must begin at this exact position. This rejects matching
+  ## text inside strings and comments without duplicating Nim's lexical rules.
+  var lex: Lexer
+  let config = newConfigRef()
+  let filename =
+    if document.path.len > 0:
+      document.path
+    else:
+      getCurrentDir() / "buffer.nim"
+  openLexer(
+    lex, AbsoluteFile(filename), llStreamOpen(document.content), newIdentCache(), config
+  )
+  lex.errorHandler = ignoreLexerError
+  defer:
+    closeLexer(lex)
+  var token: Token
+  while true:
+    rawGetTok(lex, token)
+    if token.tokType == tkEof or token.line > line or
+        (token.line == line and token.col > column):
+      break
+    if token.line == line and token.col == column:
+      return token.tokType notin {tkInvalid, tkComment, tkIntLit .. tkCustomLit}
 
 proc tryTokenSpanAt*(
     document: DocumentSnapshot,
@@ -417,7 +369,7 @@ proc tryTokenSpanAt*(
     return false
   startOffset = document.lineStartOffset(line) + column
   finishOffset = document.lineStartOffset(line) + finish
-  if not document.tokenIsInSourceCode(startOffset):
+  if not document.tokenIsInSourceCode(int(compilerLine), column):
     return false
   var position: TextPosition
   document.tryPositionAt(startOffset, position) and
