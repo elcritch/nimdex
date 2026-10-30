@@ -58,8 +58,19 @@ suite "owned semantic cache":
     analysis.snapshot[].addModule(module)
     analysis.snapshot[].recordHead(source)
     var writer = initHeadCache(root / "cache")
+    check completedHeadModuleCount(analysis.cachePath, source) == 0
     writer.storeHead(analysis)
+    check completedHeadModuleCount(analysis.cachePath, source) == 1
+    check completedHeadModuleCount(analysis.cachePath, root / "other.nim") == 0
     let manifestPath = headManifestPath(analysis.cachePath)
+    let completedManifest = readFile(manifestPath)
+    var emptyManifest = parseJson(completedManifest)
+    emptyManifest["modules"] = newJArray()
+    writeFile(manifestPath, $emptyManifest)
+    check completedHeadModuleCount(analysis.cachePath, source) == 0
+    writeFile(manifestPath, "{")
+    check completedHeadModuleCount(analysis.cachePath, source) == 0
+    writeFile(manifestPath, completedManifest)
     # Simulate a field record written before compiler field suffixes were removed.
     var oldManifest = parseJson(readFile(manifestPath))
     let cacheDirectory = root / "cache" / ("semantic-v" & $HeadCacheVersion)

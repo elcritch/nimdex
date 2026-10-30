@@ -164,7 +164,7 @@ block cli_help:
   doAssert run.status == 0
   doAssert run.output.contains("Usage: nimdex")
   doAssert run.output.contains("symbols")
-  doAssert run.output.contains("ic (default)")
+  doAssert run.output.contains("track (default)")
 
 block cli_frontend_validation:
   let run = runCli(["check", "--frontend", "unknown"])
@@ -283,7 +283,7 @@ suite "Editor LSP TCP":
         (if session == 0: "unsavedTcpValue" else: "tcpValue")
       socket.sendProtocol("nimdex/debug", %*{}, 4)
       let debug = socket.receiveProtocol(parser, 4, notifications)
-      check debug["result"]["compiler"]["frontend"].getStr() == "ic"
+      check debug["result"]["compiler"]["frontend"].getStr() == "track"
       socket.sendProtocol("shutdown", %*{}, 3)
       check socket.receiveProtocol(parser, 3, notifications)["result"].kind == JNull
       socket.sendProtocol("exit", %*{})
@@ -608,10 +608,10 @@ block cli_debug:
   doAssert run.output.contains("\"frontend\": \"track\"")
 
 block cli_default_frontend_debug:
-  let cacheRoot = getTempDir() / ("nimdex-cli-ic-cache-" & $getCurrentProcessId())
+  let cacheRoot = getTempDir() / ("nimdex-cli-track-cache-" & $getCurrentProcessId())
   let run = runExternalCli(["debug", FixtureRoot, "--cache-root", cacheRoot])
   doAssert run.status == 0, run.output
-  doAssert run.output.contains("\"frontend\": \"ic\"")
+  doAssert run.output.contains("\"frontend\": \"track\"")
   doAssert run.output.contains("\"artifactPaths\"")
 
 block cli_compile_debug:

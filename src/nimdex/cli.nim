@@ -33,7 +33,7 @@ import ./lsp
 import ./projectlayout
 import ./workspace
 
-const NimdexVersion = "0.1.6"
+const NimdexVersion = "0.1.7"
 
 var cliServiceStopRequested: Atomic[bool]
 
@@ -108,6 +108,8 @@ type
     progressKind: CompilerLogKind
     progressHead: string
     progressWorkingDir: string
+    progressFrontend: string
+    progressConfiguredFrontend: string
     progressCacheRunId: string
     progressNimCachePath: string
     progressPercentage: string
@@ -153,7 +155,7 @@ proc writeUsage(output: File) =
   output.writeLine("Options:")
   output.writeLine("  --project PATH       Project directory")
   output.writeLine("  --compiler PATH      Nim compiler or executable name")
-  output.writeLine("  --frontend MODE      ic (default), compile, or track")
+  output.writeLine("  --frontend MODE      track (default), compile, or ic")
   output.writeLine("  --cache-root PATH    Nimdex compiler cache directory")
   output.writeLine("  --log-file PATH      Append daemon stderr to PATH (daemon only)")
   output.writeLine("  --entry-point PATH   Nim entry point; may be repeated")
@@ -591,6 +593,8 @@ proc relayCompilerProgress(raw: string, context: pointer) {.nimcall, gcsafe.} =
       info "Nim compiler starting",
         workingDir = state.progressWorkingDir,
         entryPoint = state.progressHead,
+        frontend = state.progressFrontend,
+        configuredFrontend = state.progressConfiguredFrontend,
         nimCachePath = state.progressNimCachePath,
         cacheRunId = state.progressCacheRunId,
         expectedModules = state.progressExpectedModules
@@ -647,6 +651,8 @@ proc relayCompilerProgress(raw: string, context: pointer) {.nimcall, gcsafe.} =
       state.progressKind = clkNone
     state.progressHead = ""
     state.progressWorkingDir = ""
+    state.progressFrontend = ""
+    state.progressConfiguredFrontend = ""
     state.progressCacheRunId = ""
     state.progressNimCachePath = ""
     state.progressPercentage = ""
@@ -678,6 +684,10 @@ proc relayCompilerProgress(raw: string, context: pointer) {.nimcall, gcsafe.} =
     state.progressWorkingDir = value
   of "entryPoint":
     state.progressHead = value
+  of "frontend":
+    state.progressFrontend = value
+  of "configuredFrontend":
+    state.progressConfiguredFrontend = value
   of "cacheRunId":
     state.progressCacheRunId = value
   of "nimCachePath":

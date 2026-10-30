@@ -12,7 +12,7 @@ type CompilerFrontend* = enum
   cfTrack = "track"
   cfIc = "ic"
 
-const DefaultCompilerFrontend* = cfIc
+const DefaultCompilerFrontend* = cfTrack
   ## Default compiler frontend for saved-source analysis.
 
 type Workspace* = object

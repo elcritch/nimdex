@@ -5,7 +5,7 @@ small command-line client and an LSP server.
 
 ## Requirements
 
-Nimdex requires Nim 2.4.0 or newer. It defaults to `nim ic` and needs the
+Nimdex requires Nim 2.4.0 or newer. It defaults to `nim track` and needs the
 matching `nifler` and `nifmake` companions beside Nim or on `PATH`.
 Building Nimdex also requires the compiler sources for the Nim installation
 used to build it; its configuration adds `$nim` to the import path, as Atlas
@@ -145,7 +145,7 @@ Useful options are:
 
 ```text
 --compiler PATH       Select the Nim compiler
---frontend MODE       ic (default), compile, or track
+--frontend MODE       track (default), compile, or ic
 --cache-root PATH     Override the default nimcache/nimdex location
 --log-file PATH       Append daemon stderr to PATH (daemon only)
 --entry-point PATH    Add a Nim entry point (repeatable)
@@ -162,7 +162,7 @@ Useful options are:
 
 ## Editor integration
 
-Editors that support LSP work-done progress receive indexing updates during compiler cache refreshes. The detailed percentage in the progress message describes the current entry point; the standard LSP percentage tracks the overall refresh. While the compiler runs, Nimdex estimates progress from processing messages and semantic modules, using a fixed per-entry-point estimate derived from `nim dump` search paths and the previous module graph. The estimate is approximate, especially for a first build or an incremental rebuild that reuses most modules.
+Editors that support LSP work-done progress receive indexing updates during compiler cache refreshes. The detailed percentage in the progress message describes the current entry point; the standard LSP percentage tracks the overall refresh. Nimdex starts with the smaller available estimate from `nim dump` search paths and the previous successfully completed, nonempty module graph. Without a completed graph, it uses the file estimate. If processing exceeds the previous graph count, it switches to the larger file estimate, so the per-entry-point percentage can fall. The overall LSP percentage stays nondecreasing. Estimates are approximate, especially for a first build or an incremental rebuild that reuses most modules.
 
 Start the daemon directly when an editor launches an LSP server:
 
@@ -267,37 +267,37 @@ spelling rules. Unverifiable generated locations return no target.
 ## How it works
 
 Nimdex probes the configured compiler and requires `--genBif:on`. By default,
-the CLI and editor server run `nim ic --compileOnly:on --genBif:on` into a
+the CLI and editor server run `nim track --genBif:on` into a
 cache scoped to each compiler and workspace configuration. Test entry points in
 the same directory with matching configuration share an incremental frontend
-cache; other entry points retain separate caches. This generates C and semantic BIFs but skips native compilation and linking. The current
+cache; other entry points retain separate caches. This generates semantic BIFs without C or native compilation. The current
 compiler's `nim check --genBif:on` omits declarations and include metadata, so it
 cannot yet replace this command.
 
-The optional incremental frontend uses `nim track` to check modules and emit
-semantic BIFs without generating C or running the native toolchain:
+The optional `ic` frontend also generates C without running the native toolchain:
 
 ```sh
-nimdex check /path/to/project --frontend track
-nimdex daemon --frontend track
+nimdex check /path/to/project --frontend ic
+nimdex daemon --frontend ic
 ```
 
 `ic` and `track` use the same per-head incremental graph loader.
 Both modes retain compiler state between edits and use separate cache contexts.
 
 Use `--frontend compile` to select `nim c --compileOnly:on --genBif:on`, or
-`--frontend track` to select `nim track`. Editors can set
+`--frontend ic` to select `nim ic --compileOnly:on`. Editors can set
 `"compilerFrontend": "compile"`, `"track"`, or `"ic"` in
-`initializationOptions`; omitting the option selects `ic`. `ic` and `track`
+`initializationOptions`; omitting the option selects `track`. `ic` and `track`
 require the matching `nifler` and `nifmake` companions supplied with Nim. Each actual head retains its own compiler cache: unchanged
 modules are skipped, and dependency metadata decides
 which importers need rechecking. Only the current resolved module closure is
 indexed, so removed imports leave no stale symbols even though their old files
 remain in the compiler cache. Compiler state is separate from Nimdex's
 persistent semantic records. `compile`, `track`, and `ic` use distinct cache
-contexts. Dirty-buffer analysis currently uses `c --compileOnly:on` in a
-separate cache, even when saved-file analysis uses `track` or `ic`. Dirty
-semantic records are never persisted as saved analyses. The compiler's
+contexts. Dirty-buffer analysis uses a separate frontend cache. Because Nim's
+incremental driver does not detect changes to dirty mappings, Nimdex resets
+that cache whenever unsaved buffer contents or mappings change. Dirty semantic
+records are never persisted as saved analyses. The compiler's
 dirty-file option cannot represent
 paths containing commas; these produce an analysis error.
 

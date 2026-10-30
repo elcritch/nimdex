@@ -119,6 +119,7 @@ type
     progressToken: string
     progressStarted: bool
     progressHeadHundredths: int
+    progressOverallHundredths: int
     progressHeadPath: string
     progressModuleMessage: string
     compilerRefreshPending: bool
@@ -1081,7 +1082,10 @@ proc sendCompilerProgress(server: LspServer, kind: string) =
   var value = %*{"kind": kind}
   if kind != "end":
     let hundredths = server.compilerProgressHundredths()
-    value["percentage"] = %(hundredths div 100)
+    # LSP clients may ignore decreasing overall percentages. The per-head
+    # message can still reflect a revised estimate when the graph is exceeded.
+    server.progressOverallHundredths = max(server.progressOverallHundredths, hundredths)
+    value["percentage"] = %(server.progressOverallHundredths div 100)
     value["message"] = %(
       formatProgressPercent(server.progressHeadHundredths) & " " &
       server.progressModuleMessage
@@ -1096,6 +1100,7 @@ proc beginCompilerProgress(server: LspServer) =
   if not server.supportsWorkDoneProgress or server.dispatcher.isNil:
     return
   inc server.progressSerial
+  server.progressOverallHundredths = 0
   server.progressToken = "nimdex-index-" & $server.progressSerial
   server.progressStarted = false
   server.dispatcher.sendJsonRpcMessage(
@@ -1127,7 +1132,7 @@ proc receiveCompilerActivity(server: LspServer, activity: CompilerActivity) {.sl
     server.progressHeadHundredths = 0
   let estimate =
     estimatedCompilerHeadHundredths(activity.modulesProcessed, activity.expectedModules)
-  server.progressHeadHundredths = max(server.progressHeadHundredths, estimate)
+  server.progressHeadHundredths = estimate
   server.progressModuleMessage =
     activity.headPath.extractFilename() & ": " & $activity.modulesProcessed &
     (if activity.projectFiles: " project files encountered" else: " modules processed") &
@@ -1147,6 +1152,7 @@ proc startCompilerRefresh(server: LspServer) =
   info "Starting compiler refresh",
     workingDir = server.workspace.rootPath,
     compilerPath = server.compiler.compilerPath,
+    compilerFrontend = $server.workspace.compilerFrontend,
     heads = samplePaths(server.refreshEntryPoints),
     headCount = server.refreshEntryPoints.len,
     importPaths = samplePaths(server.workspace.importPaths),
@@ -2005,6 +2011,7 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
     workingDir = server.workspace.rootPath,
     compilerRequested = compilerRequested,
     compilerPath = server.workspace.compilerPath,
+    compilerFrontend = $server.workspace.compilerFrontend,
     cacheRoot = server.workspace.cacheRoot,
     heads = samplePaths(server.refreshEntryPoints),
     headCount = server.refreshEntryPoints.len,
@@ -2024,6 +2031,7 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
     server.compilerEnabled = true
     info "Compiler-backed analysis enabled",
       compilerPath = server.compiler.compilerPath,
+      compilerFrontend = $server.workspace.compilerFrontend,
       compilerVersion = logFirstLine(server.compiler.version, 80),
       compilerRevision = server.compiler.revision,
       supportsGenBif = server.compiler.supportsGenBif
@@ -2053,7 +2061,7 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
 
   let serverInfo = newJObject()
   serverInfo["name"] = %"nimdex"
-  serverInfo["version"] = %"0.1.6"
+  serverInfo["version"] = %"0.1.7"
   result["serverInfo"] = serverInfo
 
 proc initializedLsp(server: LspServer, params: JsonNode): JsonNode =

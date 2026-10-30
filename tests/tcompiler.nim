@@ -43,6 +43,17 @@ proc debugState(server: LspServer): JsonNode =
 
 suite "Nimdex compiler refresh":
   test "estimates progress from observed and expected modules":
+    check compilerExpectedModules(100, 2200, 0) == 100
+    check compilerExpectedModules(100, 2200, 100) == 100
+    check compilerExpectedModules(100, 2200, 101) == 2200
+    check compilerExpectedModules(2200, 100, 101) == 100
+    check compilerExpectedModules(0, 2200, 0) == 2200
+    check compilerExpectedModules(100, 0, 101) == 100
+    check compilerExpectedModules(0, 0, 0) == 0
+    check estimatedCompilerHeadHundredths(100, compilerExpectedModules(100, 200, 100)) ==
+      9000
+    check estimatedCompilerHeadHundredths(101, compilerExpectedModules(100, 200, 101)) ==
+      4545
     check estimatedCompilerHeadPercentage(0, 100) == 0
     check estimatedCompilerHeadPercentage(1, 1000) == 1
     check estimatedCompilerHeadPercentage(25, 50) == 45

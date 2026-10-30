@@ -194,6 +194,16 @@ func estimatedCompilerHeadHundredths*(modulesProcessed, expectedModules: int): i
   else:
     modulesProcessed * 9000 div (modulesProcessed + 50)
 
+func compilerExpectedModules*(previousGraph, candidateFiles, processed: int): int =
+  ## Prefer the smaller known estimate until processing outgrows the old graph.
+  if previousGraph <= 0:
+    return max(candidateFiles, 0)
+  if candidateFiles <= 0:
+    return previousGraph
+  if previousGraph < candidateFiles and processed > previousGraph:
+    return candidateFiles
+  min(previousGraph, candidateFiles)
+
 func estimatedCompilerHeadPercentage*(modulesProcessed, expectedModules: int): int =
   ## Return the whole-percent estimate for callers using integer progress.
   let hundredths = estimatedCompilerHeadHundredths(modulesProcessed, expectedModules)
@@ -390,15 +400,13 @@ proc runExternalCommand(
   var nextProgressSecond = 5'i64
   var nextProcessingSample = getMonoTime() + initDuration(milliseconds = 100)
   var nextArtifactSample = nextProcessingSample
-  var nextGraphSample = nextProcessingSample
   var reportedModules = 0
   var reportedPercentage = 0
   var processedFiles = initHashSet[string]()
   var reportedProjectFiles = 0
   var processingOffset = 0'i64
   var processingPending = ""
-  var observedExpected = max(expectedModules, projectFiles.len)
-  let progressExpected = observedExpected
+  var progressExpected = compilerExpectedModules(expectedModules, projectFiles.len, 0)
   var stopped = false
   while process.peekExitCode() == -1:
     let now = getMonoTime()
@@ -409,10 +417,6 @@ proc runExternalCommand(
       )
       let previousModules = reportedModules
       if now >= nextArtifactSample:
-        if now >= nextGraphSample:
-          let graphModules = incrementalExpectedModules(progressCache, progressHead)
-          observedExpected = max(observedExpected, graphModules)
-          nextGraphSample = now + initDuration(seconds = 2)
         let current = semanticArtifactTimes(progressCache)
         var changed = 0
         for path, modified in current:
@@ -422,10 +426,13 @@ proc runExternalCommand(
         nextArtifactSample = getMonoTime() + initDuration(seconds = 1)
       let progressCount =
         if projectFiles.len > 0: processedFiles.len else: reportedModules
+      progressExpected = compilerExpectedModules(
+        expectedModules, projectFiles.len, max(progressCount, reportedModules)
+      )
       let estimate = estimatedCompilerHeadHundredths(progressCount, progressExpected)
       let previousPercentage = reportedPercentage
-      reportedPercentage = max(reportedPercentage, estimate)
-      if reportedModules > previousModules or reportedPercentage > previousPercentage or
+      reportedPercentage = estimate
+      if reportedModules > previousModules or reportedPercentage != previousPercentage or
           processedFiles.len > reportedProjectFiles:
         reportedProjectFiles = processedFiles.len
         if not onActivity.isNil:
@@ -450,7 +457,7 @@ proc runExternalCommand(
         projectFilesTotal = projectFiles.len,
         expectedModules = (if progressExpected > 0: $progressExpected
         else: "unknown"),
-        graphModules = observedExpected,
+        graphModules = expectedModules,
         stdoutBytes = (if fileExists(stdoutPath): getFileSize(stdoutPath)
         else: 0'i64),
         stderrBytes = (if fileExists(stderrPath): getFileSize(stderrPath)
@@ -744,12 +751,11 @@ proc forbiddenCompilerArgument(argument: string): bool =
     normalized.startsWith("--trackdirty:") or normalized.startsWith("--trackdirty=")
 
 proc compilerArguments(
-    request: CompilerRefreshRequest, cachePath, entryPoint: string
+    request: CompilerRefreshRequest, cachePath, overlayPath, entryPoint: string
 ): seq[string] =
   # This compiler's `check --genBif:on` drops semantic statements in SemPass.
   # `track` runs IC's frontend only; `ic` also generates C for its backend.
-  let incremental =
-    request.workspace.compilerFrontend in {cfTrack, cfIc} and request.overlays.len == 0
+  let incremental = request.workspace.compilerFrontend in {cfTrack, cfIc}
   result.add(
     if incremental:
       $request.workspace.compilerFrontend
@@ -770,12 +776,14 @@ proc compilerArguments(
   result.add("--filenames:abs")
   result.add("--nimcache:" & cachePath)
   result.add("--outdir:" & cachePath)
+  if request.overlays.len > 0:
+    ensureDirectory(overlayPath)
   for overlay in request.overlays:
-    if ',' in overlay.path or ',' in cachePath:
+    if ',' in overlay.path or ',' in overlayPath:
       raise newException(
         ValueError, "Nim --trackDirty cannot represent paths containing commas"
       )
-    let dirtyPath = cachePath / ("buffer-" & $stableTextHash(overlay.path) & ".nim")
+    let dirtyPath = overlayPath / ("buffer-" & $stableTextHash(overlay.path) & ".nim")
     writeFile(dirtyPath, overlay.content)
     result.add("--trackDirty:" & dirtyPath & "," & overlay.path & ",1,0")
   result.add(entryPoint)
@@ -887,10 +895,17 @@ type HeadBuild = object
   error, command, stdout, stderr: string
   exitCode: int
 
+proc frontendContextKey(
+    reuseKey, configFingerprint, overlayFingerprint: uint64
+): string =
+  result = $reuseKey & ":" & $configFingerprint
+  if overlayFingerprint != 0:
+    result.add(":" & $overlayFingerprint)
+
 proc buildHead(
     request: CompilerRefreshRequest,
     entryPoint, cachePath: string,
-    reuseKey: uint64,
+    reuseKey, overlayFingerprint: uint64,
     artifactCache: var BifReuseCache,
     expectedModules: int,
     sharedFrontend: string,
@@ -900,9 +915,13 @@ proc buildHead(
   result.analysis =
     HeadAnalysis(headPath: entryPoint, cachePath: cachePath, reuseKey: reuseKey)
   ensureDirectory(cachePath)
+  let knownModules =
+    if expectedModules > 0:
+      expectedModules
+    else:
+      completedHeadModuleCount(cachePath, entryPoint)
   forgetHead(cachePath)
-  let incremental =
-    request.workspace.compilerFrontend in {cfTrack, cfIc} and request.overlays.len == 0
+  let incremental = request.workspace.compilerFrontend in {cfTrack, cfIc}
   # The IC driver owns and may reset this directory. Keep manifests and process
   # captures outside it, and retain its outputs for per-module rebuild decisions.
   let compilerCache =
@@ -912,9 +931,6 @@ proc buildHead(
       cachePath / "frontend"
     else:
       cachePath
-  var knownModules = expectedModules
-  if knownModules == 0 and incremental:
-    knownModules = incrementalExpectedModules(compilerCache, entryPoint)
   var configPaths = configurationInputs(request.workspace, entryPoint)
   if incremental and sharedFrontend.len == 0:
     let contextPath = cachePath / "frontend-context"
@@ -927,7 +943,10 @@ proc buildHead(
       except CatchableError:
         reset = true
     configPaths.sort()
-    let frontendKey = $reuseKey & ":" & $fingerprintInputs(configPaths)
+    # The compiler's incremental rules track the saved source, not the dirty
+    # mapping's contents. A changed overlay must start with a fresh graph.
+    let frontendKey =
+      frontendContextKey(reuseKey, fingerprintInputs(configPaths), overlayFingerprint)
     # Filename inventory/environment changes can alter import resolution or
     # static evaluation without changing the compiler's timestamp inputs. Also
     # invalidate precompiled config when a previously absent config is created.
@@ -940,7 +959,8 @@ proc buildHead(
       removeFile(path)
   let beforePaths = configPaths & @[entryPoint]
   let beforeFingerprint = fingerprintInputs(beforePaths)
-  let arguments = request.compilerArguments(compilerCache, entryPoint)
+  let arguments =
+    request.compilerArguments(compilerCache, cachePath / "buffers", entryPoint)
   result.command = commandLine(request.capabilities.compilerPath, arguments)
   let compileStarted = getTime()
   let compilerPaths = request.effectiveCompilerPaths(entryPoint)
@@ -948,16 +968,19 @@ proc buildHead(
   info "Nim compiler starting",
     workingDir = request.workspace.rootPath,
     entryPoint = entryPoint,
+    frontend = (if incremental: $request.workspace.compilerFrontend
+    else: "compile"),
+    configuredFrontend = $request.workspace.compilerFrontend,
     nimCachePath = compilerCache,
     cacheRunId = cachePath.extractFilename(),
-    expectedModules = max(knownModules, projectFiles.len),
+    expectedModules = compilerExpectedModules(knownModules, projectFiles.len, 0),
     candidateFiles = projectFiles.len
   if not onActivity.isNil:
     onActivity(
       CompilerActivity(
         stamp: stamp,
         headPath: entryPoint,
-        expectedModules: max(knownModules, projectFiles.len),
+        expectedModules: compilerExpectedModules(knownModules, projectFiles.len, 0),
       )
     )
   let process = runExternalCommand(
@@ -1052,7 +1075,7 @@ proc buildHead(
     if sharedFrontend.len == 0:
       writeFile(
         cachePath / "frontend-context",
-        $reuseKey & ":" & $fingerprintInputs(configPaths),
+        frontendContextKey(reuseKey, fingerprintInputs(configPaths), overlayFingerprint),
       )
     # Successful incremental checks can retain byte-identical BIFs with older
     # mtimes than their source (for example after a comment-only edit). Stamp
@@ -1131,6 +1154,7 @@ proc runCompilerRefresh*(
   info "Preparing compiler-backed analysis",
     workingDir = request.workspace.rootPath,
     compilerPath = result.compiler.compilerPath,
+    compilerFrontend = $request.workspace.compilerFrontend,
     heads = samplePaths(entryPoints),
     headCount = entryPoints.len,
     importPaths = samplePaths(request.workspace.importPaths),
@@ -1256,7 +1280,7 @@ proc runCompilerRefresh*(
         inc result.compiledHeads
         var expectedModules = 0
         for previous in request.previousHeads:
-          if previous.headPath == entryPoint:
+          if previous.headPath == entryPoint and not previous.snapshot.isNil:
             expectedModules = previous.artifactPaths.len
             break
         var sharedFrontend = ""
@@ -1277,8 +1301,8 @@ proc runCompilerRefresh*(
             if dirExists(sharedFrontend):
               removeDir(sharedFrontend)
         let built = buildHead(
-          effectiveRequest, entryPoint, cachePath, reuseKey, artifactCache,
-          expectedModules, sharedFrontend, result.stamp, onActivity,
+          effectiveRequest, entryPoint, cachePath, reuseKey, overlayFingerprint,
+          artifactCache, expectedModules, sharedFrontend, result.stamp, onActivity,
         )
         if built.command.len > 0:
           result.commandLines.add(built.command)

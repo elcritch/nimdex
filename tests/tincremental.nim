@@ -72,8 +72,8 @@ suite "incremental compiler frontend":
     writeFile(active / "main.frontend.build.nif", "(.nif27)\n(stmts (do nim_m))\n")
     check incrementalExpectedModules(root) == 1
 
-  test "defaults saved-source analysis to ic":
-    let root = normalizeDocumentPath(createTempDir("nimdex-default-ic-", ""))
+  test "defaults saved-source analysis to track":
+    let root = normalizeDocumentPath(createTempDir("nimdex-default-track-", ""))
     defer:
       removeDir(root)
     let head = root / "main.nim"
@@ -81,15 +81,15 @@ suite "incremental compiler frontend":
     let workspace = initWorkspace(
       documentUriFromPath(root), entryPoints = @[head], cacheRoot = root / ".nimdex"
     )
-    check workspace.compilerFrontend == cfIc
+    check workspace.compilerFrontend == cfTrack
     let refreshed = runCompilerRefresh(
       CompilerRefreshRequest(workspace: workspace, capabilities: capabilities)
     )
     checkpoint refreshed.error & "\n" & refreshed.stderr
     require refreshed.ok
     require refreshed.commandLines.len == 1
-    check " ic " in refreshed.commandLines[0]
-    check "--compileOnly:on" in refreshed.commandLines[0]
+    check " track " in refreshed.commandLines[0]
+    check "--compileOnly:on" notin refreshed.commandLines[0]
     check "--processing:filenames" in refreshed.commandLines[0]
     check "[Processing]" in (refreshed.stdout & refreshed.stderr)
     check incrementalExpectedModules(refreshed.heads[0].cachePath / "frontend") > 0
@@ -130,6 +130,64 @@ suite "incremental compiler frontend":
       )
     check response.isSome()
     check parseJson(response.get())["error"]["code"].getInt() == -32602
+
+  test "track rebuilds changed dirty buffers without altering saved analysis":
+    let root = normalizeDocumentPath(createTempDir("nimdex-track-overlays-", ""))
+    defer:
+      removeDir(root)
+    let head = root / "main.nim"
+    let shared = root / "shared.nim"
+    writeFile(head, "import shared\nconst savedHead* = shared.savedValue\n")
+    writeFile(shared, "const savedValue* = 1\n")
+    var request = requestFor(root, head)
+    let saved = runCompilerRefresh(request)
+    require saved.ok
+    check "savedHead" in saved.declarationNames(head)
+    request.overlays = @[
+      initDocumentSnapshot(
+        documentUriFromPath(head),
+        "import shared\nconst dirtyHead* = shared.dirtyValue\n",
+        1,
+      ),
+      initDocumentSnapshot(documentUriFromPath(shared), "const dirtyValue* = 2\n", 1),
+    ]
+    let first = runCompilerRefresh(request)
+    checkpoint first.error & "\n" & first.stderr
+    require first.ok
+    check " track " in first.commandLines[0]
+    check "dirtyHead" in first.declarationNames(head)
+    check "dirtyValue" in first.declarationNames(shared)
+    check "savedHead" notin first.declarationNames(head)
+    check first.heads[0].cachePath.contains(DirSep & "overlays" & DirSep)
+    request.previousHeads = first.heads
+    request.overlays[1] = initDocumentSnapshot(
+      documentUriFromPath(shared), "const dirtyValue* = 2\nconst nextValue* = 3\n", 2
+    )
+    let second = runCompilerRefresh(request)
+    checkpoint second.error & "\n" & second.stderr
+    require second.ok
+    check "nextValue" in second.declarationNames(shared)
+    check "dirtyHead" in second.declarationNames(head)
+    request.previousHeads = second.heads
+    request.overlays[1] =
+      initDocumentSnapshot(documentUriFromPath(shared), "proc broken( = discard\n", 3)
+    let failed = runCompilerRefresh(request)
+    check not failed.ok
+    request.overlays[1] = initDocumentSnapshot(
+      documentUriFromPath(shared), "const dirtyValue* = 4\nconst recovered* = 5\n", 4
+    )
+    let recovered = runCompilerRefresh(request)
+    checkpoint recovered.error & "\n" & recovered.stderr
+    require recovered.ok
+    check "recovered" in recovered.declarationNames(shared)
+    request.overlays.setLen(0)
+    request.previousHeads.setLen(0)
+    let restored = runCompilerRefresh(request)
+    require restored.ok
+    check restored.restoredHeads == 1
+    check "savedHead" in restored.declarationNames(head)
+    check "savedValue" in restored.declarationNames(shared)
+    check "dirtyValue" notin restored.declarationNames(shared)
 
   test "ic reuses the incremental graph and skips native compilation":
     let root = normalizeDocumentPath(createTempDir("nimdex-ic-", ""))

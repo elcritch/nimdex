@@ -95,6 +95,18 @@ proc readBounded(path: string, limit: int64): string =
   if result.len.int64 > limit:
     raise newException(ValueError, "semantic cache exceeds size limit")
 
+proc completedHeadModuleCount*(cachePath, head: string): int =
+  ## The manifest is published only after a successful head analysis.
+  try:
+    let manifest = parseJson(readBounded(headManifestPath(cachePath), MaxManifestBytes))
+    if manifest.kind == JObject and manifest.hasKey("version") and
+        manifest["version"].getInt() == HeadCacheVersion and manifest.hasKey("headPath") and
+        manifest["headPath"].getStr() == head and manifest.hasKey("modules") and
+        manifest["modules"].kind == JArray and manifest["modules"].len <= 10000:
+      result = manifest["modules"].len
+  except CatchableError:
+    discard
+
 proc writeAtomic(path, text: string) =
   createDir(path.parentDir)
   let temporary = createTempFile(".analysis-", ".tmp", path.parentDir)
