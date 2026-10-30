@@ -1,4 +1,4 @@
-import std/[json, os, tables, times, unittest]
+import std/[json, os, sha1, tables, times, unittest]
 
 import nimdex/[compilerinputs, documents, headcache, semantic, workspace]
 
@@ -35,7 +35,14 @@ suite "owned semantic cache":
             column: 5,
             sourceTextHash: module.sourceTextHash,
           ),
-        )
+        ),
+        SymbolInfo(
+          name: "member`f",
+          qualifiedName: "member`f.1",
+          kind: "field",
+          key: "member",
+          modulePath: source,
+        ),
       ]
     )
     var analysis = HeadAnalysis(
@@ -53,6 +60,20 @@ suite "owned semantic cache":
     var writer = initHeadCache(root / "cache")
     writer.storeHead(analysis)
     let manifestPath = headManifestPath(analysis.cachePath)
+    # Simulate a field record written before compiler field suffixes were removed.
+    var oldManifest = parseJson(readFile(manifestPath))
+    let cacheDirectory = root / "cache" / ("semantic-v" & $HeadCacheVersion)
+    var oldRecord = parseJson(
+      readFile(
+        cacheDirectory / (oldManifest["modules"][0]["digest"].getStr() & ".json")
+      )
+    )
+    oldRecord["symbols"][1]["name"] = %"member`f"
+    let oldData = $oldRecord
+    let oldDigest = $secureHash(oldData)
+    writeFile(cacheDirectory / (oldDigest & ".json"), oldData)
+    oldManifest["modules"][0]["digest"] = %oldDigest
+    writeFile(manifestPath, $oldManifest)
     let validManifest = readFile(manifestPath)
     var reader = initHeadCache(root / "cache")
     var fingerprints: InputFingerprints
@@ -62,6 +83,7 @@ suite "owned semantic cache":
     )
     check reader.loadedModules == 1
     check restored.snapshot[].findSymbols("saved").len == 1
+    check restored.snapshot[].findSymbols("member").len == 1
     check restored.snapshot[].graph.headsFor(source) == @[source]
     check restored.snapshot[].findModule(source).sourceTextHash == module.sourceTextHash
     # The persisted semantic records are sufficient even without original BIFs.

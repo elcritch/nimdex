@@ -116,6 +116,11 @@ proc symbols*(module: ModuleSnapshot): lent seq[SymbolInfo] =
 
 proc setSymbols*(module: var ModuleSnapshot, symbols: sink seq[SymbolInfo]) =
   ## Replace the payload without changing records held by earlier snapshots.
+  # Older persistent records retain the compiler's field marker in the name.
+  # Normalize those records on load without invalidating the compiler cache.
+  for symbol in symbols.mitems:
+    if symbol.kind == "field" and symbol.name.endsWith("`f"):
+      symbol.name.setLen(symbol.name.len - 2)
   module.symbolData = ModuleSymbols(values: symbols)
 
 proc initSemanticSnapshot*(

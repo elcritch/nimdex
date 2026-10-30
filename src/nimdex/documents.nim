@@ -329,6 +329,112 @@ proc tokenIsInSourceCode(document: DocumentSnapshot, line, column: int): bool =
     if token.line == line and token.col == column:
       return token.tokType notin {tkInvalid, tkComment, tkIntLit .. tkCustomLit}
 
+proc declarationText*(document: DocumentSnapshot, compilerLine: int32): string =
+  ## Read a bounded declaration header from the validated source document.
+  let line = int(compilerLine) - 1
+  if line < 0 or line >= document.lineCount:
+    return
+  let firstLine = document.lineText(line)
+  let trimmed = firstLine.strip()
+  if trimmed.len == 0:
+    return
+  let routine =
+    strutils.splitWhitespace(trimmed)[0] in
+    ["proc", "func", "method", "iterator", "converter", "template", "macro"]
+  if not routine:
+    return trimmed.substr(0, 1023)
+
+  let start = document.lineStartOffset(line)
+  let lastLine = min(document.lineCount - 1, line + 40)
+  let limit = min(
+    document.content.len, min(start + 8192, document.lineStartOffset(lastLine) + 4096)
+  )
+  let fragment = document.content[start ..< limit]
+  var lex: Lexer
+  let config = newConfigRef()
+  let filename =
+    if document.path.len > 0:
+      document.path
+    else:
+      getCurrentDir() / "buffer.nim"
+  openLexer(
+    lex, AbsoluteFile(filename), llStreamOpen(fragment), newIdentCache(), config
+  )
+  lex.errorHandler = ignoreLexerError
+  defer:
+    closeLexer(lex)
+  var token: Token
+  var depth = 0
+  let indentation =
+    firstLine.len - firstLine.strip(leading = true, trailing = false).len
+  var finish = fragment.len
+  while true:
+    rawGetTok(lex, token)
+    if token.tokType == tkEof:
+      break
+    if token.line > 1 and token.indent >= 0 and token.indent <= indentation and
+        depth == 0:
+      finish = document.lineStartOffset(line + token.line - 1) - start + token.col
+      break
+    if token.tokType == tkEquals and depth == 0:
+      finish = document.lineStartOffset(line + token.line - 1) - start + token.col
+      break
+    case token.tokType
+    of tkParLe, tkBracketLe, tkCurlyLe, tkCurlyDotLe, tkBracketDotLe, tkParDotLe:
+      inc depth
+    of tkParRi, tkBracketRi, tkCurlyRi, tkCurlyDotRi, tkBracketDotRi, tkParDotRi:
+      depth = max(0, depth - 1)
+    else:
+      discard
+  result = fragment[0 ..< min(finish, 4096)].strip()
+
+proc parameterDeclarationText*(
+    document: DocumentSnapshot, compilerLine, compilerColumn: int32
+): string =
+  ## A parameter may share its source line with its enclosing routine.
+  let line = int(compilerLine) - 1
+  if line < 0 or line >= document.lineCount or compilerColumn < 0:
+    return
+  let start = document.lineStartOffset(line) + int(compilerColumn)
+  if start >= document.content.len:
+    return
+  let fragment = document.content[start ..< min(document.content.len, start + 4096)]
+  var lex: Lexer
+  let config = newConfigRef()
+  let filename =
+    if document.path.len > 0:
+      document.path
+    else:
+      getCurrentDir() / "buffer.nim"
+  openLexer(
+    lex, AbsoluteFile(filename), llStreamOpen(fragment), newIdentCache(), config
+  )
+  lex.errorHandler = ignoreLexerError
+  defer:
+    closeLexer(lex)
+  var token: Token
+  var depth = 0
+  var finish = fragment.len
+  while true:
+    rawGetTok(lex, token)
+    if token.tokType == tkEof:
+      break
+    if depth == 0 and token.tokType in {tkComma, tkSemiColon, tkParRi}:
+      finish =
+        if token.line == 1:
+          token.col
+        else:
+          document.lineStartOffset(line + token.line - 1) - start + token.col
+      break
+    case token.tokType
+    of tkParLe, tkBracketLe, tkCurlyLe, tkCurlyDotLe, tkBracketDotLe, tkParDotLe:
+      inc depth
+    of tkParRi, tkBracketRi, tkCurlyRi, tkCurlyDotRi, tkBracketDotRi, tkParDotRi:
+      depth = max(0, depth - 1)
+    else:
+      discard
+  result = fragment[0 ..< finish].strip()
+
 proc tryTokenSpanAt*(
     document: DocumentSnapshot,
     compilerLine, compilerColumn: int32,

@@ -247,7 +247,8 @@ first resolved owner in path order.
 
 Nimdex provides document symbols, workspace symbols, go to definition, hover,
 full document synchronization, and compiler diagnostics. Procedure hovers show
-compiler-derived static `raises` effects, including inferred exceptions and
+the validated source declaration, including its parameter and return types,
+and compiler-derived static `raises` effects, including inferred exceptions and
 `raises: []`. Missing effect information is shown as `raises: unknown`.
 
 Edits are coalesced for 200 ms, then checked using Nim's dirty-file mappings.

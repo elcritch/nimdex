@@ -491,8 +491,17 @@ proc findPositionSymbol(
       discard response.addLanguageSymbol(symbol, document, startOffset, finishOffset)
     else:
       discard response.addLanguageSymbol(useSymbol, useDocument, useStart, useFinish)
-      response.preview =
-        "**" & symbol.name & "**\n\n`" & symbol.kind & "` `" & symbol.qualifiedName & "`"
+      let declaration =
+        if symbol.kind == "param":
+          document.parameterDeclarationText(
+            symbol.location.line, symbol.location.column
+          )
+        else:
+          document.declarationText(symbol.location.line)
+      if declaration.len > 0:
+        response.preview = "````nim\n" & declaration & "\n````"
+      else:
+        response.preview = "**" & symbol.name & "**\n\n`" & symbol.kind & "`"
       if symbol.kind in ["proc", "func", "method", "iterator", "converter"]:
         response.preview.add("\n\n`" & self.semantic.raisesDisplay(symbol) & "`")
       break

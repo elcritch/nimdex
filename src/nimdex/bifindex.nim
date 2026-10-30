@@ -193,6 +193,9 @@ proc failureFromReport(report: BinnyArtifactReport): AnalysisFailure =
 
 proc symbolBaseName(qualifiedName: string): string =
   let separator = qualifiedName.find('.')
+  let fieldSuffix = qualifiedName.find("`f.")
+  if fieldSuffix >= 0 and (separator < 0 or fieldSuffix < separator):
+    return qualifiedName[0 ..< fieldSuffix]
   if separator < 0:
     qualifiedName
   else:

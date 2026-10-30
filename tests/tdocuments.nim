@@ -118,6 +118,17 @@ suite "Nimdex document and workspace values":
     check document.tryTokenSpanAt(1, 8, "target", startOffset, finishOffset)
     check not document.tryTokenSpanAt(2, 12, "unfinished", startOffset, finishOffset)
 
+  test "declaration headers retain types and omit procedure bodies":
+    let document = initDocumentSnapshot(
+      "file:///tmp/declaration.nim",
+      "proc target*(\n    value: int = 3, text: string = \"=\"\n): bool {.raises: [].} =\n  discard\n",
+      1,
+    )
+    let declaration = document.declarationText(1)
+    check "value: int = 3" in declaration
+    check "): bool {.raises: [].}" in declaration
+    check "discard" notin declaration
+
   test "orders document overlay versions":
     var store = initDocumentStore()
     let uri = "file:///tmp/phase1-overlay.nim"

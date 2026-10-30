@@ -4,6 +4,70 @@ import nimdex/[compiler, documents, language, semantic, workspace]
 let Compiler = findExe("nim")
 
 suite "compiler navigation, effects and overlays":
+  test "resolves included object fields and parameter declarations":
+    let root = normalizeDocumentPath(createTempDir("nimdex-fields-", ""))
+    defer:
+      removeDir(root)
+    let main = root / "main.nim"
+    let piece = root / "piece.nim"
+    let pieceText = """type Holder = object
+  splitView: int
+  setInitialDivider: bool
+proc layout(content: Holder) =
+  discard content.splitView
+  discard content.setInitialDivider
+layout(Holder())
+"""
+    writeFile(main, "include piece\n")
+    writeFile(piece, pieceText)
+    let ws = initWorkspace(
+      documentUriFromPath(root),
+      entryPoints = @[main],
+      compilerPath = Compiler,
+      cacheRoot = root / "cache",
+    )
+    let refresh = runCompilerRefresh(
+      CompilerRefreshRequest(workspace: ws, capabilities: probeCompiler(Compiler))
+    )
+    require refresh.ok
+    let runtime = newLanguageRuntime()
+    defer:
+      runtime.close()
+    runtime.installIndex(refresh.snapshot)
+    let uri = documentUriFromPath(piece)
+    discard runtime.request(
+      LanguageRequest(kind: lrkOpen, uri: uri, text: pieceText, version: 1)
+    )
+    for item in [
+      (4, 19, "splitView: int"),
+      (5, 19, "setInitialDivider: bool"),
+      (4, 11, "content: Holder"),
+    ]:
+      let hover = runtime.request(
+        LanguageRequest(
+          kind: lrkHover,
+          uri: uri,
+          line: item[0],
+          character: item[1],
+          positionEncoding: peUtf16,
+        )
+      )
+      checkpoint hover.preview
+      check hover.ok and hover.found
+      check item[2] in hover.preview
+      if item[2] == "content: Holder":
+        check "proc layout" notin hover.preview
+      let definition = runtime.request(
+        LanguageRequest(
+          kind: lrkDefinition,
+          uri: uri,
+          line: item[0],
+          character: item[1],
+          positionEncoding: peUtf16,
+        )
+      )
+      check definition.ok and definition.found
+
   test "resolves a use in an include after numeric suffixes":
     let root = normalizeDocumentPath(createTempDir("nimdex-included-navigation-", ""))
     defer:
@@ -41,6 +105,14 @@ suite "compiler navigation, effects and overlays":
     require definition.ok and definition.found
     check definition.symbols[0].symbol.location.path == support
     check definition.symbols[0].start == TextPosition(line: 0, character: 5)
+    let hover = runtime.request(
+      LanguageRequest(
+        kind: lrkHover, uri: uri, line: 1, character: 10, positionEncoding: peUtf16
+      )
+    )
+    require hover.ok and hover.found
+    check "proc target*(amount: float32): float32" in hover.preview
+    check "```" in hover.preview
     discard runtime.request(
       LanguageRequest(
         kind: lrkChange,
