@@ -155,7 +155,14 @@ suite "published semantic snapshots":
   test "adding a head preserves lookup indexes held by earlier readers":
     var current = initSemanticSnapshot("snapshot-lifetime", 1)
     var first = ModuleSnapshot(artifactHash: "first", sourcePath: "/first.nim")
-    first.setSymbols(@[SymbolInfo(name: "first", qualifiedName: "first.0.first")])
+    first.setSymbols(
+      @[
+        SymbolInfo(name: "first", qualifiedName: "first.0.first", receiverTypeId: "T"),
+        SymbolInfo(
+          name: "field", qualifiedName: "field.0.first", kind: "field", ownerId: "Owner"
+        ),
+      ]
+    )
     current.addModule(first)
     let published = current
     var second = ModuleSnapshot(artifactHash: "second", sourcePath: "/second.nim")
@@ -164,3 +171,7 @@ suite "published semantic snapshots":
     check published.findSymbols("first").len == 1
     check published.findSymbols("second").len == 0
     check current.findSymbols("second").len == 1
+    check current.receiverSymbols("T", "").len == 1
+    check published.receiverSymbols("T", "").len == 1
+    check current.fieldsForOwner("Owner", "").len == 1
+    check published.fieldsForOwner("Owner", "").len == 1

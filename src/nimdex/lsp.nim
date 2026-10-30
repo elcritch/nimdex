@@ -97,7 +97,6 @@ type
     deferredShutdownResponse: string
     positionEncoding: PositionEncoding
     openDocuments: DocumentStore
-    overlayIdentity: uint64
     refreshDeadline: int64
     documentGeneration: uint64
     compilerSourceGeneration: uint64
@@ -955,6 +954,9 @@ proc publishCompilerDiagnostics(
 ) =
   if server.dispatcher.isNil:
     return
+  var dirtyUris = initTable[string, bool]()
+  for document in server.openDocuments.dirtyDocuments():
+    dirtyUris[document.uri] = true
   var grouped = initTable[string, seq[CompilerDiagnostic]]()
   for diagnostic in diagnostics:
     let uri =
@@ -964,7 +966,7 @@ proc publishCompilerDiagnostics(
         documentUriFromPath(diagnostic.sourcePath)
       else:
         server.workspace.rootUri
-    if uri.len > 0:
+    if uri.len > 0 and uri notin dirtyUris:
       if diagnostic notin grouped.mgetOrPut(uri, @[]):
         grouped[uri].add(diagnostic)
 
@@ -1172,7 +1174,6 @@ proc startCompilerRefresh(server: LspServer) =
     sourceGeneration: server.compilerSourceGeneration,
     cancellation: cancellation,
     previousHeads: server.reusableHeads(),
-    overlays: server.openDocuments.dirtyDocuments(),
     forceRebuild: server.forceCompilerRefresh,
     priorityHead: server.headForDocument(server.activeDocument),
   )
@@ -1228,32 +1229,16 @@ proc recordBufferUpdate(server: LspServer, request: LanguageRequest) =
     discard server.openDocuments.updateDocument(
       request.uri, request.text, request.version, request.positionEncoding
     )
+    if request.uri in server.publishedDiagnosticUris and not server.dispatcher.isNil:
+      server.dispatcher.sendJsonRpcNotification(
+        "textDocument/publishDiagnostics",
+        %*{"uri": request.uri, "version": request.version, "diagnostics": []},
+      )
+      server.publishedDiagnosticUris.del(request.uri)
   of lrkClose:
     discard server.openDocuments.closeDocument(request.uri)
   else:
     return
-  var keys: seq[string]
-  for document in server.openDocuments.dirtyDocuments():
-    keys.add(document.path & "\0" & $document.textHash)
-  keys.sort()
-  let identity =
-    if keys.len == 0:
-      0'u64
-    else:
-      stableTextHash(keys.join("\0"))
-  if identity == server.overlayIdentity:
-    return
-  server.overlayIdentity = identity
-  if not server.compilerEnabled:
-    return
-  inc server.compilerSourceGeneration
-  server.compilerCancellation.cancelCompiler()
-  if server.asynchronousSession:
-    # Only the home loop advances this deadline. While waiting it polls in
-    # short intervals; with no pending edit it blocks normally without spinning.
-    server.refreshDeadline = getMonoTime().ticks + 200_000_000
-  else:
-    server.requestCompilerRefresh()
 
 proc runCompilerRefreshSynchronously(server: LspServer) =
   if not server.compilerEnabled:
@@ -1272,7 +1257,6 @@ proc runCompilerRefreshSynchronously(server: LspServer) =
         sourceGeneration: server.compilerSourceGeneration,
         cancellation: cancellation,
         previousHeads: server.reusableHeads(),
-        overlays: server.openDocuments.dirtyDocuments(),
         forceRebuild: server.forceCompilerRefresh,
         priorityHead: server.headForDocument(server.activeDocument),
       ),
@@ -1424,7 +1408,7 @@ proc languageResult(kind: LanguageRequestKind, response: LanguageResponse): Json
   of lrkCompletion:
     var items = newJArray()
     for item in response.items:
-      var entry = %*{"label": item.label, "kind": 3}
+      var entry = %*{"label": item.label, "kind": (if item.isField: 5 else: 3)}
       if item.detail.len > 0:
         entry["detail"] = %item.detail
       items.add(entry)
@@ -1917,8 +1901,7 @@ proc receiveCompilerRefreshCompletion(
       server.activeSnapshot.preferredHeads = server.preferredHeads
       server.language.installIndex(server.activeSnapshot)
     server.compilerHeads = refresh.heads
-    if server.openDocuments.dirtyDocuments().len == 0:
-      server.savedHeads = refresh.heads
+    server.savedHeads = refresh.heads
     server.progressSnapshot = SemanticSnapshot()
     server.progressHeads.setLen(0)
     server.semanticReady = refresh.heads.len > 0
@@ -2076,7 +2059,7 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
 
   let serverInfo = newJObject()
   serverInfo["name"] = %"nimdex"
-  serverInfo["version"] = %"0.1.11"
+  serverInfo["version"] = %"0.1.12"
   result["serverInfo"] = serverInfo
 
 proc initializedLsp(server: LspServer, params: JsonNode): JsonNode =

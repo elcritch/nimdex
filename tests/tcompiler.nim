@@ -179,8 +179,10 @@ suite "Nimdex compiler refresh":
     )
     let unsaved = server.debugState()
     check unsaved["refresh"]["compiledHeads"].getInt() == 2
-    check unsaved["semantic"]["sourceFingerprint"] !=
+    check unsaved["semantic"]["sourceFingerprint"] ==
       cold["semantic"]["sourceFingerprint"]
+    check unsaved["refresh"]["cachePath"] == cold["refresh"]["cachePath"]
+    check not unsaved["refresh"]["debouncing"].getBool()
     writeFile(source, edited)
     server.notify("textDocument/didSave", %*{"textDocument": {"uri": uri}})
     let saved = server.debugState()

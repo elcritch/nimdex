@@ -33,6 +33,7 @@ type
   CompletionItem* = object
     label*: string
     detail*: string
+    isField*: bool
 
   LanguageRequest* = object ## A language operation sent to worker-owned state.
     kind*: LanguageRequestKind ## The operation to perform.
@@ -693,7 +694,11 @@ proc findCompletions(
   var seen = initHashSet[string]()
   var documents = initTable[string, DocumentSnapshot]()
   for currentType in snapshot.completionTypes(receiverType, head):
-    for symbol in snapshot.receiverSymbols(currentType, head):
+    var members = snapshot.receiverSymbols(currentType, head)
+    for typ in snapshot.findSymbols(currentType, head):
+      if typ.kind == "type" and typ.typeId == currentType:
+        members.add(snapshot.fieldsForOwner(typ.qualifiedName, head))
+    for symbol in members:
       if cancellation.isCancelled():
         response.ok = false
         response.cancelled = true
@@ -702,13 +707,22 @@ proc findCompletions(
           completionKey(symbol.name).startsWith(prefix) and (
         not symbol.receiverRequiresVar or
         (receiverMutable and currentType == receiverType)
-      ) and (symbol.visibility == svExported or symbol.modulePath in documentModules) and
-          not seen.containsOrIncl(symbol.qualifiedName):
-        var item = CompletionItem(label: symbol.name)
+      ):
+        var visible =
+          symbol.visibility == svExported or symbol.modulePath in documentModules
+        var item = CompletionItem(label: symbol.name, isField: symbol.kind == "field")
         var source: DocumentSnapshot
         if self.cachedSourceDocumentFor(
           symbol.location, request.positionEncoding, documents, source
         ):
+          var first, last: int
+          if not source.tryTokenSpanAt(
+            symbol.location.line, symbol.location.column, symbol.name, first, last
+          ):
+            continue
+          if symbol.kind == "field" and last < source.content.len and
+              source.content[last] == '*':
+            visible = true
           item.detail = source.declarationText(symbol.location.line)
         elif symbol.location.uri == response.uri:
           let line = int(symbol.location.line) - 1
@@ -725,7 +739,8 @@ proc findCompletions(
                     previous.lineText(line) == document.lineText(line):
                   item.detail = previous.declarationText(symbol.location.line)
                   break
-        response.items.add(item)
+        if visible and not seen.containsOrIncl(symbol.qualifiedName):
+          response.items.add(item)
         if response.items.len >= 200:
           break
   response.version = document.version

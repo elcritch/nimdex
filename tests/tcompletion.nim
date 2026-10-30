@@ -25,6 +25,7 @@ suite "receiver completion":
       """
 type Widget* = ref object of RootObj
   size*: int
+  secret: int
 type Fancy* = ref object of Widget
 type Wrapper* = object
   member*: Widget
@@ -72,6 +73,14 @@ proc chain() =
       "textDocument/didOpen",
       %*{"textDocument": {"uri": uri, "version": 1, "text": saved}},
     )
+    let beforeEdit = server.request(
+      %*{
+        "jsonrpc": "2.0",
+        "id": 80,
+        "method": "nimdex/debug",
+        "params": {"summaryOnly": true},
+      }
+    )["result"]
     let edited = saved.replace("discard item", "discard item.")
     server.notify(
       "textDocument/didChange",
@@ -79,6 +88,18 @@ proc chain() =
         "textDocument": {"uri": uri, "version": 2}, "contentChanges": [{"text": edited}]
       },
     )
+    let afterEdit = server.request(
+      %*{
+        "jsonrpc": "2.0",
+        "id": 81,
+        "method": "nimdex/debug",
+        "params": {"summaryOnly": true},
+      }
+    )["result"]
+    check afterEdit["refresh"]["cachePath"] == beforeEdit["refresh"]["cachePath"]
+    check afterEdit["semantic"]["sourceFingerprint"] ==
+      beforeEdit["semantic"]["sourceFingerprint"]
+    check not afterEdit["refresh"]["debouncing"].getBool()
     let completed = server.request(
       %*{
         "jsonrpc": "2.0",
@@ -94,6 +115,11 @@ proc chain() =
     for item in completed["result"]:
       labels.add(item["label"].getStr())
     check "grow" in labels
+    check "size" in labels
+    check "secret" notin labels
+    for item in completed["result"]:
+      if item["label"].getStr() == "size":
+        check item["kind"].getInt() == 5
     check "shrink" in labels
     check "unrelated" notin labels
     let inherited = saved.replace("discard fancy", "discard fancy.")
@@ -192,8 +218,26 @@ proc chain() =
     var unsavedLabels: seq[string]
     for item in unsavedResult["result"]:
       unsavedLabels.add(item["label"].getStr())
-    check "grow" in unsavedLabels
-    check "shrink" notin unsavedLabels
+    check unsavedLabels.len == 0
+    writeFile(head, changedType)
+    server.notify("textDocument/didSave", %*{"textDocument": {"uri": uri}})
+    let savedTypeResult = server.request(
+      %*{
+        "jsonrpc": "2.0",
+        "id": 60,
+        "method": "textDocument/completion",
+        "params":
+          {"textDocument": {"uri": uri}, "position": {"line": 3, "character": 16}},
+      }
+    )
+    require savedTypeResult.hasKey("result")
+    var savedLabels: seq[string]
+    for item in savedTypeResult["result"]:
+      savedLabels.add(item["label"].getStr())
+    check "grow" in savedLabels
+    check "shrink" notin savedLabels
+    writeFile(head, saved)
+    server.notify("textDocument/didSave", %*{"textDocument": {"uri": uri}})
     server.notify(
       "textDocument/didChange",
       %*{
@@ -245,3 +289,63 @@ proc chain() =
     for item in chainedResult["result"]:
       chainedLabels.add(item["label"].getStr())
     check "grow" in chainedLabels
+
+  test "completes private fields in an included source file":
+    let root = normalizeDocumentPath(createTempDir("nimdex-completion-include-", ""))
+    defer:
+      removeDir(root)
+    let
+      head = root / "main.nim"
+      includeFile = root / "piece.nim"
+      saved = "proc layout(content: Content) =\n  discard content\n"
+    writeFile(
+      head,
+      "type Content = ref object\n  splitView: int\n  setInitialDivider: bool\ninclude piece\n",
+    )
+    writeFile(includeFile, saved)
+    let server = newNimdexLspServer(compilerPath = findExe("nim"))
+    defer:
+      server.close()
+    let initialized = server.request(
+      %*{
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+          "rootUri": documentUriFromPath(root),
+          "capabilities": {},
+          "initializationOptions": {"entryPoints": [head], "importPaths": [root]},
+        },
+      }
+    )
+    require initialized.hasKey("result")
+    server.notify("initialized", %*{})
+    let uri = documentUriFromPath(includeFile)
+    server.notify(
+      "textDocument/didOpen",
+      %*{"textDocument": {"uri": uri, "version": 1, "text": saved}},
+    )
+    server.notify(
+      "textDocument/didChange",
+      %*{
+        "textDocument": {"uri": uri, "version": 2},
+        "contentChanges":
+          [{"text": saved.replace("discard content", "discard content.")}],
+      },
+    )
+    let response = server.request(
+      %*{
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "textDocument/completion",
+        "params":
+          {"textDocument": {"uri": uri}, "position": {"line": 1, "character": 18}},
+      }
+    )
+    checkpoint $response
+    require response.hasKey("result")
+    var labels: seq[string]
+    for item in response["result"]:
+      labels.add(item["label"].getStr())
+    check "splitView" in labels
+    check "setInitialDivider" in labels

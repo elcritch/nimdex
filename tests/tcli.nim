@@ -279,8 +279,11 @@ suite "Editor LSP TCP":
       )
       let symbols = socket.receiveProtocol(parser, 2, notifications)
       require symbols.hasKey("result")
-      check symbols["result"][0]["name"].getStr() ==
-        (if session == 0: "unsavedTcpValue" else: "tcpValue")
+      if session == 0:
+        check symbols["result"].len == 0
+      else:
+        require symbols["result"].len > 0
+        check symbols["result"][0]["name"].getStr() == "tcpValue"
       socket.sendProtocol("nimdex/debug", %*{}, 4)
       let debug = socket.receiveProtocol(parser, 4, notifications)
       check debug["result"]["compiler"]["frontend"].getStr() == "track"

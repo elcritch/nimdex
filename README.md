@@ -245,21 +245,21 @@ first resolved owner in path order.
 
 Nimdex provides document symbols, workspace symbols, go to definition, hover,
 receiver completion, full document synchronization, and compiler diagnostics.
-Completion after `variable.` suggests procs whose first parameter matches the
-variable's compiler type or an inherited base type. It uses the last indexed
+Completion after `variable.` suggests accessible object fields and procs whose
+first parameter matches the variable's compiler type or an inherited base type. It uses the last indexed
 declarations while an edit is incomplete; generic and implicit conversion matches
 are not yet resolved. Procedure hovers show
 the validated source declaration, including its parameter and return types,
 and compiler-derived static `raises` effects, including inferred exceptions and
 `raises: []`. Missing effect information is shown as `raises: unknown`.
 
-Edits are coalesced for 200 ms, then checked using Nim's dirty-file mappings.
-Multiple open buffers and includes retain their original source paths; editor
-text is never written over project files. Definitions and hover work on those
-checked buffers. Results from superseded revisions are discarded, and diagnostic
-notifications include the open document's version. Closing a buffer restores
-analysis of disk contents. Saves and `workspace/didChangeWatchedFiles` also
-trigger refreshes.
+The editor's unsaved text stays in memory and does not trigger compiler runs.
+Completion uses the saved index when it can verify the receiver declaration;
+changed declarations need a save before compiler-derived types are refreshed.
+Definitions and hovers are returned only when their source positions can be
+verified against the current buffer. Diagnostics for a modified buffer are
+cleared until it is saved. Saves and `workspace/didChangeWatchedFiles` trigger
+incremental compiler refreshes using the files on disk.
 
 Definition lookup uses compiler symbol identities to distinguish overloads,
 locals and generic instances within the selected actual head. Source ranges are
@@ -296,12 +296,8 @@ which importers need rechecking. Only the current resolved module closure is
 indexed, so removed imports leave no stale symbols even though their old files
 remain in the compiler cache. Compiler state is separate from Nimdex's
 persistent head manifests. `compile`, `track`, and `ic` use distinct cache
-contexts. Dirty-buffer analysis uses a separate frontend cache. Because Nim's
-incremental driver does not detect changes to dirty mappings, Nimdex resets
-that cache whenever unsaved buffer contents or mappings change. Dirty semantic
-records are never persisted as saved analyses. The compiler's
-dirty-file option cannot represent
-paths containing commas; these produce an analysis error.
+contexts. The editor server builds saved files and reuses their semantic index
+while buffers are modified.
 
 `nimcheck` conditionals and the incremental compiler's method dispatch behavior
 can differ from `nim c`; switch back with `--frontend compile` when needed.

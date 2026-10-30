@@ -99,6 +99,7 @@ type
   SemanticLookups = ref object
     nameIndex: Table[string, seq[SymbolRef]]
     receiverIndex: Table[string, seq[SymbolRef]]
+    fieldIndex: Table[string, seq[SymbolRef]]
     locationIndex: Table[string, seq[SymbolRef]]
     contentIndex: Table[string, int]
 
@@ -167,6 +168,8 @@ proc addModule*(snapshot: var SemanticSnapshot, module: sink ModuleSnapshot) =
   elif not isUniqueRef(snapshot.lookups):
     snapshot.lookups = SemanticLookups(
       nameIndex: snapshot.lookups.nameIndex,
+      receiverIndex: snapshot.lookups.receiverIndex,
+      fieldIndex: snapshot.lookups.fieldIndex,
       locationIndex: snapshot.lookups.locationIndex,
       contentIndex: snapshot.lookups.contentIndex,
     )
@@ -203,6 +206,8 @@ proc addModule*(snapshot: var SemanticSnapshot, module: sink ModuleSnapshot) =
       snapshot.lookups.receiverIndex.mgetOrPut(symbol.receiverTypeId, @[]).add(
         reference
       )
+    if symbol.kind == "field" and symbol.ownerId.len > 0:
+      snapshot.lookups.fieldIndex.mgetOrPut(symbol.ownerId, @[]).add(reference)
     snapshot.addLocationRef(symbol.location, reference)
 
 proc addFailure*(snapshot: var SemanticSnapshot, failure: sink AnalysisFailure) =
@@ -266,6 +271,15 @@ proc receiverSymbols*(
   if snapshot.lookups.isNil or typeId notin snapshot.lookups.receiverIndex:
     return
   for reference in snapshot.lookups.receiverIndex[typeId]:
+    let module = snapshot.modules[reference.moduleIndex]
+    if head.len == 0 or head in module.headFiles:
+      result.add(module.symbols[reference.symbolIndex])
+
+proc fieldsForOwner*(snapshot: SemanticSnapshot, owner, head: string): seq[SymbolInfo] =
+  ## Find fields declared by an indexed object type in the selected head.
+  if snapshot.lookups.isNil or owner notin snapshot.lookups.fieldIndex:
+    return
+  for reference in snapshot.lookups.fieldIndex[owner]:
     let module = snapshot.modules[reference.moduleIndex]
     if head.len == 0 or head in module.headFiles:
       result.add(module.symbols[reference.symbolIndex])
