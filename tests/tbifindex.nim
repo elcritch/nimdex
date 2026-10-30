@@ -44,6 +44,46 @@ proc makeArtifactRoot(): string =
   createDir(result / "nested")
 
 suite "Nimdex offline BIF index":
+  test "reuses hashes only while BIF files remain unchanged":
+    let root = makeArtifactRoot()
+    defer:
+      removeDir(root)
+    let source = root / "main.nim"
+    let path = root / "main.s.bif"
+    writeFile(source, "discard\n")
+    writeSampleBif(path, source)
+    let workspace = initWorkspace(documentUriFromPath(root))
+    var cache: BifReuseCache
+    let first = buildBifIndexCached(workspace, cache, @[path])
+    require first.failureCount() == 0
+    check cache.hashedArtifacts == 1
+    let second = buildBifIndexCached(workspace, cache, @[path])
+    check second.failureCount() == 0
+    when defined(posix):
+      check cache.hashedArtifacts == 1
+      check cache.reusedArtifactHashes == 1
+    else:
+      check cache.hashedArtifacts == 2
+    let originalTime = getLastModificationTime(path)
+    let original = readFile(path)
+    writeFile(path, "X" & original[1 .. ^1])
+    setLastModificationTime(path, originalTime)
+    let changed = buildBifIndexCached(workspace, cache, @[path])
+    check changed.failureCount() > 0
+    when defined(posix):
+      check cache.hashedArtifacts == 2
+    else:
+      check cache.hashedArtifacts == 3
+
+    # Compiler work invalidates every remembered file hash, even when the
+    # compiler leaves some artifacts unchanged.
+    writeSampleBif(path, source)
+    discard buildBifIndexCached(workspace, cache, @[path])
+    let previousHashes = cache.hashedArtifacts
+    cache.clearArtifactHashes()
+    discard buildBifIndexCached(workspace, cache, @[path])
+    check cache.hashedArtifacts == previousHashes + 1
+
   test "discovers semantic BIFs without exposing Binny storage":
     let root = makeArtifactRoot()
     defer:

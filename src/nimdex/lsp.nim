@@ -2061,7 +2061,7 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
 
   let serverInfo = newJObject()
   serverInfo["name"] = %"nimdex"
-  serverInfo["version"] = %"0.1.9"
+  serverInfo["version"] = %"0.1.10"
   result["serverInfo"] = serverInfo
 
 proc initializedLsp(server: LspServer, params: JsonNode): JsonNode =

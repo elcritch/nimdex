@@ -331,7 +331,9 @@ data as JSON. Restarts validate compiler identity, compiler arguments,
 compiler environment, resolved source/include and configuration inputs,
 and the local source inventory before restoring records. New manifests compare
 file content, so an mtime-only change does not force compilation. Valid restores
-index the existing BIFs without running the compiler. Missing, incompatible, or
+index the existing BIFs without running the compiler. On POSIX systems, shared
+BIFs are hashed once per refresh while their file identity and change times
+remain unchanged; compiler runs invalidate the remembered hashes. Missing, incompatible, or
 damaged cache entries rebuild.
 Cold compilation still runs once per head; compatible entry points can reuse
 compiler frontend work from earlier heads.

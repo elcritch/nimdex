@@ -943,6 +943,7 @@ proc buildHead(
         expectedModules: compilerExpectedModules(knownModules, projectFiles.len, 0),
       )
     )
+  artifactCache.clearArtifactHashes()
   let process = runExternalCommand(
     request.capabilities.compilerPath, arguments, request.workspace.rootPath, cachePath,
     request.cancellation, entryPoint, compilerCache, projectFiles, knownModules, stamp,

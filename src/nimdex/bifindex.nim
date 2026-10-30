@@ -26,10 +26,17 @@ type
 
   BifIndex* = SemanticSnapshot
 
+  ArtifactHash = object
+    info: FileInfo
+    digest: string
+
   BifReuseCache* = object
     modules: Table[string, ModuleSnapshot]
+    hashes: Table[string, ArtifactHash]
     loadedArtifacts*: int
     reusedArtifacts*: int
+    hashedArtifacts*: int
+    reusedArtifactHashes*: int
 
   BifIndexResult = object
     artifactPath: string
@@ -52,6 +59,34 @@ type
 const DefaultBifIndexOptions* = BifIndexOptions(
   loadLimits: DefaultBinnyLoadLimits, maxArtifacts: 10000, workerCount: 0
 )
+
+proc sameArtifact(a, b: FileInfo): bool =
+  a.id == b.id and a.kind == b.kind and a.size == b.size and
+    a.lastWriteTime == b.lastWriteTime and a.creationTime == b.creationTime
+
+proc clearArtifactHashes*(cache: var BifReuseCache) =
+  ## A compiler run can replace artifacts while the refresh is in progress.
+  cache.hashes.clear()
+
+proc artifactHash(cache: var BifReuseCache, path: string, maxBytes: int64): string =
+  let before = getFileInfo(path)
+  if before.size > maxBytes:
+    return
+  # On POSIX, creationTime is the inode change time, which also detects
+  # in-place writes whose modification time has subsequently been restored.
+  # Windows creation time does not provide that guarantee; hash it each time.
+  when defined(posix):
+    if path in cache.hashes and sameArtifact(before, cache.hashes[path].info):
+      inc cache.reusedArtifactHashes
+      return cache.hashes[path].digest
+  let digest = $secureHashFile(path)
+  let after = getFileInfo(path)
+  if not sameArtifact(before, after):
+    raise newException(IOError, "BIF changed while hashing: " & path)
+  inc cache.hashedArtifacts
+  when defined(posix):
+    cache.hashes[path] = ArtifactHash(info: after, digest: digest)
+  digest
 
 proc failureFromReport(report: BinnyArtifactReport): AnalysisFailure
 proc moduleFromReport(report: BinnyArtifactReport, projectId: string): ModuleSnapshot
@@ -343,8 +378,7 @@ proc buildBifIndexCached*(
   var indexed: seq[BifIndexResult]
   for path in selectedArtifacts:
     # Respect loader limits before reading bytes for the content cache.
-    if getFileSize(path) <= options.loadLimits.maxFileBytes:
-      hashes[path] = $secureHashFile(path)
+    hashes[path] = cache.artifactHash(path, options.loadLimits.maxFileBytes)
     let hash = hashes.getOrDefault(path)
     if hash.len > 0 and hash in cache.modules:
       var module = cache.modules[hash]
@@ -396,6 +430,8 @@ proc buildBifIndexCached*(
     moduleCount = result.moduleCount(),
     symbolCount = indexedSymbolCount,
     tokenCount = result.tokenCount(),
+    hashedArtifacts = cache.hashedArtifacts,
+    reusedArtifactHashes = cache.reusedArtifactHashes,
     failureCount = result.failureCount()
 
 proc buildBifIndex*(
