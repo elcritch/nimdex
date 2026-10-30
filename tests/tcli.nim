@@ -290,6 +290,86 @@ suite "Editor LSP TCP":
       check socket.recv(1, timeout = 10000).len == 0
       check process.running()
 
+  test "serves receiver completion through LSP TCP with an unfinished edit":
+    let root = normalizeDocumentPath(
+      getTempDir() / ("nimdex-tcp-completion-" & $getCurrentProcessId())
+    )
+    createDir(root)
+    defer:
+      removeDir(root)
+    let source = root / "main.nim"
+    let saved = """
+type Widget = object
+proc grow*(self: Widget) = discard
+proc run() =
+  var item: Widget
+  discard item
+"""
+    writeFile(source, saved)
+    let process = startProcess(
+      testDaemon(),
+      args = ["daemon", "--lsp-listen", "0", "--compiler", findExe("nim")],
+      options = {poUsePath},
+    )
+    let port = Port(
+      parseInt(process.errorStream().readListenerPort("Nimdex LSP TCP listener ready"))
+    )
+    var errorThread: Thread[Stream]
+    createThread(errorThread, drainProtocolErrors, process.errorStream())
+    defer:
+      process.terminate()
+      if process.waitForExit(10000) == -1:
+        process.kill()
+        discard process.waitForExit()
+      joinThread(errorThread)
+      process.close()
+    let socket = newSocket(buffered = false)
+    defer:
+      socket.close()
+    socket.connect("127.0.0.1", port)
+    var parser = initJsonRpcFrameParser()
+    var notifications: seq[JsonNode]
+    socket.sendProtocol(
+      "initialize", %*{"rootUri": documentUriFromPath(root), "capabilities": {}}, 1
+    )
+    require socket.receiveProtocol(parser, 1, notifications).hasKey("result")
+    socket.sendProtocol("initialized", %*{})
+    let uri = documentUriFromPath(source)
+    socket.sendProtocol(
+      "textDocument/didOpen",
+      %*{"textDocument": {"uri": uri, "languageId": "nim", "version": 1, "text": saved}},
+    )
+    socket.sendProtocol(
+      "textDocument/documentSymbol", %*{"textDocument": {"uri": uri}}, 2
+    )
+    require socket.receiveProtocol(parser, 2, notifications).hasKey("result")
+    let edited = saved.replace("discard item", "discard item.")
+    socket.sendProtocol(
+      "textDocument/didChange",
+      %*{
+        "textDocument": {"uri": uri, "version": 2}, "contentChanges": [{"text": edited}]
+      },
+    )
+    socket.sendProtocol(
+      "textDocument/completion",
+      %*{"textDocument": {"uri": uri}, "position": {"line": 4, "character": 15}},
+      3,
+    )
+    let completed = socket.receiveProtocol(parser, 3, notifications)
+    checkpoint $completed
+    require completed.hasKey("result")
+    var names: seq[string]
+    for item in completed["result"]:
+      names.add(item["label"].getStr())
+      if item["label"].getStr() == "grow":
+        check item.hasKey("detail")
+        if item.hasKey("detail"):
+          check item["detail"].getStr().contains("proc grow")
+    check "grow" in names
+    socket.sendProtocol("shutdown", %*{}, 4)
+    discard socket.receiveProtocol(parser, 4, notifications)
+    socket.sendProtocol("exit", %*{})
+
   test "reports compiler refresh progress through LSP work-done tokens":
     let root = normalizeDocumentPath(
       getTempDir() / ("nimdex-progress-" & $getCurrentProcessId())

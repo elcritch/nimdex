@@ -167,6 +167,7 @@ let
   workspaceSymbolSelector = selector[JsonNode, JsonNode]("workspace/symbol")
   definitionSelector = selector[JsonNode, JsonNode]("textDocument/definition")
   hoverSelector = selector[JsonNode, JsonNode]("textDocument/hover")
+  completionSelector = selector[JsonNode, JsonNode]("textDocument/completion")
   debugSelector = selector[JsonNode, JsonNode](LspDebugMethod)
 
 proc indexRequested(source: BifIndexTrigger) {.signal.}
@@ -1420,6 +1421,17 @@ proc languageResult(kind: LanguageRequestKind, response: LanguageResponse): Json
     result = newJObject()
     result["contents"] = contents
     result["range"] = response.symbols[0].lspRange()
+  of lrkCompletion:
+    var items = newJArray()
+    for item in response.items:
+      var entry = %*{"label": item.label, "kind": 3}
+      if item.detail.len > 0:
+        entry["detail"] = %item.detail
+      items.add(entry)
+    if response.items.len >= 200:
+      result = %*{"isIncomplete": true, "items": items}
+    else:
+      result = items
 
 proc successResponse(id, value: JsonNode): string =
   var response = newJObject()
@@ -1595,10 +1607,12 @@ proc submitAsyncLspRequest(
       request = parseDocumentSymbolsRequest(params, server.positionEncoding)
     of "workspace/symbol":
       request = parseWorkspaceSymbolsRequest(params, server.positionEncoding)
-    of "textDocument/hover", "textDocument/definition":
+    of "textDocument/hover", "textDocument/definition", "textDocument/completion":
       request = parseHoverRequest(params, server.positionEncoding)
       if methodName == "textDocument/definition":
         request.kind = lrkDefinition
+      elif methodName == "textDocument/completion":
+        request.kind = lrkCompletion
     else:
       return
 
@@ -1621,9 +1635,8 @@ proc submitAsyncLspRequest(
       server.documentGeneration = stamp.documentGeneration
       server.recordBufferUpdate(request)
     if accepted and
-        request.kind in {
-          lrkOpen, lrkChange, lrkDocumentSymbols, lrkHover, lrkDefinition
-        }:
+        request.kind in
+        {lrkOpen, lrkChange, lrkDocumentSymbols, lrkHover, lrkDefinition, lrkCompletion}:
       server.prioritizeDocument(request.uri)
   except RpcRouteError as error:
     if hasResponse:
@@ -1710,7 +1723,8 @@ proc dispatchIncomingJsonRpc(server: LspServer, data: string) =
   if methodName == "textDocument/didOpen" or methodName == "textDocument/didChange" or
       methodName == "textDocument/didClose" or
       methodName == "textDocument/documentSymbol" or methodName == "workspace/symbol" or
-      methodName == "textDocument/hover" or methodName == "textDocument/definition":
+      methodName == "textDocument/hover" or methodName == "textDocument/definition" or
+      methodName == "textDocument/completion":
     server.submitAsyncLspRequest(methodName, root.requestParams(), id)
     return
 
@@ -2057,11 +2071,12 @@ proc initializeLsp(server: LspServer, params: JsonNode): JsonNode =
     capabilities["workspaceSymbolProvider"] = %true
     capabilities["hoverProvider"] = %true
     capabilities["definitionProvider"] = %true
+    capabilities["completionProvider"] = %*{"triggerCharacters": ["."]}
   result["capabilities"] = capabilities
 
   let serverInfo = newJObject()
   serverInfo["name"] = %"nimdex"
-  serverInfo["version"] = %"0.1.10"
+  serverInfo["version"] = %"0.1.11"
   result["serverInfo"] = serverInfo
 
 proc initializedLsp(server: LspServer, params: JsonNode): JsonNode =
@@ -2237,6 +2252,15 @@ proc definitionLsp(server: LspServer, params: JsonNode): JsonNode =
   requireLanguageSuccess(response)
   languageResult(lrkDefinition, response)
 
+proc completionLsp(server: LspServer, params: JsonNode): JsonNode =
+  server.requireRunning()
+  var request = parseHoverRequest(params, server.positionEncoding)
+  request.kind = lrkCompletion
+  server.prioritizeDocument(request.uri)
+  let response = server.language.request(request)
+  requireLanguageSuccess(response)
+  languageResult(lrkCompletion, response)
+
 proc registerLspRoutes(server: LspServer) =
   discard server.addMethod(initializeSelector, toDynamicMethod(initializeLsp))
   discard server.addMethod(initializedSelector, toDynamicMethod(initializedLsp))
@@ -2254,6 +2278,7 @@ proc registerLspRoutes(server: LspServer) =
     server.addMethod(workspaceSymbolSelector, toDynamicMethod(workspaceSymbolsLsp))
   discard server.addMethod(definitionSelector, toDynamicMethod(definitionLsp))
   discard server.addMethod(hoverSelector, toDynamicMethod(hoverLsp))
+  discard server.addMethod(completionSelector, toDynamicMethod(completionLsp))
   discard server.addMethod(debugSelector, toDynamicMethod(debugLsp))
 
   server.adapter.registerSelectorMethod("initialize", server, initializeSelector)
@@ -2281,6 +2306,9 @@ proc registerLspRoutes(server: LspServer) =
     "textDocument/definition", server, definitionSelector
   )
   server.adapter.registerSelectorMethod("textDocument/hover", server, hoverSelector)
+  server.adapter.registerSelectorMethod(
+    "textDocument/completion", server, completionSelector
+  )
   server.adapter.registerSelectorMethod(LspDebugMethod, server, debugSelector)
 
 proc preloadStartupLayout(server: LspServer) =

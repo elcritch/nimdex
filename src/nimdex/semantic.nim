@@ -41,6 +41,12 @@ type
     location*: SourceLocation
     instantiatedFrom*: string
     typeId*: string
+    valueTypeId*: string
+    receiverTypeId*: string
+    receiverRequiresVar*: bool
+    baseTypeSymbol*: string
+    mutableValue*: bool
+    ownerId*: string
     raisesKnown*: bool
     raisesTypes*: seq[string]
 
@@ -92,6 +98,7 @@ type
 
   SemanticLookups = ref object
     nameIndex: Table[string, seq[SymbolRef]]
+    receiverIndex: Table[string, seq[SymbolRef]]
     locationIndex: Table[string, seq[SymbolRef]]
     contentIndex: Table[string, int]
 
@@ -192,6 +199,10 @@ proc addModule*(snapshot: var SemanticSnapshot, module: sink ModuleSnapshot) =
     snapshot.addNameRef(symbol.name, reference)
     snapshot.addNameRef(symbol.qualifiedName, reference)
     snapshot.addNameRef(symbol.typeId, reference)
+    if symbol.receiverTypeId.len > 0:
+      snapshot.lookups.receiverIndex.mgetOrPut(symbol.receiverTypeId, @[]).add(
+        reference
+      )
     snapshot.addLocationRef(symbol.location, reference)
 
 proc addFailure*(snapshot: var SemanticSnapshot, failure: sink AnalysisFailure) =
@@ -247,6 +258,17 @@ proc symbolsMatching*(snapshot: SemanticSnapshot, query: string): seq[SymbolInfo
           symbol.qualifiedName.toLowerAscii().contains(needle):
         if not seen.containsOrIncl(symbol.key):
           result.add(symbol)
+
+proc receiverSymbols*(
+    snapshot: SemanticSnapshot, typeId, head: string
+): seq[SymbolInfo] =
+  ## Find callable declarations whose first parameter matches the receiver.
+  if snapshot.lookups.isNil or typeId notin snapshot.lookups.receiverIndex:
+    return
+  for reference in snapshot.lookups.receiverIndex[typeId]:
+    let module = snapshot.modules[reference.moduleIndex]
+    if head.len == 0 or head in module.headFiles:
+      result.add(module.symbols[reference.symbolIndex])
 
 proc recordHead*(snapshot: var SemanticSnapshot, head: string) =
   ## Resolve suffixes within this compiler context before combining snapshots.

@@ -4,7 +4,7 @@
 ## proves the artifact boundary without allowing Binny cursors, pools, or
 ## buffers to escape into the rest of Nimdex.
 
-import std/[sets, tables]
+import std/[sets, strutils, tables]
 
 import binny/bif_safe
 import chronicles
@@ -32,6 +32,12 @@ type
     location*: BinnyLocation ## The best location available in the artifact.
     instantiatedFrom*: string
     typeId*: string ## Compiler type identity for named type declarations.
+    valueTypeId*: string ## Compiler type of a variable or parameter.
+    receiverTypeId*: string ## Compiler type of a callable's first parameter.
+    receiverRequiresVar*: bool
+    baseTypeSymbol*: string
+    mutableValue*: bool
+    ownerId*: string
     raisesKnown*: bool ## An effect list exists; false is not an empty list.
     raisesTypes*: seq[string] ## Qualified exception symbols or compiler type identities.
 
@@ -177,6 +183,18 @@ proc resolveNode(node: Cursor, definitions: Table[string, Cursor]): Cursor =
   if not node.cursorIsNil and node.kind == Symbol:
     result = definitions.getOrDefault(node.symName())
 
+proc receiverType(node: Cursor, definitions: Table[string, Cursor]): string =
+  result = symbolIdentity(node)
+  # `var T` is represented as a type wrapper whose generic argument is T.
+  let definition = resolveNode(node, definitions)
+  if result.startsWith("`t23.") and definition.tagIs("td"):
+    let arguments = definition.findChildTag("genericargs")
+    if not arguments.cursorIsNil:
+      let underlying = arguments.childCursor()
+      let identity = symbolIdentity(underlying)
+      if identity.len > 0:
+        result = identity
+
 proc extractDeclaration(
     module: var BifModule,
     node: Cursor,
@@ -198,6 +216,19 @@ proc extractDeclaration(
   let typ = node.childAt(9)
   if result.tag == "type":
     result.typeId = symbolIdentity(typ)
+    let sourceType = node.childAt(11)
+    if not sourceType.cursorIsNil:
+      let objectType = sourceType.findDescendantTag("objectty")
+      if not objectType.cursorIsNil:
+        let inheritance = objectType.findChildTag("ofinherit")
+        if not inheritance.cursorIsNil:
+          result.baseTypeSymbol = symbolIdentity(inheritance.childAt(2))
+  elif result.tag in ["var", "let", "param", "result", "const", "field"]:
+    result.ownerId = symbolIdentity(node.childAt(10))
+    result.valueTypeId = receiverType(typ, definitions)
+    result.mutableValue =
+      result.tag in ["var", "result"] or
+      (result.tag == "param" and symbolIdentity(typ).startsWith("`t23."))
   if result.tag notin ["proc", "func", "method", "iterator", "converter"]:
     return
   let definition = resolveNode(typ, definitions)
@@ -208,6 +239,11 @@ proc extractDeclaration(
   let params = definition.childAt(9)
   if not params.tagIs("formalparams"):
     return
+  let firstParam = params.childAt(3)
+  if firstParam.tagIs("sd"):
+    result.receiverRequiresVar =
+      symbolIdentity(firstParam.childAt(9)).startsWith("`t23.")
+    result.receiverTypeId = receiverType(firstParam.childAt(9), definitions)
   let effects = params.childAt(2)
   if not effects.tagIs("arglist"):
     return

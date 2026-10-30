@@ -1,6 +1,6 @@
 ## Worker-pool language components used by the Nimdex LSP server.
 
-import std/[atomics, os, sets, sha1, strutils, tables]
+import std/[algorithm, atomics, os, sets, sha1, strutils, tables]
 
 import ./workerlife
 
@@ -23,11 +23,16 @@ type
     lrkWorkspaceSymbols ## Search declarations across indexed modules.
     lrkDefinition ## Resolve a verified use to its compiler declaration.
     lrkHover ## Query compiler-backed hover information when available.
+    lrkCompletion ## Suggest callable members for a receiver.
 
   LanguageSymbol* = object ## A verified semantic symbol and its source range.
     symbol*: SymbolInfo ## The owned compiler-backed symbol record.
     start*: TextPosition ## Inclusive LSP position of the symbol name.
     finish*: TextPosition ## Exclusive LSP position of the symbol name.
+
+  CompletionItem* = object
+    label*: string
+    detail*: string
 
   LanguageRequest* = object ## A language operation sent to worker-owned state.
     kind*: LanguageRequestKind ## The operation to perform.
@@ -48,6 +53,7 @@ type
     version*: int ## The current document version for a successful query.
     preview*: string ## Hover text when compiler-backed analysis is available.
     symbols*: seq[LanguageSymbol] ## Owned symbols returned by an indexed query.
+    items*: seq[CompletionItem] ## Receiver-aware completion candidates.
     error*: string ## A diagnostic description when `ok` is false.
     cancelled*: bool ## Whether the operation stopped at a cancellation checkpoint.
     superseded*: bool ## Whether the request's state stamp was no longer current.
@@ -74,6 +80,9 @@ type
   LanguageService = ref object of AgentActor
     documents: DocumentStore
     semantic: SemanticSnapshot
+    previousSemantic: SemanticSnapshot
+    recentDocuments: seq[DocumentSnapshot]
+    recentDocumentBytes: int
     hasSemantic: bool
     occurrences: seq[OccurrenceCache]
     documentGeneration: uint64
@@ -508,6 +517,220 @@ proc findPositionSymbol(
   response.found = response.symbols.len > 0
   response.version = useDocument.version
 
+proc completionWordChar(ch: char): bool =
+  ch in {'a' .. 'z', 'A' .. 'Z', '0' .. '9', '_'} or ord(ch) >= 128
+
+proc completionKey(value: string): string =
+  for ch in value:
+    if ch != '_':
+      result.add(ch.toLowerAscii())
+
+proc completionOwnerContains(
+    snapshot: SemanticSnapshot,
+    ownerId, head: string,
+    document: DocumentSnapshot,
+    queryLine: int,
+): bool =
+  ## Exclude locals belonging to an earlier procedure in the same file.
+  for owner in snapshot.findSymbols(ownerId, head):
+    if owner.kind in ["proc", "func", "method", "iterator", "converter"] and
+        owner.location.uri == document.uri and owner.location.line > 0:
+      let start = int(owner.location.line) - 1
+      if start > queryLine or start >= document.lineCount():
+        return false
+      let declaration = document.lineText(start)
+      let indent =
+        declaration.len - declaration.strip(leading = true, trailing = false).len
+      for line in start + 1 .. queryLine:
+        let text = document.lineText(line)
+        let stripped = text.strip(leading = true, trailing = false)
+        if stripped.len > 0 and not stripped.startsWith("#") and
+            text.len - stripped.len <= indent:
+          return false
+      return true
+  true
+
+proc completionTypes(snapshot: SemanticSnapshot, typeId, head: string): seq[string] =
+  var pending = @[typeId]
+  var seen = initHashSet[string]()
+  while pending.len > 0:
+    let current = pending.pop()
+    if not seen.containsOrIncl(current):
+      result.add(current)
+      for typ in snapshot.findSymbols(current, head):
+        if typ.kind == "type" and typ.typeId == current and typ.baseTypeSymbol.len > 0:
+          for parent in snapshot.findSymbols(typ.baseTypeSymbol, head):
+            if parent.kind == "type" and parent.typeId.len > 0:
+              pending.add(parent.typeId)
+
+proc findCompletions(
+    self: LanguageService,
+    request: LanguageRequest,
+    response: var LanguageResponse,
+    cancellation: ptr LanguageCancellation,
+) =
+  var document: DocumentSnapshot
+  if not self.documents.tryFindDocument(response.uri, document):
+    let path = pathFromDocumentUri(response.uri)
+    if not fileExists(path):
+      return
+    document =
+      initDocumentSnapshot(response.uri, readFile(path), 0, request.positionEncoding)
+  var offset: int
+  if not document.tryOffsetAt(
+    TextPosition(line: request.line, character: request.character), offset
+  ):
+    return
+  let text = document.content
+  var start = offset
+  while start > 0 and completionWordChar(text[start - 1]):
+    dec start
+  let prefix = completionKey(text[start ..< offset])
+  if start == 0 or text[start - 1] != '.':
+    return
+  var components: seq[string]
+  var receiverEnd = start - 1
+  while receiverEnd > 0 and components.len < 8:
+    var receiverStart = receiverEnd
+    while receiverStart > 0 and completionWordChar(text[receiverStart - 1]):
+      dec receiverStart
+    if receiverStart == receiverEnd:
+      return
+    components.add(text[receiverStart ..< receiverEnd])
+    if receiverStart == 0 or text[receiverStart - 1] != '.':
+      break
+    receiverEnd = receiverStart - 1
+  if components.len == 0:
+    return
+  components.reverse()
+  let receiver = components[0]
+  let sourcePath = pathFromDocumentUri(response.uri)
+  let previousHead = self.previousSemantic.preferredHeads.getOrDefault(
+    sourcePath, self.previousSemantic.graph.preferredHead(sourcePath)
+  )
+  let preferredHead =
+    self.semantic.preferredHeads.getOrDefault(sourcePath, previousHead)
+  let currentHeads = self.semantic.graph.headsFor(sourcePath)
+  let previousHeads = self.previousSemantic.graph.headsFor(sourcePath)
+  let snapshot =
+    if currentHeads.len > 0 and (
+      preferredHead.len == 0 or preferredHead in currentHeads or
+      preferredHead notin previousHeads
+    ): self.semantic else: self.previousSemantic
+  let head = snapshot.preferredHeads.getOrDefault(
+    sourcePath, snapshot.graph.preferredHead(sourcePath)
+  )
+  var receiverType = ""
+  var receiverMutable = false
+  var latestLine = -1
+  var saved: DocumentSnapshot
+  if fileExists(sourcePath):
+    saved = initDocumentSnapshot(
+      response.uri, readFile(sourcePath), 0, request.positionEncoding
+    )
+  var candidates: seq[SymbolInfo]
+  for symbol in snapshot.findSymbols(receiver, head):
+    if symbol.valueTypeId.len > 0:
+      candidates.add(symbol)
+  if candidates.len == 0:
+    # Nim identifiers ignore underscores and case after the initial letter.
+    # Scan only this document's modules when the exact-name index misses.
+    for module in snapshot.modules:
+      if (head.len == 0 or head in module.headFiles) and
+          (module.sourceUri == response.uri or sourcePath in module.includes):
+        for symbol in module.symbols:
+          if symbol.valueTypeId.len > 0 and symbol.name.len > 0 and
+              symbol.name[0] == receiver[0] and
+              completionKey(symbol.name) == completionKey(receiver):
+            candidates.add(symbol)
+  for symbol in candidates:
+    if symbol.location.uri == response.uri and symbol.valueTypeId.len > 0 and
+        symbol.location.line > 0 and symbol.location.line <= request.line + 1 and
+        symbol.location.line > latestLine and
+        snapshot.completionOwnerContains(symbol.ownerId, head, document, request.line):
+      let line = int(symbol.location.line) - 1
+      var first, last: int
+      var declarationMatches = symbol.location.sourceTextHash == document.textHash
+      if not declarationMatches and symbol.location.sourceTextHash == saved.textHash and
+          line < saved.lineCount() and line < document.lineCount():
+        declarationMatches = saved.lineText(line) == document.lineText(line)
+      if not declarationMatches:
+        for previous in self.recentDocuments:
+          if previous.uri == response.uri and
+              previous.textHash == symbol.location.sourceTextHash and
+              line < previous.lineCount() and line < document.lineCount() and
+              previous.lineText(line) == document.lineText(line):
+            declarationMatches = true
+            break
+      if line < document.lineCount() and
+          document.tryTokenSpanAt(
+            symbol.location.line, symbol.location.column, symbol.name, first, last
+          ) and declarationMatches:
+        receiverType = symbol.valueTypeId
+        receiverMutable = symbol.mutableValue
+        latestLine = symbol.location.line
+  if receiverType.len == 0:
+    return
+  var documentModules = initHashSet[string]()
+  for module in snapshot.modules:
+    if (head.len == 0 or head in module.headFiles) and
+        (module.sourceUri == response.uri or sourcePath in module.includes):
+      documentModules.incl(module.sourcePath)
+  for index in 1 ..< components.len:
+    let ownerTypes = snapshot.completionTypes(receiverType, head)
+    var fieldType = ""
+    for field in snapshot.findSymbols(components[index], head):
+      if field.kind == "field" and field.valueTypeId.len > 0:
+        for owner in snapshot.findSymbols(field.ownerId, head):
+          if owner.kind == "type" and owner.typeId in ownerTypes:
+            fieldType = field.valueTypeId
+            break
+      if fieldType.len > 0:
+        break
+    if fieldType.len == 0:
+      return
+    receiverType = fieldType
+  var seen = initHashSet[string]()
+  var documents = initTable[string, DocumentSnapshot]()
+  for currentType in snapshot.completionTypes(receiverType, head):
+    for symbol in snapshot.receiverSymbols(currentType, head):
+      if cancellation.isCancelled():
+        response.ok = false
+        response.cancelled = true
+        return
+      if symbol.name.len > 0 and symbol.name[0] != '=' and
+          completionKey(symbol.name).startsWith(prefix) and (
+        not symbol.receiverRequiresVar or
+        (receiverMutable and currentType == receiverType)
+      ) and (symbol.visibility == svExported or symbol.modulePath in documentModules) and
+          not seen.containsOrIncl(symbol.qualifiedName):
+        var item = CompletionItem(label: symbol.name)
+        var source: DocumentSnapshot
+        if self.cachedSourceDocumentFor(
+          symbol.location, request.positionEncoding, documents, source
+        ):
+          item.detail = source.declarationText(symbol.location.line)
+        elif symbol.location.uri == response.uri:
+          let line = int(symbol.location.line) - 1
+          if line >= 0 and line < document.lineCount():
+            if symbol.location.sourceTextHash == saved.textHash and
+                line < saved.lineCount() and
+                saved.lineText(line) == document.lineText(line):
+              item.detail = saved.declarationText(symbol.location.line)
+            else:
+              for previous in self.recentDocuments:
+                if previous.uri == response.uri and
+                    previous.textHash == symbol.location.sourceTextHash and
+                    line < previous.lineCount() and
+                    previous.lineText(line) == document.lineText(line):
+                  item.detail = previous.declarationText(symbol.location.line)
+                  break
+        response.items.add(item)
+        if response.items.len >= 200:
+          break
+  response.version = document.version
+  response.found = response.items.len > 0
+
 proc installSemanticSnapshot(
     self: LanguageService, snapshot: sink SemanticSnapshot
 ) {.slot.} =
@@ -515,6 +738,11 @@ proc installSemanticSnapshot(
   self.configurationFingerprint = snapshot.configurationFingerprint
   self.compilerFingerprint = snapshot.compilerFingerprint
   self.occurrences.setLen(0)
+  if self.semantic.moduleCount() > self.previousSemantic.moduleCount():
+    self.previousSemantic = self.semantic
+  if snapshot.moduleCount() > 0 and
+      snapshot.moduleCount() >= self.previousSemantic.moduleCount():
+    self.previousSemantic = SemanticSnapshot()
   self.semantic = snapshot
   self.hasSemantic = true
 
@@ -543,6 +771,19 @@ proc processLanguageWork(self: LanguageService, work: LanguageWork) {.slot.} =
         response.ok = false
         response.error = "document could not be opened"
     of lrkChange:
+      var previous: DocumentSnapshot
+      if self.documents.tryFindDocument(work.request.uri, previous):
+        const maxRecentBytes = 8 * 1024 * 1024
+        if previous.content.len <= maxRecentBytes:
+          while self.recentDocuments.len > 0 and (
+            self.recentDocuments.len >= 32 or
+            self.recentDocumentBytes + previous.content.len > maxRecentBytes
+          )
+          :
+            self.recentDocumentBytes -= self.recentDocuments[0].content.len
+            self.recentDocuments.delete(0)
+          self.recentDocuments.add(previous)
+          self.recentDocumentBytes += previous.content.len
       inc self.documentGeneration
       case self.documents.updateDocument(
         work.request.uri, work.request.text, work.request.version,
@@ -605,6 +846,8 @@ proc processLanguageWork(self: LanguageService, work: LanguageWork) {.slot.} =
         response.error = "language request was superseded by newer state"
       else:
         self.findPositionSymbol(work.request, response, work.cancellation)
+    of lrkCompletion:
+      self.findCompletions(work.request, response, work.cancellation)
     response.stamp = LanguageStamp(
       valid: work.request.stamp.valid,
       projectId: self.semantic.projectId,

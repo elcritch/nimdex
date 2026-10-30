@@ -244,7 +244,11 @@ configured. Otherwise, a head uses its own context and shared sources use the
 first resolved owner in path order.
 
 Nimdex provides document symbols, workspace symbols, go to definition, hover,
-full document synchronization, and compiler diagnostics. Procedure hovers show
+receiver completion, full document synchronization, and compiler diagnostics.
+Completion after `variable.` suggests procs whose first parameter matches the
+variable's compiler type or an inherited base type. It uses the last indexed
+declarations while an edit is incomplete; generic and implicit conversion matches
+are not yet resolved. Procedure hovers show
 the validated source declaration, including its parameter and return types,
 and compiler-derived static `raises` effects, including inferred exceptions and
 `raises: []`. Missing effect information is shown as `raises: unknown`.
