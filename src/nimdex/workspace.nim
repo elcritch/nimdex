@@ -26,7 +26,7 @@ type Workspace* = object
   artifactRoots*: seq[string]
   compilerPath*: string
   compilerFrontend*: CompilerFrontend
-  cacheRoot*: string ## Empty selects a Nimdex subdirectory of the compiler's nimcache.
+  cacheRoot*: string ## Empty selects .nimdex in the project root.
   configurationGeneration*: uint64
   configurationFingerprint*: uint64
 

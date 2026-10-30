@@ -835,49 +835,6 @@ proc effectiveCompilerPaths(
   except CatchableError as error:
     debug "Unable to query compiler paths for progress", failure = error.msg
 
-proc compilerCacheRoot(request: CompilerRefreshRequest, entryPoint: string): string =
-  if request.workspace.cacheRoot.len > 0:
-    return request.workspace.cacheRoot
-  var arguments = @["dump"]
-  arguments.add(request.workspace.nimArguments)
-  for path in request.workspace.importPaths:
-    arguments.add("--path:" & path)
-  arguments.add("--dump.format:json")
-  arguments.add("--colors:off")
-  arguments.add(entryPoint)
-  let captureDir = createTempDir("nimdex-cache-probe-", "")
-  defer:
-    removeDir(captureDir)
-  let output = runExternalCommand(
-    request.capabilities.compilerPath, arguments, request.workspace.rootPath,
-    captureDir, request.cancellation,
-  )
-  if output.exitCode == 0:
-    # Project configuration can echo text before Nim's one-line JSON dump.
-    for line in output.stdout.splitLines():
-      if not line.startsWith("{"):
-        continue
-      try:
-        let dumped = parseJson(line)
-        if dumped.kind == JObject and dumped.hasKey("nimcache") and
-            dumped["nimcache"].kind == JString:
-          let path = dumped["nimcache"].getStr()
-          if path.len > 0:
-            let absolute =
-              if isAbsolute(path):
-                path
-              else:
-                request.workspace.rootPath / path
-            return normalizeDocumentPath(absolute) / "nimdex"
-      except ValueError:
-        discard
-  raise newException(
-    IOError,
-    "unable to resolve the compiler's nimcache; configure cacheRoot or --cache-root" &
-      (if output.stderr.len > 0: ": " & output.stderr.strip()
-      else: ""),
-  )
-
 proc addBuildFailure(result: var CompilerRefreshResult, message, fallbackPath: string) =
   result.error = message
   result.diagnostics.add(
@@ -1193,14 +1150,11 @@ proc runCompilerRefresh*(
   if request.workspace.automaticImportPaths:
     effectiveRequest.workspace.importPaths =
       discoverProjectLayout(request.workspace.rootPath).sourceDirs
-  var cacheBase: string
-  try:
-    cacheBase = compilerCacheRoot(effectiveRequest, entryPoints[0])
-  except CatchableError as error:
-    if request.cancellation.isCompilerCancelled():
-      result.cancelled = true
-    result.addBuildFailure(error.msg, entryPoints[0])
-    return
+  let cacheBase =
+    if effectiveRequest.workspace.cacheRoot.len > 0:
+      effectiveRequest.workspace.cacheRoot
+    else:
+      effectiveRequest.workspace.rootPath / ".nimdex"
   effectiveRequest.workspace.cacheRoot = cacheBase
   result.cachePath =
     cacheBase /
@@ -1212,6 +1166,20 @@ proc runCompilerRefresh*(
       "\0" & $inventory & "\0" & $compilerEnvironmentFingerprint() & "\0" &
       $request.workspace.compilerFrontend & "-bif-v" & $HeadCacheVersion
   )
+  # A shared frontend can contain several effective Nim configurations. Key
+  # the outer cache on every head's configuration inputs so edits cannot
+  # reuse a stale precompiled configuration for any of the heads.
+  var frontendConfigPaths = initHashSet[string]()
+  for head in entryPoints:
+    for path in configurationInputs(effectiveRequest.workspace, head):
+      frontendConfigPaths.incl(path)
+  var frontendConfigs: seq[string]
+  for path in frontendConfigPaths:
+    frontendConfigs.add(path)
+  frontendConfigs.sort()
+  let frontendKey =
+    stableTextHash($reuseKey & "\0" & $fingerprintInputs(frontendConfigs))
+  let savedFrontend = result.cachePath / "frontends" / $frontendKey / "frontend"
   var overlayKeys: seq[string]
   for overlay in request.overlays:
     overlayKeys.add(overlay.path & "\0" & $overlay.textHash)
@@ -1227,7 +1195,7 @@ proc runCompilerRefresh*(
   for previous in request.previousHeads:
     if not previous.snapshot.isNil:
       artifactCache.rememberModules(previous.snapshot[])
-  var resetShared = initHashSet[string]()
+  var resetShared = false
   var pending: seq[int]
   for index in 0 ..< entryPoints.len:
     pending.add(index)
@@ -1284,20 +1252,11 @@ proc runCompilerRefresh*(
             expectedModules = previous.artifactPaths.len
             break
         var sharedFrontend = ""
-        let testsRoot = request.workspace.rootPath / "tests"
         if request.overlays.len == 0 and
-            request.workspace.compilerFrontend in {cfTrack, cfIc} and
-            entryPoint.startsWith(testsRoot & DirSep):
-          var configs: seq[string]
-          for path in configurationInputs(effectiveRequest.workspace, entryPoint):
-            if fileExists(path):
-              configs.add(path)
-          let groupKey = stableTextHash(
-            entryPoint.parentDir & "\0" & $reuseKey & "\0" & $fingerprintInputs(configs)
-          )
-          sharedFrontend = result.cachePath / "test-frontends" / $groupKey / "frontend"
-          if request.forceRebuild and sharedFrontend notin resetShared:
-            resetShared.incl(sharedFrontend)
+            request.workspace.compilerFrontend in {cfTrack, cfIc}:
+          sharedFrontend = savedFrontend
+          if request.forceRebuild and not resetShared:
+            resetShared = true
             if dirExists(sharedFrontend):
               removeDir(sharedFrontend)
         let built = buildHead(

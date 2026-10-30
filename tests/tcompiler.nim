@@ -64,7 +64,7 @@ suite "Nimdex compiler refresh":
     check formatProgressPercent(10000) == "100.00%"
     check estimatedCompilerHeadHundredths(1, 80) == 112
 
-  test "default cache follows Nim configuration and survives a new session":
+  test "default cache is in the workspace and survives a new session":
     let root = normalizeDocumentPath(
       getTempDir() / ("nimdex-default-cache-" & $getCurrentProcessId())
     )
@@ -88,8 +88,7 @@ suite "Nimdex compiler refresh":
     let cold = runCompilerRefresh(request)
     require cold.ok
     check cold.compiledHeads == 1
-    check cold.cachePath.startsWith(root / "compiler-cache" / "nimdex" & DirSep)
-    check not dirExists(root / ".nimdex")
+    check cold.cachePath.startsWith(root / ".nimdex" & DirSep)
     let originalDirectory = getCurrentDir()
     let restarted = block:
       setCurrentDir(getTempDir())

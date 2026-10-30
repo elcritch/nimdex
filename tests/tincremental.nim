@@ -55,6 +55,11 @@ proc compilerRuns(refresh: CompilerRefreshResult): Table[string, Time] =
     let edge = artifact[0 ..< artifact.len - ".s.bif".len] & ".edges.bif"
     result[artifact] = getLastModificationTime(edge)
 
+proc frontendCache(refresh: CompilerRefreshResult): string =
+  for argument in refresh.commandLines[0].splitWhitespace():
+    if argument.startsWith("--nimcache:"):
+      return argument["--nimcache:".len .. ^1]
+
 suite "incremental compiler frontend":
   test "counts compiler module rules from a frontend graph":
     let root = createTempDir("nimdex-graph-count-", "")
@@ -92,8 +97,9 @@ suite "incremental compiler frontend":
     check "--compileOnly:on" notin refreshed.commandLines[0]
     check "--processing:filenames" in refreshed.commandLines[0]
     check "[Processing]" in (refreshed.stdout & refreshed.stderr)
-    check incrementalExpectedModules(refreshed.heads[0].cachePath / "frontend") > 0
-    let frontend = refreshed.heads[0].cachePath / "frontend"
+    let frontend = refreshed.frontendCache()
+    require frontend.len > 0
+    check incrementalExpectedModules(frontend) > 0
     let staleDir = frontend / "configs" / "obsolete" / "sem"
     createDir(staleDir)
     writeFile(staleDir / "stale.frontend.build.nif", "(.nif27)\n(stmts)\n")
@@ -209,7 +215,7 @@ suite "incremental compiler frontend":
     check cold.snapshot.graph.headsFor(shared) == @[head]
     check cold.cachePath != tracked.cachePath
     var cFiles = 0
-    for path in walkDirRec(cold.heads[0].cachePath):
+    for path in walkDirRec(cold.frontendCache()):
       if path.endsWith(".c"):
         inc cFiles
       check path.splitFile.ext notin [".o", ".obj", ".exe", ".dylib"]
@@ -261,7 +267,7 @@ suite "incremental compiler frontend":
     check tracked.snapshot.graph.headsFor(root / "support.nim") == @[head]
     check fileExists(headManifestPath(tracked.heads[0].cachePath))
     check tracked.heads[0].cachePath != tracked.artifactPaths[0].parentDir
-    for path in walkDirRec(tracked.heads[0].cachePath):
+    for path in walkDirRec(tracked.frontendCache()):
       check path.splitFile.ext notin
         [".c", ".cpp", ".o", ".obj", ".exe", ".so", ".dylib"]
 
@@ -405,6 +411,50 @@ when defined(testContext):
     require newConfig.ok
     check "testContextValue" notin newConfig.declarationNames(head)
 
+  test "entry points in different directories share frontend work":
+    let root = normalizeDocumentPath(createTempDir("nimdex-shared-heads-", ""))
+    defer:
+      removeDir(root)
+    createDir(root / "src")
+    createDir(root / "tests")
+    let first = root / "src/app.nim"
+    let second = root / "tests/tapp.nim"
+    let shared = root / "src/shared.nim"
+    writeFile(shared, "const common* = 1\n")
+    writeFile(first, "import shared\nconst appValue* = common\n")
+    writeFile(second, "import shared\nconst testValue* = common\n")
+    let request = CompilerRefreshRequest(
+      workspace: initWorkspace(
+        documentUriFromPath(root),
+        entryPoints = @[first, second],
+        importPaths = @[root / "src"],
+        cacheRoot = root / "cache",
+        compilerFrontend = cfTrack,
+      ),
+      capabilities: capabilities,
+    )
+    var firstArtifact: string
+    var firstModified: Time
+    let refreshed = runCompilerRefresh(
+      request,
+      onHead = proc(progress: CompilerHeadProgress) =
+        if progress.ok and progress.headPath == first:
+          for module in progress.analysis.snapshot[].modules:
+            if module.sourcePath == shared:
+              firstArtifact = module.artifactPath
+              firstModified = getLastModificationTime(firstArtifact)
+      ,
+    )
+    checkpoint refreshed.error & "\n" & refreshed.stderr
+    require refreshed.ok
+    require refreshed.heads.len == 2
+    require firstArtifact.len > 0
+    let secondArtifact = refreshed.heads[1].snapshot[].findModule(shared).artifactPath
+    check secondArtifact == firstArtifact
+    check getLastModificationTime(secondArtifact) == firstModified
+    check refreshed.heads[0].snapshot[].findSymbols("appValue").len == 1
+    check refreshed.heads[1].snapshot[].findSymbols("testValue").len == 1
+
   test "test entry points share an IC cache and preserve their main modules":
     let root = normalizeDocumentPath(createTempDir("nimdex-shared-tests-", ""))
     defer:
@@ -463,9 +513,12 @@ when defined(testContext):
     writeFile(root / "sample.nimble", "srcDir = \"src\"\n")
     let packageHead = root / "src/sample.nim"
     let testHead = root / "tests/tsample.nim"
+    let shared = root / "src/shared.nim"
+    writeFile(shared, "const sharedValue* = 1\n")
     writeFile(
       packageHead,
       """
+import shared
 when isMainModule:
   const mainOnly* = true
 when defined(testContext):
@@ -475,7 +528,9 @@ else:
 """,
     )
     writeFile(root / "tests/config.nims", "switch(\"define\", \"testContext\")\n")
-    writeFile(testHead, "import sample\nwhen isMainModule:\n  const testMain* = true\n")
+    writeFile(
+      testHead, "import sample, shared\nwhen isMainModule:\n  const testMain* = true\n"
+    )
     let refreshed = runCompilerRefresh(
       CompilerRefreshRequest(
         workspace: initWorkspace(documentUriFromPath(root), compilerFrontend = cfTrack),
@@ -485,6 +540,12 @@ else:
     checkpoint refreshed.error & "\n" & refreshed.stderr
     require refreshed.ok
     check refreshed.compiledHeads == 2
+    require refreshed.heads.len == 2
+    let firstShared = refreshed.heads[0].snapshot[].findModule(shared).artifactPath
+    let secondShared = refreshed.heads[1].snapshot[].findModule(shared).artifactPath
+    check firstShared != secondShared
+    check firstShared.contains(DirSep & "frontends" & DirSep)
+    check secondShared.contains(DirSep & "frontends" & DirSep)
     check refreshed.snapshot.graph.headsFor(packageHead) == @[packageHead, testHead]
     for analysis in refreshed.heads:
       let names = analysis.snapshot[].findSymbols("mainOnly")
@@ -538,7 +599,7 @@ else:
     require before.hasKey("result")
     require before["result"].len > 0
     var artifacts: Table[string, Time]
-    for path in walkDirRec(root / "compiler-cache" / "nimdex"):
+    for path in walkDirRec(root / ".nimdex"):
       if path.endsWith(".s.bif"):
         artifacts[path] = getLastModificationTime(path)
     require artifacts.len > 0

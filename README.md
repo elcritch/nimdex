@@ -133,10 +133,8 @@ Stopping and restarting the listener with the same project, compiler, frontend,
 and cache root restores valid head analyses from disk. `nimdex debug . --connect
 PORT | jq '.refresh | {compiledHeads, restoredHeads}'` shows whether the new
 daemon reused them; source or configuration changes rebuild affected heads.
-Without an explicit cache root, Nimdex asks the selected compiler for the
-resolved `nimcache` of the workspace's first entry point and stores artifacts and
-semantic records in its `nimdex/` subdirectory. This respects `nim.cfg`,
-`config.nims`, and the configured Nim arguments. Compiler/workspace fingerprints
+Without an explicit cache root, Nimdex stores artifacts and semantic records in
+`.nimdex/` at the workspace root. Compiler/workspace fingerprints
 and per-head subdirectories keep analyses isolated; process IDs and launch
 directories do not select new caches. Unsaved buffers use a separate `overlays/`
 subdirectory and never replace the saved-source analyses.
@@ -146,7 +144,7 @@ Useful options are:
 ```text
 --compiler PATH       Select the Nim compiler
 --frontend MODE       track (default), compile, or ic
---cache-root PATH     Override the default nimcache/nimdex location
+--cache-root PATH     Override the default project .nimdex location
 --log-file PATH       Append daemon stderr to PATH (daemon only)
 --entry-point PATH    Add a Nim entry point (repeatable)
 --import-path PATH    Add a Nim import path (repeatable)
@@ -227,14 +225,14 @@ compiler configuration, put options such as these in
   "compilerPath": "/path/to/nim",
   "entryPoints": ["main.nim"],
   "importPaths": ["src"],
-  "cacheRoot": "nimcache/nimdex"
+  "cacheRoot": ".nimdex"
 }
 ```
 
 Explicit `entryPoints` override automatic discovery. Computed Nimble metadata
 is reported in `nimdex/debug` under `workspace.discoveryWarnings`; configure
 entry points and import paths explicitly for those projects.
-Omit `cacheRoot` to use the compiler-resolved location. The stdio daemon's
+Omit `cacheRoot` to use `.nimdex/` in the workspace root. The stdio daemon's
 `--cache-root PATH` option also selects an explicit location for editor sessions;
 an initialization option overrides that command-line default. Relative cache
 paths are resolved against the initialized workspace root.
@@ -268,9 +266,9 @@ spelling rules. Unverifiable generated locations return no target.
 
 Nimdex probes the configured compiler and requires `--genBif:on`. By default,
 the CLI and editor server run `nim track --genBif:on` into a
-cache scoped to each compiler and workspace configuration. Test entry points in
-the same directory with matching configuration share an incremental frontend
-cache; other entry points retain separate caches. This generates semantic BIFs without C or native compilation. The current
+cache scoped to each compiler and workspace configuration. Entry points share
+an incremental frontend cache while Nim separates incompatible configurations
+and main-module artifacts. This generates semantic BIFs without C or native compilation. The current
 compiler's `nim check --genBif:on` omits declarations and include metadata, so it
 cannot yet replace this command.
 
@@ -307,8 +305,8 @@ After a partial rebuild, diagnostics currently reflect modules checked in that
 invocation; warnings from skipped modules may disappear. Whole-head cache reuse
 retains its saved diagnostics.
 Configuration, environment, and source-inventory changes select or reset the
-incremental compiler cache. Test entry points with matching configurations reuse
-their shared frontend cache while retaining separate analysis records.
+incremental compiler cache. Compatible entry points reuse their shared frontend
+cache while retaining separate analysis records.
 
 The daemon safely loads the generated BIF files through Binny and converts them into
 owned semantic records. BIF loading and indexing use Sigils worker pools, with at most four loaders by
@@ -335,7 +333,7 @@ and the local source inventory before restoring records. New manifests compare
 file content, so an mtime-only change does not force compilation. Older manifests
 are upgraded when their saved inputs still match. Valid restores run no compiler
 and load no BIF files. Missing, incompatible, or damaged cache entries rebuild.
-Cold compilation still runs once per head; matching test entry points can reuse
+Cold compilation still runs once per head; compatible entry points can reuse
 compiler frontend work from earlier heads.
 
 Each successful head publishes a stamped snapshot. Failed heads report
