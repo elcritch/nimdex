@@ -293,7 +293,7 @@ suite "incremental compiler frontend":
     check restored.ok
     check restored.restoredHeads == 1
     check restored.compiledHeads == 0
-    check restored.loadedArtifacts == 0
+    check restored.loadedArtifacts > 0
 
     # Exercise the compiler's no-op path independently of Nimdex's whole-head cache.
     forgetHead(cold.heads[0].cachePath)

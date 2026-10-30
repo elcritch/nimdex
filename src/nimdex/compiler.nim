@@ -155,7 +155,10 @@ proc readIfPresent(path: string): string =
     except CatchableError:
       discard
 
-const MaxCompilerCaptureBytes = 8 * 1024 * 1024
+const
+  MaxCompilerCaptureBytes = 8 * 1024 * 1024
+  # Independent of the head manifest format, so metadata changes retain BIFs.
+  BifCacheFormatVersion = 2
 
 proc readCompilerCapture(path: string): string =
   if not fileExists(path):
@@ -1164,7 +1167,7 @@ proc runCompilerRefresh*(
   let reuseKey = stableTextHash(
     $result.compiler.fingerprint & "\0" & $request.workspace.configurationFingerprint &
       "\0" & $inventory & "\0" & $compilerEnvironmentFingerprint() & "\0" &
-      $request.workspace.compilerFrontend & "-bif-v" & $HeadCacheVersion
+      $request.workspace.compilerFrontend & "-bif-v" & $BifCacheFormatVersion
   )
   # A shared frontend can contain several effective Nim configurations. Key
   # the outer cache on every head's configuration inputs so edits cannot
@@ -1236,7 +1239,7 @@ proc runCompilerRefresh*(
       if not progress.reused and not request.forceRebuild and request.overlays.len == 0:
         progress.restored = diskCache.restoreHead(
           effectiveRequest.workspace, entryPoint, cachePath, reuseKey, inputCache,
-          progress.analysis,
+          artifactCache, progress.analysis,
         )
       if progress.reused or progress.restored:
         inc result.reusedHeads

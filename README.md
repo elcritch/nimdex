@@ -133,7 +133,7 @@ Stopping and restarting the listener with the same project, compiler, frontend,
 and cache root restores valid head analyses from disk. `nimdex debug . --connect
 PORT | jq '.refresh | {compiledHeads, restoredHeads}'` shows whether the new
 daemon reused them; source or configuration changes rebuild affected heads.
-Without an explicit cache root, Nimdex stores artifacts and semantic records in
+Without an explicit cache root, Nimdex stores compiler artifacts and head manifests in
 `.nimdex/` at the workspace root. Compiler/workspace fingerprints
 and per-head subdirectories keep analyses isolated; process IDs and launch
 directories do not select new caches. Unsaved buffers use a separate `overlays/`
@@ -291,7 +291,7 @@ modules are skipped, and dependency metadata decides
 which importers need rechecking. Only the current resolved module closure is
 indexed, so removed imports leave no stale symbols even though their old files
 remain in the compiler cache. Compiler state is separate from Nimdex's
-persistent semantic records. `compile`, `track`, and `ic` use distinct cache
+persistent head manifests. `compile`, `track`, and `ic` use distinct cache
 contexts. Dirty-buffer analysis uses a separate frontend cache. Because Nim's
 incremental driver does not detect changes to dirty mappings, Nimdex resets
 that cache whenever unsaved buffer contents or mappings change. Dirty semantic
@@ -325,14 +325,14 @@ head directory as a scheduling hint. Other heads load in the background.
 Document queries can complete as soon as their context is ready; workspace
 symbol queries and CLI project checks wait for the whole refresh.
 
-Unchanged heads reuse their analyses and diagnostics. Owned semantic records
-and per-head manifests also persist under the cache root, sharing identical
-module records. Restarts validate compiler identity, compiler arguments,
+Unchanged heads reuse their in-memory analyses and diagnostics. Per-head manifests
+persist inputs, diagnostics, and BIF references without duplicating the semantic
+data as JSON. Restarts validate compiler identity, compiler arguments,
 compiler environment, resolved source/include and configuration inputs,
 and the local source inventory before restoring records. New manifests compare
-file content, so an mtime-only change does not force compilation. Older manifests
-are upgraded when their saved inputs still match. Valid restores run no compiler
-and load no BIF files. Missing, incompatible, or damaged cache entries rebuild.
+file content, so an mtime-only change does not force compilation. Valid restores
+index the existing BIFs without running the compiler. Missing, incompatible, or
+damaged cache entries rebuild.
 Cold compilation still runs once per head; compatible entry points can reuse
 compiler frontend work from earlier heads.
 

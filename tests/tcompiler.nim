@@ -101,7 +101,11 @@ suite "Nimdex compiler refresh":
     check restarted.compiledHeads == 0
     check restarted.restoredHeads == 1
     check restarted.commandLines.len == 0
+    check restarted.loadedArtifacts > 0
     check restarted.snapshot.findSymbols("cachedValue").len == 1
+    for path in walkDirRec(root / ".nimdex"):
+      if path.endsWith(".json"):
+        check path.extractFilename() == "analysis.json"
 
     request.overlays = @[
       initDocumentSnapshot(documentUriFromPath(source), "const cachedValue* = 2\n", 1)
@@ -115,6 +119,14 @@ suite "Nimdex compiler refresh":
     require afterOverlay.ok
     check afterOverlay.restoredHeads == 1
     check afterOverlay.compiledHeads == 0
+
+    # A manifest must not restore a head after one of its BIFs disappears.
+    removeFile(afterOverlay.heads[0].artifactPaths[0])
+    let repaired = runCompilerRefresh(request)
+    checkpoint repaired.error & "\n" & repaired.stderr
+    require repaired.ok
+    check repaired.compiledHeads == 1
+    check repaired.snapshot.findSymbols("cachedValue").len == 1
 
     writeFile(source, "const changedValue* = 3\n")
     let changed = runCompilerRefresh(request)
@@ -284,7 +296,7 @@ suite "Nimdex compiler refresh":
     check restarted.ok
     check restarted.compiledHeads == 0
     check restarted.restoredHeads == 4
-    check restarted.loadedArtifacts == 0
+    check restarted.loadedArtifacts > 0
     check restarted.snapshot.moduleCount() == cold.snapshot.moduleCount()
     check restarted.snapshot.graph.headsFor(root / "lib/piece.nim") ==
       cold.snapshot.graph.headsFor(root / "lib/piece.nim")
